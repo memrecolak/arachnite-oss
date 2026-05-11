@@ -1,0 +1,45 @@
+# Robot arm pick-and-place — two-AgentNode deployment manifest.
+#
+# vision-node   runs on the machine with the camera / proximity sensor
+#               (e.g. Jetson Nano with USB camera + VL53L1X ToF sensor).
+# control-node  runs on the machine driving the motors
+#               (e.g. Raspberry Pi 4 with servo HAT).
+#
+# In the single-process simulation (simulate.py) both agents use
+# LocalTransport and run in the same process.
+# In production replace transport: local → mqtt or nats and set
+# the broker address in mesh.transport_options.
+#
+# Co-location constraint (enforced by DeploymentManifest.validate()):
+#   CollisionReflex and EmergencyRetractAction are BOTH on control-node.
+#   This guarantees zero network-hop latency for the reflex path.
+
+mesh:
+  name: robot-arm-cell
+  transport_default: local
+
+agents:
+  - id: vision-node
+    transport: local
+    tick_rate_hz: 20.0
+    description: "Perception layer — proximity and object detection"
+    tags: [perception, jetson]
+    nodes:
+      sense:
+        - kind: examples.robot_arm.nodes.ProximitySenseNode
+        - kind: examples.robot_arm.nodes.ObjectDetectionSenseNode
+
+  - id: control-node
+    transport: local
+    tick_rate_hz: 10.0
+    description: "Motor control layer — grasp planning and execution"
+    tags: [control, raspi]
+    nodes:
+      sense:
+        - kind: examples.robot_arm.nodes.JointPositionSenseNode
+      instinct:
+        - kind: examples.robot_arm.nodes.CollisionReflex
+        - kind: examples.robot_arm.nodes.GraspInstinct
+      action:
+        - kind: examples.robot_arm.nodes.EmergencyRetractAction
+        - kind: examples.robot_arm.nodes.PickAndPlaceAction

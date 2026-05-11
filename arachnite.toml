@@ -1,0 +1,91 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Arachnite framework configuration
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# This file configures the Arachnite runtime plumbing:
+#   - tick loop speed and shutdown grace period
+#   - message transport backend
+#   - logging verbosity and output
+#   - node supervisor restart policy
+#   - context history and state persistence
+#
+# If this file is absent, all settings fall back to their defaults.
+#
+# Environment variable interpolation is supported in string values:
+#   ${VAR}           → value of VAR (error if not set)
+#   ${VAR:-default}  → value of VAR, or "default" if not set
+#
+# Usage in Python:
+#   from arachnite.framework_config import FrameworkConfig
+#   cfg       = FrameworkConfig.from_toml()          # reads this file
+#   transport = cfg.build_transport()
+#   log_sinks = cfg.build_log_sinks()
+#   context   = cfg.build_context()
+#
+#   rt = ArachniteRuntime(
+#       ...,
+#       tick_rate_hz = cfg.runtime.tick_rate_hz,
+#       log_sinks    = log_sinks,
+#   )
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── Tick loop ─────────────────────────────────────────────────────────────────
+
+[runtime]
+tick_rate_hz       = 10.0   # target ticks per second
+                            # 5.0  — power-constrained edge devices
+                            # 10.0 — balanced default
+                            # 50.0 — latency-sensitive robotics
+overrun_warn_pct   = 0.2    # log a warning when tick takes > interval * (1 + this)
+teardown_timeout_s = 5.0    # grace period for node teardown during stop()
+
+# ── Transport ─────────────────────────────────────────────────────────────────
+#
+# backend = "local"   In-process, single device (default, zero extra deps)
+# backend = "mqtt"    Edge devices via MQTT broker   (pip install arachnite[mqtt])
+# backend = "nats"    Low-latency LAN/cloud via NATS  (pip install arachnite[nats])
+# backend = "redis"   Redis pub/sub                   (pip install arachnite[redis])
+
+[transport]
+backend = "local"
+
+[transport.mqtt]
+broker = "${MQTT_BROKER:-localhost:1883}"   # host:port
+
+[transport.nats]
+url = "${NATS_URL:-nats://localhost:4222}"
+
+[transport.redis]
+url = "${REDIS_URL:-redis://localhost:6379}"
+
+# ── Logging ───────────────────────────────────────────────────────────────────
+#
+# level = one of: DEBUG | INFO | WARNING | ERROR | CRITICAL
+# file  = path to a JSON log file; leave empty for stdout only
+
+[logging]
+level = "WARNING"
+file  = ""              # e.g. "logs/arachnite.jsonl" for persistent JSON logs
+
+# ── Node supervisor ───────────────────────────────────────────────────────────
+#
+# restart_policy = "never"       — don't restart; go straight to DEAD
+# restart_policy = "on_failure"  — restart only on unhandled exception (default)
+# restart_policy = "always"      — restart on any non-STOPPED exit
+
+[supervisor]
+restart_policy  = "on_failure"
+max_restarts    = 3
+restart_delay_s = 1.0
+
+# ── Context / working memory ──────────────────────────────────────────────────
+#
+# history_length  — how many past ticks of signals to retain
+# state_path      — persist context state dict to this JSON file across reboots
+#                   leave empty for in-memory only
+# flush_on_write  — if true, flush to state_path on every set()/delete() call
+
+[context]
+history_length = 10
+state_path     = ""     # e.g. "state/context.json"
+flush_on_write = false

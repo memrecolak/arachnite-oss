@@ -1,0 +1,17 @@
+/*
+ * Jason MAS project for the pick-and-place benchmark.
+ * Run via JasonBench (which substitutes init args before invoking
+ * RunCentralisedMAS), not directly with `jason`.
+ */
+
+MAS robot_arm {
+    infrastructure: Centralised
+
+    environment: RobotArmEnv(out=jason_latencies.jsonl, cycles=10000, warmup=1000)
+
+    agents:
+        robot robot_arm.asl;
+
+    aslSourcePath:
+        "baselines/jason";
+}
