@@ -248,41 +248,6 @@ class TestQuickConstants:
         assert _QUICK_ITERATIONS_REDIS == 200
 
 
-# ── Suite registration ─────────────────────────────────────────────────────
-
-
-class TestSuiteRegistration:
-    def test_transport_latency_registered_in_suite(self) -> None:
-        from benchmarks.suite import BENCHMARKS
-        assert "transport_latency" in BENCHMARKS
-
-    def test_suite_version_bumped_to_2_4(self) -> None:
-        from benchmarks import suite
-        assert "2.4" in (suite.__doc__ or "")
-
-    @pytest.mark.asyncio
-    async def test_suite_runner_returns_expected_shape(
-        self, monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        """Suite-side runner returns the documented payload shape."""
-        monkeypatch.delenv(_ENV_VAR_MQTT,  raising=False)
-        monkeypatch.delenv(_ENV_VAR_NATS,  raising=False)
-        monkeypatch.delenv(_ENV_VAR_REDIS, raising=False)
-        from benchmarks.suite import run_transport_latency
-
-        result = await run_transport_latency(n_runs=1)
-
-        assert result["name"] == "transport_latency"
-        assert result["unit"] == "ms"
-        assert result["mode"] == "quick"
-        assert result["payload_sizes_b"] == list(_PAYLOAD_SIZES_B)
-        assert "transports" in result
-        local = result["transports"]["LocalTransport"]
-        assert local["status"] == _STATUS_MEASURED
-        for name in ("MQTTTransport", "NATSTransport", "RedisTransport"):
-            assert result["transports"][name]["status"] == _STATUS_SKIPPED
-
-
 # ── CLI smoke ───────────────────────────────────────────────────────────────
 
 

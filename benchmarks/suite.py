@@ -26,7 +26,18 @@ Output:
 
 Suite version history
 ---------------------
-v2.7 (2026-05-06) — current
+v2.8 (2026-05-11) — current
+    Drops ``transport_latency`` and ``active_inference_comparison`` from
+    the registry. Both standalone drivers
+    (``benchmarks/transport_latency.py``,
+    ``benchmarks/active_inference_comparison.py``) remain and are still
+    the right entry points for those measurements; they are simply no
+    longer invoked as part of a default suite run. Schema loses the two
+    optional top-level benchmark entries
+    (``benchmarks.transport_latency``, ``benchmarks.active_inference_comparison``);
+    no other field changes.
+
+v2.7 (2026-05-06)
     Adds the ``active_inference`` benchmark to the registry. The
     standalone driver
     (``benchmarks/active_inference_comparison.py``) was previously only
@@ -882,128 +893,6 @@ async def run_scalability_extended(n_runs: int) -> dict[str, Any]:
     }
 
 
-async def run_transport_latency(n_runs: int) -> dict[str, Any]:
-    """Transport publish-to-deliver latency benchmark (§8.2.9, Bench-2).
-
-    Always invokes the ``--quick`` preset (Local 5,000 iterations,
-    brokers 200) so a full suite run remains sub-minute on Local-only
-    hosts. Operators wanting full-N runs should invoke
-    ``python benchmarks/transport_latency.py`` directly with
-    ``--runs N`` and any ``ARACHNITE_TEST_*_URL`` env vars set. Broker
-    transports skip silently when their env var is unset (status
-    ``"skipped"`` in the result); a misconfigured broker (env var set,
-    dep missing, or connect fails) raises and aborts the suite per
-    ADR 0004 §1.
-
-    ``n_runs`` is forwarded to the benchmark as the per-cell run count
-    (each ``DescriptiveStats`` is computed from this many independent
-    runs).
-    """
-    from benchmarks.transport_latency import (
-        _PAYLOAD_SIZES_B,
-        _QUICK_ITERATIONS_LOCAL,
-        _QUICK_ITERATIONS_MQTT,
-        _QUICK_ITERATIONS_NATS,
-        _QUICK_ITERATIONS_REDIS,
-        _report_to_json,
-    )
-    from benchmarks.transport_latency import (
-        run as single_run,
-    )
-
-    reports = await single_run(
-        iterations_override=None, n_runs=n_runs, quick=True,
-    )
-    transports_out = {tr.transport: _report_to_json(tr) for tr in reports}
-    for tr in reports:
-        if tr.status == "skipped":
-            print(f"    {tr.transport}: skipped ({tr.note})")
-            continue
-        if tr.status == "failed":
-            print(f"    {tr.transport}: FAILED ({tr.note})")
-            continue
-        for cell in tr.cells:
-            print(
-                f"    {tr.transport} {cell.payload_size_b:>6d} B: "
-                f"median={cell.stats.median:.4f} ms  "
-                f"P99={cell.stats.p99:.4f} ms"
-            )
-
-    return {
-        "name": "transport_latency",
-        "unit": "ms",
-        "protocol": (
-            "in-process loopback (single BaseTransport instance acts as "
-            "both publisher and subscriber); per-payload sweep "
-            "8 B / 1 KB / 64 KB; LocalTransport always runs, broker "
-            "transports gated by ARACHNITE_TEST_<MQTT|NATS|REDIS>_URL "
-            "(unset → skipped; set but unreachable → loud failure per "
-            "ADR 0004 §1). Suite invocation uses --quick: Local "
-            f"{_QUICK_ITERATIONS_LOCAL:,} iterations, brokers "
-            f"{_QUICK_ITERATIONS_MQTT:,} iterations."
-        ),
-        "mode": "quick",
-        "n_runs": n_runs,
-        "payload_sizes_b": list(_PAYLOAD_SIZES_B),
-        "quick_iterations": {
-            "local": _QUICK_ITERATIONS_LOCAL,
-            "mqtt":  _QUICK_ITERATIONS_MQTT,
-            "nats":  _QUICK_ITERATIONS_NATS,
-            "redis": _QUICK_ITERATIONS_REDIS,
-        },
-        "transports": transports_out,
-    }
-
-
-async def run_active_inference_comparison(n_runs: int) -> dict[str, Any]:
-    """Decision-strategy comparison benchmark.
-
-    Invokes ``benchmarks.active_inference_comparison.run_async`` with the
-    driver-exported ``_QUICK_TICKS`` / ``_QUICK_WARMUP`` defaults so a
-    full suite run remains tractable. The standalone driver
-    (``python -m benchmarks.active_inference_comparison --ticks 2000``)
-    is the right entry point for publication-grade decision-quality
-    numbers. ``n_runs`` is forwarded verbatim — Wilcoxon comparison
-    needs ``n_runs ≥ 10``.
-    """
-    from benchmarks.active_inference_comparison import (
-        _QUICK_TICKS,
-        _QUICK_WARMUP,
-        run_async,
-    )
-
-    result = await run_async(
-        n_runs=n_runs, n_ticks=_QUICK_TICKS, warmup=_QUICK_WARMUP,
-    )
-
-    # Strip the redundant top-level metadata that the standalone driver
-    # writes (``benchmark`` / ``platform`` / ``machine`` / ``args``);
-    # the suite report already carries equivalent fields under
-    # ``device`` / ``timestamp`` / ``runs_per_benchmark``. Keep the
-    # measurement payload (``case_study`` / ``synthetic`` /
-    # ``pairwise_vs_weighted``) so the per-benchmark structure is
-    # preserved for downstream tooling.
-    return {
-        "name": "active_inference_comparison",
-        "unit": "mixed",  # ms (case study) + us (synthetic)
-        "protocol": (
-            "Greedy / Weighted / Random / ActiveInference compared on "
-            "two workloads — pick-and-place case study (latency in ms) "
-            "and synthetic competing-proposal decision layer (latency "
-            "in us). Suite invocation uses quick defaults: "
-            f"{_QUICK_TICKS} ticks per run, {_QUICK_WARMUP} warmup "
-            "ticks. Pairwise statistics use Weighted as the reference."
-        ),
-        "mode": "quick",
-        "n_runs": n_runs,
-        "ticks_per_run": _QUICK_TICKS,
-        "warmup": _QUICK_WARMUP,
-        "case_study": result["case_study"],
-        "synthetic":  result["synthetic"],
-        "pairwise_vs_weighted": result["pairwise_vs_weighted"],
-    }
-
-
 # ── Registry ────────────────────────────────────────────────────────────────
 
 BENCHMARKS = {
@@ -1018,14 +907,6 @@ BENCHMARKS = {
         run_multistep_action_latency,
     ),
     "soak_test": ("Soak / Stability (§8.2.8, quick mode)", run_soak_test),
-    "transport_latency": (
-        "Transport Latency (§8.2.9, quick mode)",
-        run_transport_latency,
-    ),
-    "active_inference": (
-        "Active Inference Comparison (§9.2, quick mode)",
-        run_active_inference_comparison,
-    ),
 }
 
 
@@ -1094,7 +975,7 @@ def main() -> None:
         py_tag = f"py{device_info['python_version']}"
 
         report = {
-            "suite_version": "2.7",
+            "suite_version": "2.8",
             "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
             "elapsed_s": round(elapsed, 1),
             "runs_per_benchmark": args.runs,

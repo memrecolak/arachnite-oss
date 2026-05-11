@@ -30,7 +30,7 @@ the difference is packaging — `stats.py` writes one JSON file per benchmark,
 `suite.py` writes a combined report for the whole run.
 
 Available choices: tick, stage_breakdown, reflex, memory, scalability,
-extended, multistep_action_latency, soak_test, transport_latency, all.
+extended, multistep_action_latency, soak_test, all.
 
 Output:
     JSON file in benchmarks/results/ with per-run raw data and aggregated
