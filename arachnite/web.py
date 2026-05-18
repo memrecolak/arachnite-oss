@@ -45,12 +45,6 @@ from collections import deque
 from pathlib import Path
 from typing import Any
 
-# Cookie name used to remember a validated auth token across requests so
-# the user doesn't have to keep the token in the URL bar.  Set HttpOnly
-# (JS can't read it) and SameSite=Strict (no cross-site CSRF surface).
-_AUTH_COOKIE = "arachnite_auth"
-_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1", "localhost"})
-
 from arachnite.bus import SignalBus
 from arachnite.logging import BaseLogSink, LogLevel
 from arachnite.models import (
@@ -80,6 +74,12 @@ except ImportError:  # pragma: no cover - exercised only without [web] extra
     HTMLResponse = None  # type: ignore[assignment,misc]
     PlainTextResponse = None  # type: ignore[assignment,misc]
     Response = None  # type: ignore[assignment,misc]
+
+# Cookie name used to remember a validated auth token across requests so
+# the user doesn't have to keep the token in the URL bar.  Set HttpOnly
+# (JS can't read it) and SameSite=Strict (no cross-site CSRF surface).
+_AUTH_COOKIE = "arachnite_auth"
+_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1", "localhost"})
 
 # Dashboard background image — shipped inside the package.
 _BG_IMAGE_PATH = Path(__file__).parent / "assets" / "dashboard_bg.png"
