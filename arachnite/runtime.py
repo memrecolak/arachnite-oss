@@ -746,13 +746,13 @@ class ArachniteRuntime:
                 dispatched = list(to_dispatch),
                 interrupts = list(interrupts),
             )
-            for obs in self._decision_observers:
+            for dec_obs in self._decision_observers:
                 try:
-                    obs(decision_event)
+                    dec_obs(decision_event)
                 except Exception as e:  # noqa: BLE001
                     self._logger.warning(
                         "Decision observer raised; ignoring",
-                        observer=getattr(obs, "__qualname__", repr(obs)),
+                        observer=getattr(dec_obs, "__qualname__", repr(dec_obs)),
                         error=str(e),
                     )
 

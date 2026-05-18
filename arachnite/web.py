@@ -2130,14 +2130,17 @@ class SignalDashboard(BaseLogSink):
     ) -> str | None:
         """Look for an auth token in header, query, or cookie (in that order)."""
         auth_header = headers.get("authorization")
-        if auth_header and isinstance(auth_header, str):
+        if isinstance(auth_header, str):
             prefix = "bearer "
             if auth_header.lower().startswith(prefix):
                 return auth_header[len(prefix):].strip()
         qp = query_params.get("token")
-        if qp:
+        if isinstance(qp, str) and qp:
             return qp
-        return cookies.get(_AUTH_COOKIE)
+        cookie = cookies.get(_AUTH_COOKIE)
+        if isinstance(cookie, str) and cookie:
+            return cookie
+        return None
 
     def _is_request_authorised(self, request: Any) -> bool:
         if not self._auth_token:
@@ -2147,7 +2150,9 @@ class SignalDashboard(BaseLogSink):
             query_params=request.query_params,
             cookies=request.cookies,
         )
-        return bool(sent) and secrets.compare_digest(sent, self._auth_token)
+        if sent is None:
+            return False
+        return secrets.compare_digest(sent, self._auth_token)
 
     def _is_ws_authorised(self, ws: Any) -> bool:
         if not self._auth_token:
@@ -2157,7 +2162,9 @@ class SignalDashboard(BaseLogSink):
             query_params=ws.query_params,
             cookies=ws.cookies,
         )
-        return bool(sent) and secrets.compare_digest(sent, self._auth_token)
+        if sent is None:
+            return False
+        return secrets.compare_digest(sent, self._auth_token)
 
     def _build_app(self) -> Any:
         app       = FastAPI(title="Arachnite Dashboard", docs_url=None, redoc_url=None)
