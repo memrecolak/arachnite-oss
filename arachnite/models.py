@@ -379,6 +379,25 @@ class LogLevel(Enum):
 
 
 @dataclass(slots=True)
+class DecisionEvent:
+    """
+    Per-tick snapshot of the decision layer's activity.
+
+    Emitted to observers registered on :class:`ArachniteRuntime` via
+    ``decision_observers``.  Captures every proposal the decision strategy
+    considered, which ones were dispatched, any interrupt requests issued,
+    and the name of the active strategy — enough to reconstruct *why* the
+    agent took (or did not take) an action on a given tick.
+    """
+    tick:       int
+    timestamp:  float
+    strategy:   str                       # type(strategy).__name__
+    considered: list[Proposal]
+    dispatched: list[Proposal]
+    interrupts: list[InterruptRequest]
+
+
+@dataclass(slots=True)
 class LogEvent:
     """
     A structured log record emitted by StructuredLogger.

@@ -116,10 +116,23 @@ class TestWireEncodingRoundtrip:
         assert restored.value is None
 
     def test_roundtrip_preserves_metadata(self) -> None:
+        # Decode preserves all user-supplied metadata keys verbatim.  It also
+        # injects a reserved ``__origin_agent__`` marker carrying the
+        # envelope's ``src`` so consumers can attribute the signal back to
+        # its originating agent — the test below covers that explicitly.
         t = StubTransport()
         sig = _sig("temperature", 42.0, metadata={"unit": "celsius", "sensor_id": "T1"})
         restored = t._decode_signal(t._encode_signal(sig))
-        assert restored.metadata == {"unit": "celsius", "sensor_id": "T1"}
+        assert restored.metadata["unit"] == "celsius"
+        assert restored.metadata["sensor_id"] == "T1"
+
+    def test_decode_stamps_origin_agent_in_metadata(self) -> None:
+        t = StubTransport(agent_node_id="edge-7")
+        sig = _sig("temperature", 42.0, metadata={"unit": "celsius"})
+        restored = t._decode_signal(t._encode_signal(sig))
+        assert restored.metadata["__origin_agent__"] == "edge-7"
+        # Original user metadata is still intact.
+        assert restored.metadata["unit"] == "celsius"
 
     def test_roundtrip_preserves_timestamp(self) -> None:
         t = StubTransport()
@@ -128,10 +141,12 @@ class TestWireEncodingRoundtrip:
         assert abs(restored.timestamp - sig.timestamp) < 1e-6
 
     def test_roundtrip_empty_metadata(self) -> None:
+        # Empty user-metadata still gets the origin marker.  The metadata
+        # is otherwise empty — no spurious keys are added.
         t = StubTransport()
         sig = _sig("temperature", 1.0, metadata={})
         restored = t._decode_signal(t._encode_signal(sig))
-        assert restored.metadata == {}
+        assert set(restored.metadata) == {"__origin_agent__"}
 
     def test_encode_returns_bytes(self) -> None:
         t = StubTransport()

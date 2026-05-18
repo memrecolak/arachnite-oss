@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import time
+from collections.abc import Callable
 from typing import Protocol, runtime_checkable
 
 from arachnite.bus import SignalBus
@@ -17,7 +18,17 @@ from arachnite.context import ContextNode
 from arachnite.exceptions import ActionNotFoundError, MandatoryBlockViolation
 from arachnite.health import HealthMonitor
 from arachnite.logging import BaseLogSink, LogLevel, StdoutLogSink, StructuredLogger
-from arachnite.models import ActionExecutionState, Permission, Result, ShutdownPhase, Signal
+from arachnite.models import (
+    ActionExecutionState,
+    Context,
+    DecisionEvent,
+    InterruptRequest,
+    Permission,
+    Proposal,
+    Result,
+    ShutdownPhase,
+    Signal,
+)
 from arachnite.nodes.action import ActionMasterNode, BaseActionNode
 from arachnite.nodes.base import BaseNode
 from arachnite.nodes.decision import DecisionMasterNode
@@ -108,6 +119,8 @@ class ArachniteRuntime:
         shutdown_coordinator: ShutdownCoordinator | None = None,
         allowed_permissions: dict[str, set[Permission]] | None = None,
         tick_instrumenter: TickInstrumenter | None = None,
+        context_observers: list[Callable[[Context], None]] | None = None,
+        decision_observers: list[Callable[[DecisionEvent], None]] | None = None,
     ) -> None:
         self._sense_master    = sense_master
         self._context         = context
@@ -175,6 +188,21 @@ class ArachniteRuntime:
         # the tick path short-circuits on a single branch per stage.
         self._tick_instrumenter: TickInstrumenter | None = tick_instrumenter
 
+        # Optional per-tick Context observers. Each callable is invoked with
+        # the freshly assembled Context after ContextNode.update() each tick.
+        # Exceptions in observers are swallowed (and logged) so a faulty
+        # observer cannot crash the tick loop.
+        self._context_observers: list[Callable[[Context], None]] = (
+            list(context_observers) if context_observers else []
+        )
+
+        # Optional per-tick DecisionEvent observers (e.g. SignalDashboard).
+        # Fired once per tick after the decide stage, after considered /
+        # dispatched / interrupts are all known.  Exceptions are isolated.
+        self._decision_observers: list[Callable[[DecisionEvent], None]] = (
+            list(decision_observers) if decision_observers else []
+        )
+
     # ── Public properties ─────────────────────────────────────────────────────
 
     @property
@@ -201,6 +229,38 @@ class ArachniteRuntime:
     @property
     def bus(self) -> SignalBus:
         return self._bus
+
+    # ── Context observers ────────────────────────────────────────────────────
+
+    def add_context_observer(
+        self, observer: Callable[[Context], None],
+    ) -> None:
+        """Register a callable invoked with each tick's Context snapshot."""
+        if observer not in self._context_observers:
+            self._context_observers.append(observer)
+
+    def remove_context_observer(
+        self, observer: Callable[[Context], None],
+    ) -> None:
+        """Unregister a previously added Context observer (no-op if absent)."""
+        with contextlib.suppress(ValueError):
+            self._context_observers.remove(observer)
+
+    # ── Decision observers ───────────────────────────────────────────────────
+
+    def add_decision_observer(
+        self, observer: Callable[[DecisionEvent], None],
+    ) -> None:
+        """Register a callable invoked with each tick's DecisionEvent."""
+        if observer not in self._decision_observers:
+            self._decision_observers.append(observer)
+
+    def remove_decision_observer(
+        self, observer: Callable[[DecisionEvent], None],
+    ) -> None:
+        """Unregister a previously added Decision observer (no-op if absent)."""
+        with contextlib.suppress(ValueError):
+            self._decision_observers.remove(observer)
 
     # ── Tick instrumentation (ADR 0002) ──────────────────────────────────────
 
@@ -279,7 +339,6 @@ class ArachniteRuntime:
         self._running = False
         self._stop_event.set()
         # Force-interrupt all running actions
-        from arachnite.models import InterruptRequest, Proposal
         emergency = Proposal(
             instinct_id="emergency_stop",
             action_id="__emergency__",
@@ -573,6 +632,18 @@ class ArachniteRuntime:
             results=self._last_results,
         )
 
+        # Notify Context observers (e.g. SignalDashboard).  Failures here are
+        # isolated — a broken observer cannot stall the tick loop.
+        for obs in self._context_observers:
+            try:
+                obs(ctx)
+            except Exception as e:  # noqa: BLE001
+                self._logger.warning(
+                    "Context observer raised; ignoring",
+                    observer=getattr(obs, "__qualname__", repr(obs)),
+                    error=str(e),
+                )
+
         if instrumenter is not None:
             now = time.monotonic()
             self._emit_stage(instrumenter, "context", now - stage_start)
@@ -661,6 +732,29 @@ class ArachniteRuntime:
                     action_id=interrupt_req.new_proposal.action_id,
                     error=str(exc),
                 )
+
+        # Fan out DecisionEvent to observers (e.g. SignalDashboard).  This
+        # happens before the act stage so observers see the dispatch plan as
+        # decided, independent of action outcomes.  Failures are isolated —
+        # a broken observer cannot stall the tick loop.
+        if self._decision_observers:
+            decision_event = DecisionEvent(
+                tick       = self._tick_count,
+                timestamp  = time.monotonic(),
+                strategy   = type(self._decision_master.strategy).__name__,
+                considered = list(all_considered),
+                dispatched = list(to_dispatch),
+                interrupts = list(interrupts),
+            )
+            for obs in self._decision_observers:
+                try:
+                    obs(decision_event)
+                except Exception as e:  # noqa: BLE001
+                    self._logger.warning(
+                        "Decision observer raised; ignoring",
+                        observer=getattr(obs, "__qualname__", repr(obs)),
+                        error=str(e),
+                    )
 
         if instrumenter is not None:
             now = time.monotonic()

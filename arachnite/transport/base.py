@@ -115,13 +115,21 @@ class BaseTransport(ABC):
             )
         sig = envelope["sig"]
         value = self._codec.decode(sig["kind"], sig["value"])
+        # Preserve the originating agent in metadata under a reserved key
+        # so consumers (the dashboard, mesh-aware instincts) can attribute
+        # the signal back to its source agent.  The local bus never sets
+        # this key, so its presence means "delivered over the wire".
+        metadata = dict(sig.get("metadata") or {})
+        origin = envelope.get("src")
+        if origin:
+            metadata.setdefault("__origin_agent__", origin)
         return Signal(
             source     = sig["source"],
             kind       = sig["kind"],
             value      = value,
             confidence = sig["confidence"],
             timestamp  = sig["timestamp"],
-            metadata   = sig.get("metadata", {}),
+            metadata   = metadata,
         )
 
     @property

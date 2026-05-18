@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import signal
+import sys
 
 # Re-use all the nodes from the temperature monitor example
 from examples.temperature_monitor import (
@@ -71,33 +72,47 @@ async def main() -> None:
     action_master.register(EmergencyStop(bus=bus, log_sinks=log_sinks))
 
     rt = ArachniteRuntime(
-        sense_master    = sense_master,
-        context         = ContextNode(),
-        instinct_master = instinct_master,
-        decision_master = decision_master,
-        action_master   = action_master,
-        bus             = bus,
-        tick_rate_hz    = 4.0,
-        log_sinks       = log_sinks,
+        sense_master      = sense_master,
+        context           = ContextNode(),
+        instinct_master   = instinct_master,
+        decision_master   = decision_master,
+        action_master     = action_master,
+        bus               = bus,
+        tick_rate_hz      = 4.0,
+        log_sinks         = log_sinks,
+        # Wire per-tick Context + Decision snapshots into the details pane.
+        context_observers  = [dashboard.submit_context],
+        decision_observers = [dashboard.submit_decision],
     )
 
-    # Register OS signal handlers so Ctrl+C / SIGTERM trigger graceful shutdown
-    loop = asyncio.get_running_loop()
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        loop.add_signal_handler(sig, lambda: asyncio.create_task(rt.stop()))
+    # Register OS signal handlers so SIGINT/SIGTERM trigger graceful shutdown.
+    # Windows' asyncio doesn't support loop.add_signal_handler, so we skip
+    # registration there and rely on the KeyboardInterrupt path below.
+    if sys.platform != "win32":
+        loop = asyncio.get_running_loop()
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            loop.add_signal_handler(sig, lambda: asyncio.create_task(rt.stop()))
 
     await dashboard.start()
     print("Dashboard: http://localhost:7070")
     print("Log file:  temperature_monitor.log")
     print("Press Ctrl+C to stop.")
-    print("─" * 50)
+    print("-" * 50)
 
     await rt.start()
-    await rt.wait()           # blocks until rt.stop() is called
-
-    await dashboard.stop()
+    try:
+        await rt.wait()       # blocks until rt.stop() is called
+    except (KeyboardInterrupt, asyncio.CancelledError):
+        # On Windows, Ctrl+C surfaces here as KeyboardInterrupt.
+        pass
+    finally:
+        await rt.stop()
+        await dashboard.stop()
     print(f"\nStopped after {rt.tick_count} ticks.")
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        pass
