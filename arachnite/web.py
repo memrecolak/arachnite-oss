@@ -104,18 +104,24 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
 <title>Arachnite Dashboard</title>
 <style>
 :root {
-  --bg:      #02050d;
-  --surface: rgba(10, 22, 40, 0.88);
-  --surface-solid: #0a1628;
-  --border:  #1e4d7a;
-  --text:    #cfe9ff;
-  --muted:   #5a82a8;
-  --green:   #5fd9b3;
-  --red:     #e05555;
-  --yellow:  #e0b040;
-  --cyan:    #4dc4ff;
-  --cyan-bright: #9adcff;
-  --magenta: #c060e0;
+  /* "Noble" palette — deep midnight base, antique-gold accents.
+     The --cyan / --cyan-bright names are kept (aliased to gold) so the
+     existing class selectors don't need renaming; semantically they are
+     now the primary highlight colour. */
+  --bg:            #0a0c13;
+  --surface:       rgba(20, 22, 32, 0.78);
+  --surface-solid: #14161f;
+  --border:        #4a3c22;
+  --text:          #ede1c5;
+  --muted:         #8a7a55;
+  --green:         #8ac795;
+  --red:           #d06868;
+  --yellow:        #e0b87a;
+  --gold:          #d4ad6c;
+  --gold-bright:   #f0d394;
+  --cyan:          var(--gold);
+  --cyan-bright:   var(--gold-bright);
+  --magenta:       #b07adb;
 }
 * { box-sizing: border-box; margin: 0; padding: 0; }
 html, body { height: 100%; }
@@ -130,14 +136,17 @@ body {
   position: relative;
 }
 /* Background image — fixed, covers viewport, sits behind everything.
-   Darkened by a stacked gradient so foreground rows stay readable. */
+   A lighter top-to-bottom warm-dark wash keeps the spider/circuit art
+   readable through the chrome without washing out the foreground rows.
+   A subtle radial vignette at the edges deepens the "noble" feel. */
 body::before {
   content: "";
   position: fixed;
   inset: 0;
   z-index: -1;
   background:
-    linear-gradient(rgba(2, 5, 13, 0.78), rgba(2, 5, 13, 0.82)),
+    radial-gradient(ellipse at center, rgba(10, 12, 20, 0.35) 0%, rgba(6, 8, 14, 0.85) 100%),
+    linear-gradient(rgba(10, 12, 20, 0.55), rgba(10, 12, 20, 0.78)),
     url('/bg.png') center center / cover no-repeat;
 }
 
@@ -147,7 +156,7 @@ body::before {
   backdrop-filter: blur(8px);
   -webkit-backdrop-filter: blur(8px);
   border-bottom: 1px solid var(--border);
-  box-shadow: 0 0 14px rgba(77, 196, 255, 0.12);
+  box-shadow: 0 0 14px rgba(232, 192, 120, 0.12);
   padding: 9px 16px;
   display: flex;
   align-items: center;
@@ -158,9 +167,10 @@ body::before {
 #title {
   font-size: 14px;
   font-weight: 600;
+  letter-spacing: 0.6px;
   white-space: nowrap;
   color: var(--cyan-bright);
-  text-shadow: 0 0 8px rgba(77, 196, 255, 0.55);
+  text-shadow: 0 0 10px rgba(232, 192, 120, 0.45), 0 0 2px rgba(232, 192, 120, 0.3);
 }
 #status {
   font-size: 11px;
@@ -184,7 +194,7 @@ body::before {
   align-items: center;
   gap: 8px;
   padding: 2px 10px;
-  background: rgba(2, 8, 18, 0.45);
+  background: rgba(12, 14, 22, 0.45);
   border: 1px solid var(--border);
   border-radius: 10px;
   letter-spacing: 0.3px;
@@ -196,7 +206,7 @@ body::before {
 #filter {
   flex: 1;
   min-width: 160px;
-  background: rgba(2, 8, 18, 0.6);
+  background: rgba(12, 14, 22, 0.6);
   border: 1px solid var(--border);
   color: var(--text);
   padding: 4px 10px;
@@ -207,13 +217,13 @@ body::before {
 }
 #filter:focus {
   border-color: var(--cyan);
-  box-shadow: 0 0 6px rgba(77, 196, 255, 0.4);
+  box-shadow: 0 0 6px rgba(232, 192, 120, 0.4);
 }
 .btn {
   padding: 4px 12px;
   border-radius: 4px;
   border: 1px solid var(--border);
-  background: rgba(10, 22, 40, 0.7);
+  background: rgba(22, 24, 34, 0.7);
   color: var(--text);
   cursor: pointer;
   font-size: 11.5px;
@@ -223,7 +233,7 @@ body::before {
 .btn:hover {
   border-color: var(--cyan);
   color: var(--cyan-bright);
-  box-shadow: 0 0 6px rgba(77, 196, 255, 0.3);
+  box-shadow: 0 0 6px rgba(232, 192, 120, 0.3);
 }
 #btn-pause.on { border-color: var(--yellow); color: var(--yellow); }
 #count { font-size: 11px; color: var(--muted); white-space: nowrap; margin-left: auto; }
@@ -249,7 +259,7 @@ body::before {
   border: 1px solid;
   cursor: default;
   white-space: nowrap;
-  background: rgba(2, 8, 18, 0.45);
+  background: rgba(12, 14, 22, 0.45);
 }
 
 /* Severity totals strip — pinned left side of #stats */
@@ -266,7 +276,7 @@ body::before {
   padding: 2px 8px;
   border-radius: 10px;
   border: 1px solid;
-  background: rgba(2, 8, 18, 0.45);
+  background: rgba(12, 14, 22, 0.45);
   cursor: pointer;
   user-select: none;
   opacity: 0.45;
@@ -299,7 +309,7 @@ body::before {
   padding: 2px 8px;
   border-radius: 10px;
   border: 1px solid;
-  background: rgba(2, 8, 18, 0.45);
+  background: rgba(12, 14, 22, 0.45);
   cursor: pointer;
   user-select: none;
   opacity: 0.85;
@@ -345,16 +355,16 @@ body::before {
   padding: 2px 16px;
   border-bottom: 1px solid transparent;
 }
-.row:hover { background: rgba(30, 77, 122, 0.18); }
+.row:hover { background: rgba(110, 86, 42, 0.18); }
 .row.hidden { display: none; }
 .ts   { color: var(--muted); white-space: nowrap; width: 88px; flex-shrink: 0; }
 .dt   { color: var(--muted); white-space: nowrap; width: 56px; flex-shrink: 0; text-align: right; opacity: 0.55; font-size: 11px; }
 .tb   { font-size: 10px; padding: 1px 5px; border-radius: 3px; flex-shrink: 0; width: 32px; text-align: center; }
-.tb-l { background: rgba(30, 77, 122, 0.35); color: var(--cyan); }
+.tb-l { background: rgba(110, 86, 42, 0.35); color: var(--cyan); }
 .tb-s { background: rgba(30, 100, 90, 0.35); color: var(--green); }
 .lb   { font-size: 10px; padding: 1px 6px; border-radius: 3px; flex-shrink: 0; min-width: 64px; text-align: center; }
 .lv-DEBUG    { background: rgba(20, 30, 50, 0.55); color: #7ea8c8; }
-.lv-INFO     { background: rgba(30, 77, 122, 0.45); color: var(--cyan); }
+.lv-INFO     { background: rgba(110, 86, 42, 0.45); color: var(--cyan); }
 .lv-WARNING  { background: rgba(60, 50, 15, 0.5); color: var(--yellow); }
 .lv-ERROR    { background: rgba(70, 20, 20, 0.5); color: var(--red); }
 .lv-CRITICAL { background: rgba(55, 20, 70, 0.5); color: var(--magenta); }
@@ -376,14 +386,14 @@ body::before {
   bottom: 14px;
   padding: 6px 14px 6px 12px;
   border-radius: 14px;
-  background: rgba(10, 22, 40, 0.92);
+  background: rgba(22, 24, 34, 0.92);
   color: var(--cyan-bright);
   border: 1px solid var(--cyan);
   font-family: inherit;
   font-size: 11.5px;
   font-weight: 500;
   cursor: pointer;
-  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.55), 0 0 10px rgba(77, 196, 255, 0.35);
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.55), 0 0 10px rgba(232, 192, 120, 0.35);
   display: none;
   align-items: center;
   gap: 6px;
@@ -400,16 +410,16 @@ body::before {
   opacity: 1;
   transform: translateY(0);
 }
-#scroll-pill:hover { background: rgba(30, 77, 122, 0.92); }
+#scroll-pill:hover { background: rgba(110, 86, 42, 0.92); }
 #scroll-pill .arrow { font-size: 13px; line-height: 1; }
 
 /* ── Row selection ───────────────────────────────────────────────────────── */
 .row { cursor: pointer; }
 .row.selected {
-  background: rgba(77, 196, 255, 0.18);
+  background: rgba(232, 192, 120, 0.18);
   border-left: 3px solid var(--cyan);
   padding-left: 13px;
-  box-shadow: inset 0 0 0 9999px rgba(77, 196, 255, 0.06);
+  box-shadow: inset 0 0 0 9999px rgba(232, 192, 120, 0.06);
 }
 
 /* ── Splitter ────────────────────────────────────────────────────────────── */
@@ -422,7 +432,7 @@ body::before {
 }
 #splitter:hover, #splitter.dragging {
   background: var(--cyan);
-  box-shadow: 0 0 8px rgba(77, 196, 255, 0.55);
+  box-shadow: 0 0 8px rgba(232, 192, 120, 0.55);
 }
 
 /* ── Details pane ────────────────────────────────────────────────────────── */
@@ -478,7 +488,7 @@ body::before {
   margin-top: 14px;
   padding-top: 8px;
   border-top: 1px dashed var(--border);
-  text-shadow: 0 0 6px rgba(77, 196, 255, 0.35);
+  text-shadow: 0 0 6px rgba(232, 192, 120, 0.35);
 }
 /* Nested titles inside the Context body — smaller, indented, no caps so they
    read as second-level. */
@@ -499,10 +509,10 @@ body::before {
 }
 .fields-table td.k { color: var(--muted); width: 170px; white-space: nowrap; }
 .fields-table td.v { color: var(--text); word-break: break-word; }
-.fields-table tr:hover { background: rgba(30, 77, 122, 0.12); }
+.fields-table tr:hover { background: rgba(110, 86, 42, 0.12); }
 
 .raw-pre {
-  background: rgba(2, 8, 18, 0.55);
+  background: rgba(12, 14, 22, 0.55);
   border: 1px solid var(--border);
   border-radius: 4px;
   padding: 8px 10px;
@@ -517,7 +527,7 @@ body::before {
   padding: 1px 8px;
   border-radius: 3px;
   border: 1px solid var(--border);
-  background: rgba(10, 22, 40, 0.7);
+  background: rgba(22, 24, 34, 0.7);
   color: var(--text);
   cursor: pointer;
   margin-left: 8px;
@@ -528,55 +538,79 @@ body::before {
 body.dragging { user-select: none; cursor: row-resize; }
 
 /* ── Light theme ─────────────────────────────────────────────────────────── */
-/* Overrides the core palette plus the handful of hard-coded rgba() backgrounds
-   that would otherwise stay near-black under a light background.            */
+/* Cream/parchment surface with sienna-gold accents — the noble palette's
+   daylight counterpart.  Overrides the core palette plus the hard-coded
+   rgba() backgrounds that would otherwise sit at dark-mode values.        */
 body.light {
-  --bg:          #f4f6fa;
-  --surface:     rgba(255, 255, 255, 0.92);
-  --surface-solid: #ffffff;
-  --border:      #c4d4e6;
-  --text:        #1a2a3f;
-  --muted:       #6a8398;
-  --green:       #1a9c70;
-  --red:         #c83434;
-  --yellow:      #a87010;
-  --cyan:        #1a72b8;
-  --cyan-bright: #0a508c;
-  --magenta:     #8a3ab8;
+  --bg:            #f6f1e3;
+  --surface:       rgba(252, 248, 236, 0.92);
+  --surface-solid: #fcf8ec;
+  --border:        #c8b58a;
+  --text:          #2a2418;
+  --muted:         #8a7a55;
+  --green:         #4a8a5e;
+  --red:           #b84848;
+  --yellow:        #9a6a18;
+  --gold:          #8a6a28;
+  --gold-bright:   #6a4e14;
+  --cyan:          var(--gold);
+  --cyan-bright:   var(--gold-bright);
+  --magenta:       #8a3ab8;
 }
-body.light::before { background: var(--bg); }
-body.light #title { text-shadow: none; }
-body.light #header { box-shadow: 0 0 14px rgba(26, 114, 184, 0.08); }
-body.light #status { background: rgba(220, 240, 230, 0.7); border-color: rgba(26, 156, 112, 0.4); }
-body.light #status.disc { background: rgba(245, 220, 220, 0.7); border-color: rgba(200, 52, 52, 0.4); }
-body.light #rt-status { background: rgba(245, 248, 252, 0.6); }
-body.light #filter { background: rgba(245, 248, 252, 0.85); }
-body.light #filter:focus { box-shadow: 0 0 6px rgba(26, 114, 184, 0.3); }
-body.light .btn { background: rgba(245, 248, 252, 0.85); }
-body.light .btn:hover { box-shadow: 0 0 6px rgba(26, 114, 184, 0.25); }
+/* Light theme keeps the same artwork.  invert(1) + hue-rotate(180deg) maps
+   the dark-navy plate to cream parchment and the gold circuit traces to
+   warm sienna — so the spider silhouette and routing lines stay readable
+   under daylight chrome.  brightness/saturate are tuned by eye to land
+   in noble warm territory rather than washed-out beige or neon orange. */
+body.light::before {
+  background: url('/bg.png') center center / cover no-repeat;
+  filter: invert(1) hue-rotate(180deg) saturate(0.78) brightness(1.04);
+}
+/* Separate ::after wash sits above the inverted image but is itself NOT
+   filtered, so we can tint with real cream rgba without it flipping to a
+   dark navy.  Provides the radial vignette + a top-down warm gradient. */
+body.light::after {
+  content: "";
+  position: fixed;
+  inset: 0;
+  z-index: -1;
+  pointer-events: none;
+  background:
+    radial-gradient(ellipse at center, rgba(246, 241, 227, 0.0) 0%, rgba(214, 196, 156, 0.30) 100%),
+    linear-gradient(rgba(246, 241, 227, 0.22), rgba(246, 241, 227, 0.42));
+}
+body.light #title { text-shadow: 0 0 6px rgba(154, 120, 54, 0.25), 0 0 1px rgba(106, 78, 20, 0.4); }
+body.light #header { box-shadow: 0 0 14px rgba(154, 120, 54, 0.10); }
+body.light #status { background: rgba(225, 240, 220, 0.75); border-color: rgba(74, 138, 94, 0.4); }
+body.light #status.disc { background: rgba(245, 220, 220, 0.75); border-color: rgba(184, 72, 72, 0.4); }
+body.light #rt-status { background: rgba(248, 244, 232, 0.7); }
+body.light #filter { background: rgba(252, 248, 236, 0.85); }
+body.light #filter:focus { box-shadow: 0 0 6px rgba(154, 120, 54, 0.35); }
+body.light .btn { background: rgba(252, 248, 236, 0.85); }
+body.light .btn:hover { box-shadow: 0 0 6px rgba(154, 120, 54, 0.3); }
 body.light .sev,
 body.light .agent-pill,
-body.light .badge { background: rgba(245, 248, 252, 0.85); }
-body.light .sev-DEBUG { color: #4a6a86; border-color: #4a6a86; }
-body.light .row:hover { background: rgba(26, 114, 184, 0.08); }
+body.light .badge { background: rgba(252, 248, 236, 0.85); }
+body.light .sev-DEBUG { color: #6a5a3e; border-color: #6a5a3e; }
+body.light .row:hover { background: rgba(154, 120, 54, 0.08); }
 body.light .row.selected {
-  background: rgba(26, 114, 184, 0.12);
-  box-shadow: inset 0 0 0 9999px rgba(26, 114, 184, 0.04);
+  background: rgba(154, 120, 54, 0.14);
+  box-shadow: inset 0 0 0 9999px rgba(154, 120, 54, 0.05);
 }
-body.light .tb-l { background: rgba(26, 114, 184, 0.18); color: var(--cyan); }
-body.light .tb-s { background: rgba(26, 156, 112, 0.18); color: var(--green); }
-body.light .lv-DEBUG    { background: rgba(74, 106, 134, 0.15); color: #4a6a86; }
-body.light .lv-INFO     { background: rgba(26, 114, 184, 0.15); color: var(--cyan); }
-body.light .lv-WARNING  { background: rgba(168, 112, 16, 0.18); color: var(--yellow); }
-body.light .lv-ERROR    { background: rgba(200, 52, 52, 0.15); color: var(--red); }
+body.light .tb-l { background: rgba(154, 120, 54, 0.18); color: var(--gold-bright); }
+body.light .tb-s { background: rgba(74, 138, 94, 0.18); color: var(--green); }
+body.light .lv-DEBUG    { background: rgba(106, 90, 62, 0.15); color: #6a5a3e; }
+body.light .lv-INFO     { background: rgba(154, 120, 54, 0.15); color: var(--gold-bright); }
+body.light .lv-WARNING  { background: rgba(154, 106, 24, 0.18); color: var(--yellow); }
+body.light .lv-ERROR    { background: rgba(184, 72, 72, 0.15); color: var(--red); }
 body.light .lv-CRITICAL { background: rgba(138, 58, 184, 0.15); color: var(--magenta); }
 body.light #scroll-pill {
-  background: rgba(255, 255, 255, 0.95);
-  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.12), 0 0 10px rgba(26, 114, 184, 0.25);
+  background: rgba(252, 248, 236, 0.95);
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.12), 0 0 10px rgba(154, 120, 54, 0.3);
 }
-body.light #scroll-pill:hover { background: rgba(230, 240, 250, 0.95); }
-body.light .raw-pre { background: rgba(245, 248, 252, 0.85); color: var(--cyan-bright); }
-body.light .copy-btn { background: rgba(245, 248, 252, 0.85); }
+body.light #scroll-pill:hover { background: rgba(244, 234, 210, 0.95); }
+body.light .raw-pre { background: rgba(248, 244, 232, 0.85); color: var(--gold-bright); }
+body.light .copy-btn { background: rgba(252, 248, 236, 0.85); }
 </style>
 </head>
 <body>
