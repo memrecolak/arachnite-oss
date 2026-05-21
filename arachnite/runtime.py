@@ -575,8 +575,6 @@ class ArachniteRuntime:
         and then drive ticks deterministically via this method.
         """
         self._tick_count += 1
-        self._last_results = []
-        self._last_result = None
         tick_start = time.monotonic()
 
         # Sync the per-tick counter on the runtime + master loggers so that
@@ -631,6 +629,14 @@ class ArachniteRuntime:
             action_states=action_states,
             results=self._last_results,
         )
+
+        # Prior-tick results have now been snapshotted into ``ctx`` and are
+        # observable by instincts via ``ctx.last_results`` / ``ctx.last_result``
+        # for the duration of this tick.  Clear the runtime-side slots so this
+        # tick's reflex/normal dispatch writes (below) cannot accumulate with
+        # older values — gives ``last_results`` precisely one tick of lifetime.
+        self._last_results = []
+        self._last_result = None
 
         # Notify Context observers (e.g. SignalDashboard).  Failures here are
         # isolated — a broken observer cannot stall the tick loop.

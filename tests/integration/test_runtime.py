@@ -10,10 +10,10 @@ import pytest
 from arachnite import ContextNode, SignalBus
 from arachnite.exceptions import MandatoryBlockViolation
 from arachnite.logging import BaseLogSink, LogLevel
-from arachnite.models import InterruptRequest, LogEvent, Proposal, Result, Signal
+from arachnite.models import Context, InterruptRequest, LogEvent, Proposal, Result, Signal
 from arachnite.nodes.action import ActionMasterNode, BaseActionNode
 from arachnite.nodes.decision import DecisionMasterNode, GreedyDecisionNode
-from arachnite.nodes.instinct import InstinctMasterNode
+from arachnite.nodes.instinct import BaseInstinctNode, InstinctMasterNode
 from arachnite.nodes.sense import SenseMasterNode
 from arachnite.runtime import ArachniteRuntime
 from tests.conftest import (
@@ -389,44 +389,151 @@ class TestMandatoryBlockViolationLogging:
         assert "transport down" in errors[0].data.get("error", "")
 
 
-# ── A-09 / A-18: Stale _last_result cleared across ticks ───────────────────
+# ── Result carry-over lifecycle (one-tick) ─────────────────────────────────
 
 
-class TestStaleResultIntegration:
-    """Integration test: context.last_result must not carry over from a
-    previous tick when no action is dispatched (A-09 / A-18)."""
+class TestLastResultsCarryOver:
+    """The runtime carries action ``Result``\\ s into the *next* tick's
+    Context so instincts can react to outcomes (per ``Result`` docstring
+    "Fed back into the next tick's Context").  Lifetime is exactly one
+    tick: after the carry-over snapshot is consumed, the runtime-side
+    slots are cleared so an immediately-following idle tick presents
+    empty results.
+
+    Supersedes the prior A-09 / A-18 ``test_context_results_fresh_each_tick``
+    assertion that ``ctx.last_results`` is empty in the very next tick —
+    that behaviour was the bug.  Stale-across-many-idle-ticks (A-09's
+    actual concern) is still bounded because the runtime now clears its
+    own slots after the carry-over is snapshotted into ctx.
+    """
 
     @pytest.mark.asyncio
-    async def test_context_results_fresh_each_tick(self) -> None:
-        """After a tick that dispatches an action, the next idle tick must
-        present empty results to instincts via the context snapshot."""
-        # Sensor above threshold → instinct fires on tick 1
+    async def test_prior_tick_result_visible_then_cleared(self) -> None:
+        """Tick 1 dispatches; tick 2's ctx carries the result; tick 3
+        (still idle) sees an empty list because tick 2 had nothing to
+        carry forward."""
         rt, recording = build_runtime(sensor_value=90.0, threshold=80.0)
         await rt.start()
         await rt.pause()
         recording.calls.clear()
 
-        # Tick 1: instinct fires, action dispatched
+        # Tick 1: instinct fires, action dispatched.  The runtime stores
+        # the result in ``_last_results`` for the next tick to carry over.
         await rt.tick()
         assert len(recording.calls) >= 1, "tick 1 must dispatch an action"
-        assert rt._last_result is not None
+        tick1_action_id = "CoolDownAction"
 
-        # Lower sensor below threshold so instinct no longer fires
-        # Swap the sense master's node for one that reads below threshold
+        # Lower sensor below threshold so instinct no longer fires.
         rt._sense_master._nodes.clear()
         rt._sense_master.register(
             ConstantSenseNode(bus=rt.bus, value=50.0)
         )
 
-        # Tick 2: instinct returns None, no dispatch
+        # Tick 2: instinct returns None, no dispatch.  The ctx built at
+        # the start of this tick MUST carry tick 1's result.
         await rt.tick()
+        ctx_tick2 = rt.context.snapshot()
+        assert ctx_tick2.last_result is not None, (
+            "tick 2's ctx must carry tick 1's result (one-tick feedback)"
+        )
+        assert ctx_tick2.last_result.action_id == tick1_action_id
+        assert len(ctx_tick2.last_results) == 1
+        assert ctx_tick2.last_results[0].action_id == tick1_action_id
 
-        # Results must be cleared — context snapshot must reflect this
-        ctx = rt.context.snapshot()
+        # The runtime-side slots are cleared after the carry-over snapshot
+        # so the next idle tick has nothing to carry forward.
         assert rt._last_results == []
         assert rt._last_result is None
-        assert ctx.last_result is None
-        assert ctx.last_results == []
+
+        # Tick 3: still idle.  ctx must now be empty — staleness is bounded
+        # to exactly one tick (A-09's underlying concern).
+        await rt.tick()
+        ctx_tick3 = rt.context.snapshot()
+        assert ctx_tick3.last_result is None
+        assert ctx_tick3.last_results == []
+
+        await rt.stop()
+
+    @pytest.mark.asyncio
+    async def test_instinct_observes_prior_result_via_ctx(self) -> None:
+        """A normal instinct's ``evaluate(ctx)`` MUST receive a non-empty
+        ``ctx.last_results`` on the tick following a dispatch.  This is
+        the read path that ``LLMInstinctNode`` and downstream consumers
+        rely on; prior to the A1 fix it was always empty."""
+        bus = SignalBus()
+        context = ContextNode(history_length=5)
+
+        sense_master    = SenseMasterNode(bus=bus)
+        instinct_master = InstinctMasterNode(bus=bus)
+        decision_master = DecisionMasterNode(
+            bus=bus, strategy=GreedyDecisionNode(bus=bus),
+        )
+        action_master   = ActionMasterNode(bus=bus)
+
+        sensor = ConstantSenseNode(bus=bus, value=90.0)
+        sensor.poll_interval_s = 0.0  # don't throttle across rapid ticks
+        sense_master.register(sensor)
+        instinct_master.register(ThresholdInstinct(bus=bus, threshold=80.0))
+
+        recorded_last_results: list[list[Result]] = []
+
+        class ObservingInstinct(BaseInstinctNode):
+            """Read-only instinct: records what it sees in ctx.last_results
+            and never produces a proposal, so its presence does not affect
+            dispatch."""
+            node_id  = "ObservingInstinct"
+            priority = 1
+
+            async def evaluate(self, ctx: Context) -> Proposal | None:
+                recorded_last_results.append(list(ctx.last_results))
+                return None
+
+        observer = ObservingInstinct(bus=bus)
+        instinct_master.register(observer)
+
+        recording = RecordingAction(bus=bus)
+        recording.node_id = "CoolDownAction"  # type: ignore[assignment]
+        action_master.register(recording)
+
+        rt = ArachniteRuntime(
+            sense_master    = sense_master,
+            context         = context,
+            instinct_master = instinct_master,
+            decision_master = decision_master,
+            action_master   = action_master,
+            bus             = bus,
+            tick_rate_hz    = 100.0,
+        )
+        await rt.start()
+        await rt.pause()
+
+        # Three ticks: tick 1 dispatches, tick 2 carries it forward, tick 3
+        # idle (no carry-over because tick 2 didn't dispatch — observer
+        # is read-only and never produces a proposal).
+        await rt.tick()
+        await rt.tick()
+        await rt.tick()
+
+        assert len(recorded_last_results) == 3, "instinct must evaluate each tick"
+
+        # Tick 1: no prior tick, last_results is empty.
+        assert recorded_last_results[0] == []
+
+        # Tick 2: tick 1's CoolDownAction result MUST be visible.  This is
+        # the assertion the framework was missing — the original ctx.last_results
+        # bug bypassed it because no test exercised the runtime path with
+        # an observing instinct that actually reads ctx.last_results.
+        assert len(recorded_last_results[1]) == 1, (
+            "tick 2's ctx.last_results must carry tick 1's dispatch result"
+        )
+        assert recorded_last_results[1][0].action_id == "CoolDownAction"
+        assert recorded_last_results[1][0].success is True
+
+        # Tick 3: tick 2 also dispatched (ThresholdInstinct still fires
+        # against sensor=90.0), so ctx.last_results carries tick 2's result.
+        assert len(recorded_last_results[2]) == 1
+        assert recorded_last_results[2][0].action_id == "CoolDownAction"
+
         await rt.stop()
 
 

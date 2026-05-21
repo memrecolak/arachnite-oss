@@ -138,13 +138,7 @@ async def tick\(self\) \-> None:
 
     tick\_start = time\.monotonic\(\)
 
-    \# 0a\. Reset per\-tick result state\.  \_last\_results and \_last\_result
-    \#     MUST be cleared at the start of every tick so that stale results
-    \#     from a previous tick never leak into the current tick's context\.
-    self\.\_last\_results = \[\]
-    self\.\_last\_result  = None
-
-    \# 0b\. Notify all leaf nodes that a new tick is starting
+    \# 0\. Notify all leaf nodes that a new tick is starting
 
     await asyncio\.gather\(
 
@@ -170,9 +164,17 @@ async def tick\(self\) \-> None:
 
     self\.\_supervisor\_signal\_buffer\.clear\(\)
 
-    \# 3\. Context update
+    \# 3\. Context update — snapshot the *previous* tick's results into
+    \#    ctx so instincts can react to outcomes \(``Result`` docstring:
+    \#    "Fed back into the next tick's Context"\)\. After the snapshot
+    \#    is taken, clear the runtime\-side slots so this tick's dispatch
+    \#    \(below\) writes into a clean buffer — bounding ``last\_results``
+    \#    to a one\-tick lifetime\. See §7\.2\.1\.
 
     ctx      = self\.\_context\.update\(signals, self\.\_last\_result\)
+
+    self\.\_last\_results = \[\]
+    self\.\_last\_result  = None
 
     \# 4\. Reflex pass — bypass decision if any reflex fires
 
@@ -279,6 +281,20 @@ async def tick\(self\) \-> None:
         self\.\_action\_master\.notify\_tick\_end\(self\.\_tick\_count, tick\_duration\),
 
     \)
+
+### __7\.2\.1 ``last\_results`` lifecycle__
+
+The runtime's ``\_last\_results`` / ``\_last\_result`` slots carry action ``Result``s into exactly *one* subsequent tick, providing the feedback channel that ``Result``'s docstring promises and that ``LLMInstinctNode`` reads via ``ctx\.last\_results`` / ``ctx\.last\_result``\.
+
+Lifecycle per tick N\+1, given dispatch in tick N:
+
+1\. Tick N\+1 starts; ``self\.\_last\_results`` still holds tick N's results\.
+2\. Step 3 \(``\_context\.update``\) snapshots them into the new ``Context``\. Every instinct evaluated this tick — reflex or normal — observes them via ``ctx\.last\_results`` / ``ctx\.last\_result``\.
+3\. Immediately after the snapshot, the runtime clears ``self\.\_last\_results`` and ``self\.\_last\_result``\. The snapshot inside ``ctx`` is unaffected \(dataclass field copy\)\.
+4\. If reflex or normal dispatch fires this tick, the resulting ``Result``s are written back into ``self\.\_last\_results`` for tick N\+2 to carry forward\.
+5\. If neither reflex nor normal dispatch fires, the slots remain empty and tick N\+2's ``ctx\.last\_results`` is ``\[\]``\.
+
+This bounds staleness to one tick: an instinct that fires once and then stops firing will see its own ``Result`` exactly once \(on the immediately following tick\), never repeatedly\.
 
 ## __7\.3 Quick\-Start Example__
 
