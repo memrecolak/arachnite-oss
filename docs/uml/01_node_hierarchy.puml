@@ -1,0 +1,183 @@
+@startuml node_hierarchy
+title Arachnite — Node Class Hierarchy
+
+skinparam classAttributeIconSize 0
+skinparam classFontStyle bold
+skinparam packageStyle rectangle
+hide empty members
+
+abstract class BaseNode {
+  + node_id: str
+  + permissions: set<Permission>
+  + requires: list<str>
+  + bus: SignalBus
+  + config: NodeConfig
+  + logger: StructuredLogger
+  --
+  + {abstract} setup(): None
+  + {abstract} teardown(): None
+  + on_pause(): None
+  + on_resume(): None
+  + on_tick_start(tick: int): None
+  + on_tick_end(tick: int, duration_s: float): None
+  + spawn_background_task(coro): Task
+  + cancel_background_tasks(): None
+  + artifact_dir: Path
+}
+
+' ── Sense layer ──────────────────────────────────────────────
+package "Sense" <<Rectangle>> {
+  abstract class BaseSenseNode {
+    + signal_kind: str
+    + poll_interval_s: float
+    --
+    + {abstract} read(): Signal | None
+    + on_error(exc: Exception): Signal | None
+  }
+
+  class SenseMasterNode {
+    - _nodes: dict<str, BaseSenseNode>
+    - _merge_policies: dict<str, MergePolicy>
+    --
+    + register(node: BaseSenseNode): None
+    + unregister(node_id: str): None
+    + read_all(): list<Signal>
+    - _apply_merge(signals): list<Signal>
+  }
+}
+
+' ── Instinct layer ───────────────────────────────────────────
+package "Instinct" <<Rectangle>> {
+  abstract class BaseInstinctNode {
+    + priority: int = 50
+    + enabled: bool = True
+    + reflex: bool = False
+    + trigger_interval_s: float | None
+    + trigger_on_signals: list<str> | None
+    --
+    + {abstract} evaluate(ctx: Context): Proposal | None
+    + on_proposal_rejected(p: Proposal): None
+  }
+
+  abstract class BaseReflexInstinctNode {
+    + reflex: bool = True
+    + priority: int = 200
+  }
+
+  class LLMInstinctNode {
+    + model: str
+    + max_tokens: int
+    + min_interval_s: float
+    --
+    + {abstract} available_actions(): dict<str, str>
+    + system_prompt(): str
+    + context_to_text(ctx): str
+    + evaluate(ctx): Proposal | None
+  }
+
+  class InstinctMasterNode {
+    + reflex_conflict: str
+    - _normal_nodes: dict<str, BaseInstinctNode>
+    - _reflex_nodes: dict<str, BaseReflexInstinctNode>
+    --
+    + register(node: BaseInstinctNode): None
+    + evaluate_reflexes(ctx): list<Proposal>
+    + evaluate_all(ctx): list<Proposal>
+    + notify_rejected(rejected): None
+  }
+}
+
+' ── Decision layer ───────────────────────────────────────────
+package "Decision" <<Rectangle>> {
+  abstract class BaseDecisionNode {
+    + {abstract} decide(proposals): Proposal | None
+    + decide_many(proposals, running_ids): list<Proposal>
+  }
+
+  class GreedyDecisionNode
+  class WeightedDecisionNode
+  class RandomDecisionNode
+  class ActiveInferenceDecisionNode {
+    + beta: float
+    + temperature: float
+    + prior_confidence: float
+    - _pragmatic_value(p): float
+    - _epistemic_value(p): float
+    - _expected_free_energy(p): float
+  }
+
+  class DecisionMasterNode {
+    + max_pending_ticks: int
+    - _strategy: BaseDecisionNode
+    - _pending: dict<str, Proposal>
+    --
+    + set_strategy(s: BaseDecisionNode): None
+    + on_new_proposals_many(...): tuple<list, list>
+    + clear_pending(instinct_id: str): None
+  }
+}
+
+' ── Action layer ─────────────────────────────────────────────
+package "Action" <<Rectangle>> {
+  abstract class BaseActionNode {
+    + timeout_s: float
+    + max_retries: int
+    --
+    + {abstract} execute(p: Proposal): Result
+    + on_timeout(p: Proposal): Result
+  }
+
+  abstract class MultiStepActionNode {
+    + interrupt_policy: InterruptPolicy
+    - _interrupt_requested: bool
+    - _current_step: ActionStep | None
+    - _completed_steps: list<StepResult>
+    --
+    + {abstract} steps(): list<ActionStep>
+    + {abstract} execute_step(step, p, completed): StepResult
+    + on_interrupted(...): None
+    + request_interrupt(req: InterruptRequest): None
+    + is_interruptible(): bool
+    + execution_state(): ActionExecutionState
+  }
+
+  class ActionMasterNode {
+    - _nodes: dict<str, BaseActionNode>
+    - _running_nodes: dict<str, BaseActionNode>
+    - _running_proposals: dict<str, Proposal>
+    --
+    + register(node: BaseActionNode): None
+    + dispatch(p: Proposal): Result
+    + dispatch_many(proposals): list<Result>
+    + request_interrupt(req, action_id): None
+    + running_action_ids(): set<str>
+  }
+}
+
+' ── Inheritance ──────────────────────────────────────────────
+BaseNode <|-- BaseSenseNode
+BaseNode <|-- BaseInstinctNode
+BaseNode <|-- BaseDecisionNode
+BaseNode <|-- BaseActionNode
+BaseNode <|-- SenseMasterNode
+BaseNode <|-- InstinctMasterNode
+BaseNode <|-- DecisionMasterNode
+BaseNode <|-- ActionMasterNode
+
+BaseInstinctNode    <|-- BaseReflexInstinctNode
+BaseInstinctNode    <|-- LLMInstinctNode
+BaseDecisionNode    <|-- GreedyDecisionNode
+BaseDecisionNode    <|-- WeightedDecisionNode
+BaseDecisionNode    <|-- RandomDecisionNode
+BaseDecisionNode    <|-- ActiveInferenceDecisionNode
+BaseActionNode      <|-- MultiStepActionNode
+
+' ── Composition ──────────────────────────────────────────────
+SenseMasterNode    "1" *-- "*" BaseSenseNode      : registers
+InstinctMasterNode "1" *-- "*" BaseInstinctNode   : registers
+InstinctMasterNode "1" *-- "*" BaseReflexInstinctNode : registers
+DecisionMasterNode "1" *-- "1" BaseDecisionNode   : strategy
+ActionMasterNode   "1" *-- "*" BaseActionNode     : registers
+MultiStepActionNode "1" *-- "*" ActionStep        : steps()
+
+@enduml

@@ -1,0 +1,192 @@
+@startuml runtime_composition
+title Arachnite — Runtime Composition
+
+skinparam classAttributeIconSize 0
+skinparam classFontStyle bold
+skinparam packageStyle rectangle
+hide empty members
+
+' ── Top-level entry points ───────────────────────────────────
+class RuntimeBuilder {
+  - _bus: SignalBus
+  - _sense_nodes: list
+  - _instinct_nodes: list
+  - _action_nodes: list
+  - _strategy: BaseDecisionNode
+  - _tick_rate_hz: float
+  --
+  + sense(node_or_cls): RuntimeBuilder
+  + instinct(node_or_cls): RuntimeBuilder
+  + action(node_or_cls): RuntimeBuilder
+  + strategy(s): RuntimeBuilder
+  + tick_rate(hz: float): RuntimeBuilder
+  + reflex_conflict(policy: str): RuntimeBuilder
+  + permissions(allowed: dict): RuntimeBuilder
+  + build(): ArachniteRuntime
+}
+
+class ArachniteRuntime {
+  - _tick_rate_hz: float
+  - _tick_count: int
+  - _running: bool
+  - _paused: bool
+  - _last_result: Result | None
+  - _last_results: list<Result>
+  - _context_observers: list<Callable>
+  - _decision_observers: list<Callable>
+  --
+  + start(): None
+  + stop(): None
+  + emergency_stop(): None
+  + pause(): None
+  + resume(): None
+  + tick(): None
+  + register_sense_live(node): None
+  + register_instinct_live(node): None
+  + register_action_live(node): None
+  + add_context_observer(cb): None
+  + add_decision_observer(cb): None
+}
+
+' ── Core pipeline components (defined elsewhere) ─────────────
+class SignalBus {
+  - _subscribers: dict<str, list<Callback>>
+  --
+  + subscribe(kind, callback): None
+  + unsubscribe(kind, callback): None
+  + publish(signal: Signal): None
+  + publish_many(signals): None
+  + subscriber_count(kind): int
+}
+
+class ContextNode {
+  + history_length: int
+  - _history: deque<list<Signal>>
+  - _state: dict<str, Any>
+  - _last_result: Result | None
+  - _last_results: list<Result>
+  - _action_state: ActionExecutionState | None
+  --
+  + update(signals, result, action_state, ...): Context
+  + snapshot(): Context
+  + get(key, default): Any
+  + set(key, value): None
+  + delete(key): None
+  + flush_state(): None
+}
+
+class SenseMasterNode
+class InstinctMasterNode
+class DecisionMasterNode
+class ActionMasterNode
+
+' ── Supervision / safety / shutdown ──────────────────────────
+class NodeSupervisor {
+  + restart_policy: RestartPolicy
+  + max_restarts: int
+  + restart_delay: float
+  - _states: dict<str, NodeState>
+  - _restart_counts: dict<str, int>
+  - _nodes: dict<str, BaseNode>
+  --
+  + track(node: BaseNode): None
+  + untrack(node_id: str): None
+  + state_of(node_id: str): NodeState
+  + is_healthy(): bool
+  + on_fault(node_id, error): None
+  + restart(node_id): None
+}
+
+class HealthMonitor {
+  - _supervisors: list<NodeSupervisor>
+  - _remote_states: dict<str, dict<str, NodeState>>
+  --
+  + system_healthy(): bool
+  + mesh_healthy(): bool
+  + report(): dict
+  + nodes_in_state(state): list<str>
+  + update_remote(remote: RemoteNodeState): None
+}
+
+abstract class BaseSafetyMonitor {
+  + monitor_id: str
+  + {abstract} check(tick, state): SafetyViolationSignal | None
+  + emit_violation(prop, severity, details): SafetyViolationSignal
+}
+
+class ReflexBypassMonitor
+class MandatoryBlockMonitor
+class ReflexDispatchMonitor
+class ReflexAvailabilityMonitor
+class TickBudgetMonitor
+
+class ShutdownCoordinator {
+  - _teardown_timeout_s: float
+  - _multiplier: float
+  - _phase: ShutdownPhase
+  --
+  + execute(runtime: ArachniteRuntime): None
+}
+
+class StructuredLogger {
+  - _node_id: str
+  - _agent_node_id: str
+  - _sinks: list<BaseLogSink>
+  - _tick: int
+  --
+  + debug(msg, **data): None
+  + info(msg, **data): None
+  + warning(msg, **data): None
+  + error(msg, **data): None
+  + critical(msg, **data): None
+}
+
+abstract class BaseLogSink {
+  + level: LogLevel
+  + {abstract} emit(event: LogEvent): None
+  + accepts(event: LogEvent): bool
+}
+class StdoutLogSink
+class JSONLogSink
+class NullLogSink
+
+' ── Composition ──────────────────────────────────────────────
+RuntimeBuilder ..> ArachniteRuntime : build()
+
+ArachniteRuntime "1" *-- "1" SignalBus           : bus
+ArachniteRuntime "1" *-- "1" ContextNode         : context
+ArachniteRuntime "1" *-- "1" SenseMasterNode
+ArachniteRuntime "1" *-- "1" InstinctMasterNode
+ArachniteRuntime "1" *-- "1" DecisionMasterNode
+ArachniteRuntime "1" *-- "1" ActionMasterNode
+ArachniteRuntime "1" *-- "4..*" NodeSupervisor   : one per master
+ArachniteRuntime "1" *-- "1" HealthMonitor
+ArachniteRuntime "1" o-- "*" BaseSafetyMonitor   : monitors
+ArachniteRuntime "1" ..> ShutdownCoordinator     : on stop()
+
+HealthMonitor "1" o-- "*" NodeSupervisor
+NodeSupervisor "1" --> "1" SignalBus             : publishes SupervisorSignal
+
+BaseSafetyMonitor <|-- ReflexBypassMonitor
+BaseSafetyMonitor <|-- MandatoryBlockMonitor
+BaseSafetyMonitor <|-- ReflexDispatchMonitor
+BaseSafetyMonitor <|-- ReflexAvailabilityMonitor
+BaseSafetyMonitor <|-- TickBudgetMonitor
+
+BaseLogSink <|-- StdoutLogSink
+BaseLogSink <|-- JSONLogSink
+BaseLogSink <|-- NullLogSink
+
+StructuredLogger "1" o-- "*" BaseLogSink
+
+note bottom of ArachniteRuntime
+  Per tick (see 04_tick_sequence.puml):
+    1. SENSE     – SenseMasterNode.read_all()
+    2. CONTEXT   – ContextNode.update()
+    3. REFLEX    – InstinctMasterNode.evaluate_reflexes()
+    4. INSTINCT  – InstinctMasterNode.evaluate_all()
+    5. DECIDE    – DecisionMasterNode.on_new_proposals_many()
+    6. ACT       – ActionMasterNode.dispatch_many()
+end note
+
+@enduml

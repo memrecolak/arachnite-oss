@@ -1,0 +1,112 @@
+@startuml tick_sequence
+title Arachnite — One Runtime Tick
+
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+
+actor "Event loop" as loop
+participant "ArachniteRuntime" as RT
+participant "SenseMasterNode"    as SM
+participant "BaseSenseNode\n(many)"        as SN
+participant "SignalBus"          as BUS
+participant "ContextNode"        as CTX
+participant "InstinctMasterNode" as IM
+participant "BaseReflexInstinctNode\n(many)" as RI
+participant "BaseInstinctNode\n(many)"      as NI
+participant "DecisionMasterNode" as DM
+participant "BaseDecisionNode\n(strategy)"  as DS
+participant "ActionMasterNode"   as AM
+participant "BaseActionNode\n(targets)"     as AN
+
+loop -> RT : tick()
+activate RT
+
+== 1 · SENSE ==
+RT -> SM : read_all()
+activate SM
+SM -> SN : read()  (concurrent per kind)
+SN --> SM : Signal | None
+SM -> SM : _apply_merge(signals)\n(MergePolicy per kind)
+SM --> RT : list<Signal>
+deactivate SM
+RT -> BUS : publish_many(signals)
+
+== 2 · CONTEXT ==
+RT -> CTX : update(signals, last_results,\n         action_states)
+activate CTX
+CTX -> CTX : push to rolling history\napply StateUpdateSignals
+CTX --> RT : Context
+deactivate CTX
+RT -> RT : notify context_observers(ctx)
+
+== 3 · REFLEX  (blocks decision layer) ==
+RT -> IM : evaluate_reflexes(ctx)
+activate IM
+IM -> RI : evaluate(ctx)  (concurrent)
+RI --> IM : Proposal | None
+IM --> RT : list<Proposal>  (priority ≥ 200)
+deactivate IM
+
+alt reflex proposals present
+  loop for each reflex proposal
+    RT -> AM : dispatch(proposal)
+    activate AM
+    AM -> AN : execute(proposal)
+    AN --> AM : Result
+    AM --> RT : Result
+    deactivate AM
+  end
+  note over RT
+    Reflexes bypass DecisionMaster
+    by design (safety guarantee).
+  end note
+end
+
+== 4 · INSTINCT ==
+RT -> IM : evaluate_all(ctx)
+activate IM
+IM -> NI : evaluate(ctx)\n(filtered by trigger_on_signals\n / trigger_interval_s)
+NI --> IM : Proposal | None
+IM --> RT : list<Proposal>
+deactivate IM
+
+== 5 · DECIDE ==
+RT -> DM : on_new_proposals_many(\n   proposals,\n   running_proposals,\n   running_interruptible,\n   evaluated_instinct_ids)
+activate DM
+DM -> DM : merge with pending\n(persist=True carry-over)
+DM -> DS : decide_many(pool, running_ids)
+DS --> DM : list<Proposal> selected
+DM -> DM : detect interrupts\n(new.priority > running.priority\n & is_interruptible)
+DM --> RT : (to_dispatch, interrupt_requests)
+deactivate DM
+RT -> IM : notify_rejected(rejected)
+RT -> RT : notify decision_observers(\n   DecisionEvent)
+
+alt interrupt_requests not empty
+  loop for each InterruptRequest
+    RT -> AM : request_interrupt(req, action_id)
+    AM -> AN : request_interrupt(req)\n(checked at next ActionStep boundary)
+  end
+end
+
+== 6 · ACT ==
+RT -> AM : dispatch_many(to_dispatch)
+activate AM
+AM -> AM : dedupe by action_id\nskip already-running
+AM -> AN : execute(proposal)  (concurrent)
+note right of AN
+  MultiStepActionNode loops through
+  steps(); checks _interrupt_requested
+  at each interruptible boundary.
+end note
+AN --> AM : Result
+AM --> RT : list<Result>
+deactivate AM
+
+RT -> RT : _last_results = reflex_results + dispatch_results
+RT -> RT : on_tick_end(tick, duration_s)  on all nodes
+
+RT --> loop : (sleep until next tick)
+deactivate RT
+
+@enduml

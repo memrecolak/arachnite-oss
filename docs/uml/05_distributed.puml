@@ -1,0 +1,175 @@
+@startuml distributed
+title Arachnite — Distributed / Transport / Codec
+
+skinparam classAttributeIconSize 0
+skinparam classFontStyle bold
+skinparam packageStyle rectangle
+hide empty members
+
+' ── Multi-agent runtime ──────────────────────────────────────
+package "Distributed" <<Rectangle>> {
+
+  class MeshRuntime {
+    - _manifest: DeploymentManifest
+    - _agents: dict<str, AgentNode>
+    - _started: bool
+    --
+    + start(): None
+    + stop(): None
+    + agent(agent_node_id: str): AgentNode
+    + mesh_health(): dict<str, bool>
+    + nodes_in_state(state: NodeState): dict<str, list<str>>
+  }
+
+  class AgentNode {
+    + node_id: str
+    + tags: list<str>
+    + description: str
+    --
+    + start(): None
+    + stop(): None
+    + emergency_stop(): None
+    + health: HealthMonitor
+    + {static} from_manifest(m, agent_id, transport, sinks): AgentNode
+  }
+
+  class DeploymentManifest {
+    - _mesh_config: dict
+    - _agent_configs: dict<str, AgentNodeConfig>
+    - _assignments: list<NodeAssignment>
+    --
+    + {static} from_yaml(path): DeploymentManifest
+    + {static} from_dict(data): DeploymentManifest
+    + validate(): None
+    + assignments_for(agent_node_id: str): list<NodeAssignment>
+    + agent_ids(): list<str>
+    + agent_config(agent_id: str): AgentNodeConfig
+  }
+
+  class AgentNodeConfig
+  class NodeAssignment {
+    + node_class: str
+    + agent_node_id: str
+    + config: NodeConfig
+  }
+
+  class PermissionWhitelist {
+    + validate(node: BaseNode, allowed: set<Permission>)
+  }
+
+  class ColocationValidator {
+    + validate(manifest: DeploymentManifest)
+  }
+}
+
+' ── Transport ────────────────────────────────────────────────
+package "Transport" <<Rectangle>> {
+
+  abstract class BaseTransport {
+    + _agent_node_id: str
+    + _codec: CodecRegistry
+    --
+    + {abstract} connect(): None
+    + {abstract} disconnect(): None
+    + {abstract} publish(signal: Signal): None
+    + {abstract} subscribe(kind, callback): None
+    + {abstract} unsubscribe(kind, callback): None
+    # _encode_signal(signal): bytes
+    # _decode_signal(data): Signal
+  }
+
+  class LocalTransport {
+    - _subscribers: dict<str, list<Callback>>
+    - _connected: bool
+  }
+  class MQTTTransport {
+    + host: str
+    + port: int
+    + topic_prefix: str
+    + qos: int
+  }
+  class NATSTransport {
+    + servers: list<str>
+    + subject_pfx: str
+  }
+  class RedisTransport {
+    + url: str
+    + channel_prefix: str
+  }
+}
+
+' ── Codecs ───────────────────────────────────────────────────
+package "Codec" <<Rectangle>> {
+
+  abstract class SignalCodec {
+    + network_safe: bool
+    + {abstract} encode(value: Any): bytes
+    + {abstract} decode(data: bytes): Any
+  }
+
+  class MsgpackCodec
+  class JSONCodec
+  class PickleCodec {
+    + network_safe = False
+  }
+  class NumpyCodec
+
+  class CodecRegistry {
+    - _codecs: dict<str, SignalCodec>
+    --
+    + register(kind: str, codec: SignalCodec): None
+    + encode(kind: str, value: Any): bytes
+    + decode(kind: str, data: bytes): Any
+    + check_network_safety(transport_name: str): None
+  }
+}
+
+' ── External façade (from runtime composition diagram) ───────
+class ArachniteRuntime <<external>>
+class SignalBus <<external>>
+
+' ── Relationships ────────────────────────────────────────────
+MeshRuntime "1" *-- "*" AgentNode             : agents
+MeshRuntime "1" --> "1" DeploymentManifest
+
+AgentNode "1" *-- "1" ArachniteRuntime
+AgentNode "1" *-- "1" BaseTransport
+AgentNode ..> DeploymentManifest               : from_manifest()
+
+DeploymentManifest "1" *-- "*" AgentNodeConfig
+DeploymentManifest "1" *-- "*" NodeAssignment
+DeploymentManifest ..> ColocationValidator     : validate()
+DeploymentManifest ..> PermissionWhitelist     : validate()
+
+BaseTransport <|-- LocalTransport
+BaseTransport <|-- MQTTTransport
+BaseTransport <|-- NATSTransport
+BaseTransport <|-- RedisTransport
+
+BaseTransport "1" *-- "1" CodecRegistry
+BaseTransport --> SignalBus                    : forwards Signal
+
+SignalCodec <|-- MsgpackCodec
+SignalCodec <|-- JSONCodec
+SignalCodec <|-- PickleCodec
+SignalCodec <|-- NumpyCodec
+CodecRegistry "1" o-- "*" SignalCodec          : per-kind + '*' fallback
+
+note bottom of BaseTransport
+  Wire format: msgpack envelope
+    { version, origin_agent_node_id,
+      kind, codec_value: bytes }
+  Local → in-process callbacks (no encode)
+  MQTT → topic = "{prefix}{kind}"
+  NATS → subject = "{prefix}.{kind}"
+  Redis → channel = "{prefix}:{kind}"
+end note
+
+note right of DeploymentManifest
+  Co-location invariant:
+  every ReflexInstinctNode must run on
+  the same AgentNode as its target
+  ActionNode (validated at startup).
+end note
+
+@enduml

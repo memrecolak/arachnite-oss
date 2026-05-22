@@ -73,3 +73,6 @@ secrets.yaml
 
 # Quick-launch script
 arachnite.bat
+
+# Local toolchain (PlantUML jar, etc.)
+.tools/

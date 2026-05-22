@@ -1,0 +1,211 @@
+@startuml data_models
+title Arachnite — Data Models (Signals · Context · Proposals · Results)
+
+skinparam classAttributeIconSize 0
+skinparam classFontStyle bold
+hide empty members
+
+' ── Pipeline payloads ────────────────────────────────────────
+class Signal <<dataclass>> {
+  + source: str
+  + kind: str
+  + value: Any
+  + confidence: float  ' [0.0, 1.0]
+  + timestamp: float
+  + metadata: dict<str, Any>
+}
+
+class Context <<dataclass>> {
+  + tick: int
+  + signals: list<Signal>
+  + history: deque<list<Signal>>
+  + state: dict<str, Any>
+  + last_result: Result | None
+  + timestamp: float
+  + action_state: ActionExecutionState | None
+  + last_results: list<Result>
+  + action_states: list<ActionExecutionState>
+}
+
+class Proposal <<dataclass>> {
+  + instinct_id: str
+  + action_id: str
+  + priority: int
+  + urgency: float  ' [0.0, 1.0]
+  + parameters: dict<str, Any>
+  + rationale: str
+  + evidence: dict<str, Any>
+  + persist: bool
+}
+
+class Result <<dataclass>> {
+  + action_id: str
+  + success: bool
+  + output: Any
+  + error: BaseException | None
+  + duration_s: float
+  + interrupted: bool
+  + stopped_at_step: str | None
+  + step_results: list<StepResult>
+  + rolled_back: bool
+}
+
+' ── Multi-step action models ─────────────────────────────────
+class ActionStep <<dataclass>> {
+  + name: str
+  + interruptible: bool
+  + rollback: Callable | None
+  + timeout_s: float | None
+  + checkpoint: bool
+  + metadata: dict
+}
+
+class StepResult <<dataclass>> {
+  + step_name: str
+  + success: bool
+  + output: Any
+  + error: BaseException | None
+  + duration_s: float
+  + abort_sequence: bool
+}
+
+class InterruptRequest <<dataclass>> {
+  + new_proposal: Proposal
+  + requesting_instinct_id: str
+  + reason: str
+  + timestamp: float
+}
+
+class ActionExecutionState <<dataclass>> {
+  + action_id: str | None
+  + current_step: str | None
+  + completed_steps: list<str>
+  + interruptible: bool
+  + mandatory_block_remaining_s: float
+}
+
+enum InterruptPolicy {
+  ALWAYS
+  NEVER
+  CHECKPOINT
+  ROLLBACK
+}
+
+' ── Supervisor / bus-level signals ───────────────────────────
+class SupervisorSignal <<dataclass>> {
+  + node_id: str
+  + previous_state: NodeState
+  + current_state: NodeState
+  + restart_count: int
+  + fault_error: BaseException | None
+}
+
+class NodeFaultSignal <<dataclass>> {
+  + error_type: str
+  + error_message: str
+}
+
+class StateUpdateSignal <<dataclass>> {
+  + key: str
+  + state_value: Any
+  + delete: bool
+}
+
+' ── Enums ────────────────────────────────────────────────────
+enum NodeState {
+  STARTING
+  RUNNING
+  FAULTED
+  RESTARTING
+  STOPPED
+  DEAD
+}
+
+enum RestartPolicy {
+  NEVER
+  ON_FAILURE
+  ALWAYS
+}
+
+enum MergePolicy {
+  ALL
+  LATEST
+  HIGHEST_CONFIDENCE
+  MEAN
+  BAYESIAN
+  ENSEMBLE
+}
+
+enum Permission {
+  NETWORK
+  FILESYSTEM_READ
+  FILESYSTEM_WRITE
+  SUBPROCESS
+  GPU
+}
+
+enum ShutdownPhase {
+  NOT_STARTED
+  STOP_SENSING
+  DRAIN_REFLEXES
+  COMPLETE_MANDATORY
+  INTERRUPT_ACTION
+  STOP_SUPERVISORS
+  TEARDOWN_NODES
+  DISCONNECT_TRANSPORT
+  COMPLETE
+}
+
+' ── Observer / log events ────────────────────────────────────
+class DecisionEvent <<dataclass>> {
+  + tick: int
+  + timestamp: float
+  + strategy: str
+  + considered: list<Proposal>
+  + dispatched: list<Proposal>
+  + interrupts: list<InterruptRequest>
+}
+
+class LogEvent <<dataclass>> {
+  + level: LogLevel
+  + node_id: str
+  + agent_node_id: str
+  + tick: int
+  + message: str
+  + data: dict
+  + timestamp: float
+}
+
+class HistoryConfig <<dataclass>> {
+  + max_ticks: int | None
+  + max_bytes: int | None
+  + value_ttl_s: float | None
+}
+
+' ── Inheritance ──────────────────────────────────────────────
+Signal           <|-- SupervisorSignal
+SupervisorSignal <|-- NodeFaultSignal
+Signal           <|-- StateUpdateSignal
+
+' ── Aggregation / references ─────────────────────────────────
+Context "1" o-- "*" Signal              : signals
+Context "1" o-- "*" Result              : last_results
+Context "1" o-- "*" ActionExecutionState : action_states
+Result  "1" o-- "*" StepResult          : step_results
+InterruptRequest "1" --> "1" Proposal   : new_proposal
+DecisionEvent    "1" o-- "*" Proposal   : considered/dispatched
+DecisionEvent    "1" o-- "*" InterruptRequest : interrupts
+
+note right of Signal
+  Validated in __post_init__:
+  confidence ∈ [0.0, 1.0]
+end note
+
+note right of Proposal
+  priority bands (convention):
+  200+  reflex
+  100-199  safety
+  50-99   normal
+end note
+
+@enduml
