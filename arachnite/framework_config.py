@@ -46,10 +46,10 @@ from typing import Any
 @dataclass
 class RuntimeSettings:
     """Controls the tick loop and graceful shutdown."""
-    tick_rate_hz:             float = 10.0   # target ticks per second
-    overrun_warn_pct:         float = 0.2    # log warning when tick exceeds interval by this fraction
-    overrun_warn_consecutive: int   = 3      # only warn after N consecutive overruns; pass 1 for warn-on-every
-    teardown_timeout_s:       float = 5.0    # grace period for node teardown during stop()
+    tick_rate_hz:        float = 10.0   # target ticks per second
+    overrun_warn_pct:    float = 0.2    # log warning when tick exceeds interval by this fraction
+    overrun_warn_consecutive: int = 3   # warn only after N consecutive overruns (1 = every)
+    teardown_timeout_s:  float = 5.0    # grace period for node teardown during stop()
 
 
 @dataclass
