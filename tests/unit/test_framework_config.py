@@ -108,13 +108,26 @@ class TestFromToml:
 [runtime]
 tick_rate_hz = 20.0
 overrun_warn_pct = 0.1
+overrun_warn_consecutive = 5
 teardown_timeout_s = 3.0
 """)
         try:
             cfg = FrameworkConfig.from_toml(p)
             assert cfg.runtime.tick_rate_hz == 20.0
             assert cfg.runtime.overrun_warn_pct == 0.1
+            assert cfg.runtime.overrun_warn_consecutive == 5
             assert cfg.runtime.teardown_timeout_s == 3.0
+        finally:
+            p.unlink()
+
+    def test_runtime_overrun_warn_consecutive_default_preserved(self) -> None:
+        p = self._write_toml("""
+[runtime]
+tick_rate_hz = 20.0
+""")
+        try:
+            cfg = FrameworkConfig.from_toml(p)
+            assert cfg.runtime.overrun_warn_consecutive == 3
         finally:
             p.unlink()
 

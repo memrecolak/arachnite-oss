@@ -36,8 +36,9 @@ tick_rate_hz       = 10.0   # target ticks per second
                             # 5.0  — power-constrained edge devices
                             # 10.0 — balanced default
                             # 50.0 — latency-sensitive robotics
-overrun_warn_pct   = 0.2    # log a warning when tick takes > interval * (1 + this)
-teardown_timeout_s = 5.0    # grace period for node teardown during stop()
+overrun_warn_pct         = 0.2    # log a warning when tick takes > interval * (1 + this)
+overrun_warn_consecutive = 3      # only warn after N consecutive overruns; 1 = warn-on-every
+teardown_timeout_s       = 5.0    # grace period for node teardown during stop()
 
 # ── Transport ─────────────────────────────────────────────────────────────────
 #
