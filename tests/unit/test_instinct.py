@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import math
 import time
 from collections import deque
 
@@ -576,3 +577,169 @@ class TestReflexTriggerIntervalWarning:
             if ev.message == "Reflex trigger_interval_s ignored"
         ]
         assert len(warnings) == 0
+
+
+# ── set_pre_evaluate_gate ────────────────────────────────────────────────────
+
+class _SecondInstinct(BaseInstinctNode):
+    """A second always-proposing instinct, distinct node_id from AlwaysProposesInstinct."""
+    node_id  = "_SecondInstinct"
+    priority = 70
+
+    async def evaluate(self, ctx: Context) -> Proposal | None:
+        return Proposal(
+            instinct_id=self.node_id, action_id="Act2",
+            priority=self.priority, urgency=0.4,
+        )
+
+
+class TestPreEvaluateGate:
+    @pytest.mark.asyncio
+    async def test_no_gate_installed_all_nodes_evaluate(self) -> None:
+        """Default behavior preserved — no gate means every enabled node evaluates."""
+        im = InstinctMasterNode(bus=_bus())
+        im.register(AlwaysProposesInstinct(bus=_bus()))
+        im.register(_SecondInstinct(bus=_bus()))
+        proposals = await im.evaluate_all(_ctx())
+        assert len(proposals) == 2
+        assert im.last_evaluated_ids == {"AlwaysProposesInstinct", "_SecondInstinct"}
+
+    @pytest.mark.asyncio
+    async def test_gate_denying_skips_node(self) -> None:
+        """A node the gate denies does not evaluate and is absent from last_evaluated_ids."""
+        im = InstinctMasterNode(bus=_bus())
+        im.register(AlwaysProposesInstinct(bus=_bus()))
+        im.set_pre_evaluate_gate(lambda node, ctx: False)
+        proposals = await im.evaluate_all(_ctx())
+        assert proposals == []
+        assert "AlwaysProposesInstinct" not in im.last_evaluated_ids
+
+    @pytest.mark.asyncio
+    async def test_gate_selective_allow_one_deny_other(self) -> None:
+        """The InferenceScheduler shape — gate picks one instinct per tick."""
+        im = InstinctMasterNode(bus=_bus())
+        im.register(AlwaysProposesInstinct(bus=_bus()))
+        im.register(_SecondInstinct(bus=_bus()))
+        im.set_pre_evaluate_gate(
+            lambda node, ctx: node.node_id == "AlwaysProposesInstinct",
+        )
+        proposals = await im.evaluate_all(_ctx())
+        assert [p.instinct_id for p in proposals] == ["AlwaysProposesInstinct"]
+        assert im.last_evaluated_ids == {"AlwaysProposesInstinct"}
+
+    @pytest.mark.asyncio
+    async def test_passing_none_clears_installed_gate(self) -> None:
+        """set_pre_evaluate_gate(None) restores ungated behavior."""
+        im = InstinctMasterNode(bus=_bus())
+        im.register(AlwaysProposesInstinct(bus=_bus()))
+        im.set_pre_evaluate_gate(lambda node, ctx: False)
+        assert await im.evaluate_all(_ctx()) == []
+        im.set_pre_evaluate_gate(None)
+        proposals = await im.evaluate_all(_ctx())
+        assert len(proposals) == 1
+
+    @pytest.mark.asyncio
+    async def test_gate_runs_after_trigger_on_signals(self) -> None:
+        """Signal-gated nodes that fail the signal check never reach the gate."""
+        seen: list[str] = []
+
+        def recording_gate(node: BaseInstinctNode, ctx: Context) -> bool:
+            seen.append(node.node_id)
+            return True
+
+        im = InstinctMasterNode(bus=_bus())
+        im.register(FaceTriggeredInstinct(bus=_bus()))   # needs face/proximity
+        im.register(AlwaysProposesInstinct(bus=_bus()))
+        im.set_pre_evaluate_gate(recording_gate)
+        # Signal does not match FaceTriggeredInstinct.trigger_on_signals.
+        await im.evaluate_all(_ctx(signals=[_signal("temperature")]))
+        assert "FaceTriggeredInstinct" not in seen
+        assert "AlwaysProposesInstinct" in seen
+
+    @pytest.mark.asyncio
+    async def test_gate_runs_after_trigger_interval_s(self) -> None:
+        """Throttled nodes that fail the interval check never reach the gate."""
+        seen: list[str] = []
+
+        def recording_gate(node: BaseInstinctNode, ctx: Context) -> bool:
+            seen.append(node.node_id)
+            return True
+
+        im = InstinctMasterNode(bus=_bus())
+        im.register(ThrottledInstinct(bus=_bus()))
+        im.set_pre_evaluate_gate(recording_gate)
+        # First call: passes throttle, gate is consulted.
+        await im.evaluate_all(_ctx())
+        assert seen == ["ThrottledInstinct"]
+        # Second call: throttled (60s interval) — gate must NOT be consulted.
+        await im.evaluate_all(_ctx())
+        assert seen == ["ThrottledInstinct"]   # unchanged
+
+    @pytest.mark.asyncio
+    async def test_gate_denial_does_not_advance_last_trigger_s(self) -> None:
+        """Gate denial is orthogonal to the node's intrinsic throttle clock."""
+        im = InstinctMasterNode(bus=_bus())
+        node = ThrottledInstinct(bus=_bus())
+        im.register(node)
+        # Deny the node — its _last_trigger_s must stay at -inf.
+        im.set_pre_evaluate_gate(lambda n, ctx: False)
+        await im.evaluate_all(_ctx())
+        assert node._last_trigger_s == -math.inf
+        # Now lift the gate — the throttle clock was not advanced, so the
+        # node evaluates on the very next tick (this is the load-bearing
+        # invariant: a scheduler denial does not delay an instinct's
+        # intrinsic cadence).
+        im.set_pre_evaluate_gate(None)
+        await im.evaluate_all(_ctx())
+        assert "ThrottledInstinct" in im.last_evaluated_ids
+        assert node._last_trigger_s > -math.inf
+
+    @pytest.mark.asyncio
+    async def test_gate_exception_fails_open(self) -> None:
+        """A gate that raises is logged and treated as allowing the node."""
+        sink = _CaptureSink()
+        im = InstinctMasterNode(bus=_bus(), log_sinks=[sink])
+        im.register(AlwaysProposesInstinct(bus=_bus()))
+
+        def bad_gate(node: BaseInstinctNode, ctx: Context) -> bool:
+            raise RuntimeError("gate is broken")
+
+        im.set_pre_evaluate_gate(bad_gate)
+        proposals = await im.evaluate_all(_ctx())
+
+        assert len(proposals) == 1   # fail-open: node still evaluated
+        assert "AlwaysProposesInstinct" in im.last_evaluated_ids
+
+        await asyncio.sleep(0)   # let fire-and-forget log tasks flush
+        errors = [
+            ev for ev in sink.events
+            if ev.message == "Pre-evaluate gate raised; treating as allowed"
+        ]
+        assert len(errors) == 1
+        assert errors[0].data["node_id"] == "AlwaysProposesInstinct"
+        assert "gate is broken" in errors[0].data["error"]
+
+    @pytest.mark.asyncio
+    async def test_reflex_nodes_are_not_gated(self) -> None:
+        """A deny-all gate must not block reflexes (they use evaluate_reflexes)."""
+        im = InstinctMasterNode(bus=_bus())
+        im.register(AlwaysProposesReflex(bus=_bus()))
+        im.set_pre_evaluate_gate(lambda node, ctx: False)
+        proposals = await im.evaluate_reflexes(_ctx())
+        assert len(proposals) == 1
+        assert proposals[0].instinct_id == "AlwaysProposesReflex"
+
+    def test_async_gate_rejected_at_install(self) -> None:
+        """Coroutine-function gates are caught at install time, not evaluation."""
+        im = InstinctMasterNode(bus=_bus())
+
+        async def async_gate(node: BaseInstinctNode, ctx: Context) -> bool:
+            return True
+
+        with pytest.raises(TypeError, match="must be sync"):
+            im.set_pre_evaluate_gate(async_gate)   # type: ignore[arg-type]
+
+    def test_sync_gate_returning_coroutine_callable_not_rejected(self) -> None:
+        """Sanity: a sync function is accepted; only ``async def`` is rejected."""
+        im = InstinctMasterNode(bus=_bus())
+        im.set_pre_evaluate_gate(lambda node, ctx: True)   # must not raise

@@ -9,10 +9,11 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import inspect
 import math
 import time
 from abc import abstractmethod
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from typing import Any
 
 from arachnite.bus import SignalBus
@@ -139,6 +140,9 @@ class InstinctMasterNode(BaseNode):
         self._normal_nodes: dict[str, BaseInstinctNode] = {}
         self._reflex_nodes: dict[str, BaseReflexInstinctNode] = {}
         self._last_evaluated_ids: set[str] = set()
+        self._pre_evaluate_gate: (
+            Callable[[BaseInstinctNode, Context], bool] | None
+        ) = None
 
     def register(self, node: BaseInstinctNode) -> None:
         """
@@ -272,13 +276,65 @@ class InstinctMasterNode(BaseNode):
     def last_evaluated_ids(self) -> set[str]:
         """
         Node IDs of instincts that were actually evaluated (passed signal
-        gate and throttle checks) in the most recent evaluate_all() call.
+        gate, throttle, and any installed pre-evaluate gate) in the most
+        recent evaluate_all() call.
 
         Used by DecisionMasterNode to distinguish "instinct returned None"
         (clear its pending proposal) from "instinct was throttled/gated"
         (keep its pending proposal).
         """
         return self._last_evaluated_ids
+
+    def set_pre_evaluate_gate(
+        self,
+        gate: Callable[[BaseInstinctNode, Context], bool] | None,
+    ) -> None:
+        """
+        Install (or clear) an external policy gate consulted by
+        evaluate_all() before each enabled normal instinct's evaluate()
+        call. Returning False skips that node for the current tick.
+
+        Intended for cross-instinct policies the framework does not own —
+        e.g. single-LLM contention scheduling where only one instinct
+        may hold the model slot per tick. The per-node
+        ``trigger_on_signals`` and ``trigger_interval_s`` skips run
+        first; the gate only sees nodes those would have evaluated.
+
+        Contract:
+        - Must be a sync function. Async gates are rejected at install
+          time because their coroutine return value is always truthy
+          and the bug would be silent at evaluation time.
+        - Must be fast and side-effect-free. The gate runs inside the
+          tick loop's ``asyncio.gather`` over all enabled instincts;
+          blocking I/O, lock acquisition, or model calls will stall the
+          tick. Per-tick gate cost rolls up into instinct-stage tick
+          time, so an overrun will surface via the standard
+          ``overrun_warn_pct`` / ``overrun_warn_consecutive`` path.
+        - Reflex nodes (``BaseReflexInstinctNode``) are not gated.
+          ``evaluate_reflexes()`` runs before ``evaluate_all()`` and
+          bypasses this hook entirely; reflexes must remain a hard
+          real-time path.
+        - Gate exceptions are logged and treated as True (fail-open).
+          A broken gate must not deadlock cognition; for fail-closed
+          semantics, wrap the gate at the call site.
+        - A node skipped by the gate is *not* added to
+          ``last_evaluated_ids``, so ``DecisionMasterNode`` retains its
+          prior pending proposal. A gate that denies a node
+          indefinitely will keep that node's last proposal alive
+          indefinitely — gate consumers are responsible for proposal
+          freshness, typically via aging in the gate's own state.
+        - The gate does *not* advance the node's ``_last_trigger_s``;
+          a gate denial is orthogonal to the node's intrinsic
+          ``trigger_interval_s`` cadence.
+
+        Passing ``None`` clears any installed gate.
+        """
+        if gate is not None and inspect.iscoroutinefunction(gate):
+            raise TypeError(
+                "pre_evaluate_gate must be sync; got coroutine function "
+                f"{gate.__qualname__}",
+            )
+        self._pre_evaluate_gate = gate
 
     async def evaluate_all(self, ctx: Context) -> list[Proposal]:
         """
@@ -301,6 +357,8 @@ class InstinctMasterNode(BaseNode):
             signal_kinds = set()
         evaluated_ids: set[str] = set()
 
+        gate = self._pre_evaluate_gate
+
         async def _eval(node: BaseInstinctNode) -> Proposal | None:
             # Enforce trigger_on_signals — skip if no matching signal present
             if (
@@ -314,6 +372,22 @@ class InstinctMasterNode(BaseNode):
                 and (now - node._last_trigger_s) < node.trigger_interval_s
             ):
                 return None
+            # Consult external pre-evaluate gate, if installed. Fail-open on
+            # exception so a broken gate cannot deadlock cognition. Gate-skipped
+            # nodes are NOT added to evaluated_ids — DecisionMasterNode keeps
+            # their prior pending proposal.
+            if gate is not None:
+                try:
+                    allowed = gate(node, ctx)
+                except Exception as exc:  # noqa: BLE001
+                    self.logger.error(
+                        "Pre-evaluate gate raised; treating as allowed",
+                        node_id=node.node_id,
+                        error=str(exc),
+                    )
+                    allowed = True
+                if not allowed:
+                    return None
             evaluated_ids.add(node.node_id)
             try:
                 result = await node.evaluate(ctx)
