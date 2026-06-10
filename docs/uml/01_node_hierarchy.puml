@@ -79,10 +79,12 @@ package "Instinct" <<Rectangle>> {
     + reflex_conflict: str
     - _normal_nodes: dict<str, BaseInstinctNode>
     - _reflex_nodes: dict<str, BaseReflexInstinctNode>
+    - _pre_evaluate_gate: Callable | None
     --
     + register(node: BaseInstinctNode): None
     + evaluate_reflexes(ctx): list<Proposal>
     + evaluate_all(ctx): list<Proposal>
+    + set_pre_evaluate_gate(gate): None
     + notify_rejected(rejected): None
   }
 }

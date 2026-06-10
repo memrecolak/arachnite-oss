@@ -65,7 +65,7 @@ end
 == 4 · INSTINCT ==
 RT -> IM : evaluate_all(ctx)
 activate IM
-IM -> NI : evaluate(ctx)\n(filtered by trigger_on_signals\n / trigger_interval_s)
+IM -> NI : evaluate(ctx)\n(filtered by trigger_on_signals\n / trigger_interval_s\n / pre_evaluate_gate)
 NI --> IM : Proposal | None
 IM --> RT : list<Proposal>
 deactivate IM
