@@ -1,0 +1,1047 @@
+# Arachnite
+
+> A biologically-inspired reactive agent framework for Python.
+> Models the nervous system of arachnids: sense → context → reflex → instinct → decide → act.
+> Designed for edge devices (Raspberry Pi, Jetson Nano), laptops, and cloud servers.
+
+Full spec: SPEC.md  |  Examples: examples/  |  Tests: tests/ (1101)
+
+---
+
+## Architecture
+
+One pipeline cycle ("tick") in order:
+
+0. **on_tick_start(tick)** — called on all leaf nodes (sense, instinct, action) via masters; default implementation syncs `self.logger._set_tick(tick)` so every LogEvent.tick reflects the current tick (subclasses overriding must call `super().on_tick_start(tick)`). Runtime additionally syncs its own logger and the four master loggers directly each tick.
+1. **SenseMasterNode.read_all()** — SenseNodes read hardware → list[Signal] (poll_interval_s enforced per node; throttle timestamps are per-sensor, not batch-start)
+2. **Supervisor signal injection** — buffered SupervisorSignals (FAULTED, DEAD, RESTARTING) appended to signals
+3. **ContextNode.update(signals)** — merge signals + last results → Context snapshot (StateUpdateSignals applied to state here; ctx.state is a shallow copy; history deque and inner lists are shallow-copied per snapshot so subsequent ticks do not mutate previously returned Context objects)
+4. **InstinctMasterNode.evaluate_reflexes(ctx)** — reflex instincts fire first, bypass decision (sequential); ActionNotFoundError caught and logged; all reflex results accumulated
+5. **InstinctMasterNode.evaluate_all(ctx)** — normal instincts produce list[Proposal] (trigger_interval_s throttling applied)
+6. **DecisionMasterNode.on_new_proposals_many()** — pick proposals for concurrent dispatch + interrupts; rejected instincts notified via on_proposal_rejected() (covers both fresh and carried-forward pending proposals)
+6b. **Interrupt dispatch** — for each interrupt request, call request_interrupt(); MandatoryBlockViolation caught and logged as WARNING (not suppressed); other exceptions logged as ERROR
+7. **ActionMasterNode.dispatch_many(proposals)** → list[Result] (concurrent via asyncio.gather)
+8. Results merged (reflex + normal) and stored in `_last_results` / `_last_result` for the *next* tick's `_context.update()` to snapshot into ctx.last_results / ctx.last_result (the feedback channel that instincts read to react to outcomes). The runtime clears `_last_results` / `_last_result` to []/None immediately *after* the snapshot is taken — gives last_results a one-tick lifetime (bounded staleness without making the field empty).
+9. **on_tick_end(tick, duration_s)** — called on all leaf nodes via masters
+
+Different ActionNodes execute concurrently. Same ActionNode cannot run twice concurrently.
+
+Nodes never hold references to each other — all communication goes through SignalBus.
+
+---
+
+## The tick loop is a sampling cadence — slow work runs *beside* it, not *inside* it
+
+A common mistake when building on Arachnite is assuming every node must do all of
+its work synchronously inside the tick. It must not. The tick is a fast, fixed-cadence
+cycle (default 10 Hz): the per-tick methods it calls — `read()`, `evaluate()`,
+`execute()` — must each return quickly so the next tick fires on time (rule 6: all
+node I/O is async; wrap blocking calls in `asyncio.to_thread()`). Work that is slow,
+latency-unbounded, or event-driven (LLM inference, heavy CV analysis, network
+round-trips, hardware event streams) does **not** belong on the synchronous tick
+path. It runs in a *background task* alongside the loop, and the tick only reads the
+most recent result that background work has already produced.
+
+**Canonical example — `LLMInstinctNode` (`nodes/llm.py`):**
+- `evaluate(ctx)` never calls the model inline. It returns the last cached `Proposal`
+  immediately, and — only when `min_interval_s` has elapsed and no call is in flight —
+  spawns the LLM call as a background task via `spawn_background_task()`.
+- That call finishes seconds later and swaps in the fresh proposal under an
+  `asyncio.Lock`. The *next* tick picks it up. The loop never blocks on the model.
+
+So when modelling any slow or asynchronous capability, don't force it into the tick.
+Instead:
+1. Run the slow work in a background task (`spawn_background_task()` — kicked off from
+   `setup()` for continuous listeners, or from `evaluate()`/`read()` for on-demand
+   work; see *Background task lifecycle*).
+2. Cache the result; have the per-tick method return the latest cached value (or
+   `None`/no-op while nothing new is ready).
+3. Throttle how often the work is launched (`min_interval_s`, `trigger_interval_s`,
+   `poll_interval_s`) so background launches don't pile up.
+
+The event-driven `read()` in *Background task lifecycle* and the non-blocking
+`LLMInstinctNode` are the same pattern: **produce off the loop, hand the loop a ready
+value.** Only deterministic, statically-bounded logic (classical instincts, reflexes,
+fast sensor reads) should compute its result inline on the tick.
+
+---
+
+## Imports — everything you need is at the root
+
+```python
+from arachnite import (
+    # Runtime & bus
+    ArachniteRuntime, RuntimeBuilder, SignalBus, ContextNode,
+    ShutdownCoordinator,
+    TickInstrumenter, TICK_STAGE_NAMES,    # optional per-stage tick instrumentation
+
+    # Models
+    Signal, StateUpdateSignal, Context, Proposal, Result,
+    ActionStep, StepResult,
+    InterruptPolicy, InterruptRequest, ActionExecutionState,
+    NodeState, RestartPolicy, MergePolicy, SupervisorSignal, NodeFaultSignal,
+    LogLevel, LogEvent, ShutdownPhase, HistoryConfig,
+
+    # Node base classes — extend these
+    BaseNode,
+    BaseSenseNode,    SenseMasterNode,
+    BaseInstinctNode, BaseReflexInstinctNode, InstinctMasterNode,
+    LLMInstinctNode,
+    BaseDecisionNode, DecisionMasterNode,
+    GreedyDecisionNode, WeightedDecisionNode, RandomDecisionNode,
+    ActiveInferenceDecisionNode,
+    BaseActionNode,   MultiStepActionNode,    ActionMasterNode,
+
+    # LLM providers
+    LLMProvider, AnthropicProvider, OllamaProvider, LocalProvider,
+    ThreadSafeProvider, SharedModelRegistry,
+
+    # Safety monitors
+    BaseSafetyMonitor, SafetyMonitorRegistry, SafetyViolationSignal,
+    SafetySeverity, MonitorState,
+    ReflexBypassMonitor, MandatoryBlockMonitor, ReflexDispatchMonitor,
+    ReflexAvailabilityMonitor, TickBudgetMonitor,
+
+    # Media
+    MediaStore,
+
+    # Infrastructure
+    NodeSupervisor, HealthMonitor,
+    NodeConfig,
+    StructuredLogger, BaseLogSink, StdoutLogSink, JSONLogSink,
+    SignalCodec, CodecRegistry,
+
+    # Config
+    FrameworkConfig,
+
+    # Web dashboard (requires: pip install arachnite[web])
+    SignalDashboard, FileLogSink,
+
+    # Testing helpers
+    make_signal, make_proposal, make_result, make_context, MockBus,
+
+    # Exceptions
+    DependencyValidationError,
+    UnsafeCodecError,
+)
+```
+
+---
+
+## Extension patterns
+
+### Sensor node
+```python
+import time
+from arachnite import BaseSenseNode, Signal
+
+class MySensor(BaseSenseNode):
+    node_id         = "MySensor"       # must be unique; used as Proposal.action_id target
+    signal_kind     = "temperature"    # filters for this kind on the bus
+    poll_interval_s = 0.1              # default: read at most 10x/sec; set 0.0 for every tick
+
+    async def read(self) -> Signal | None:
+        raw = await read_hardware()        # must be async
+        return Signal(
+            source=self.node_id, kind=self.signal_kind,
+            value=raw, confidence=1.0, timestamp=time.monotonic(),
+        )
+        # Return None to indicate "nothing to report this tick"
+
+    async def on_error(self, exc: Exception) -> Signal | None:
+        return None  # return None to skip this tick on error
+```
+
+### Normal instinct node
+```python
+from arachnite import BaseInstinctNode, Context, Proposal
+
+class MyInstinct(BaseInstinctNode):
+    node_id  = "MyInstinct"
+    priority = 80   # 1-49 exploratory, 50-99 goal, 100-199 safety
+
+    async def evaluate(self, ctx: Context) -> Proposal | None:
+        signals = [s for s in ctx.signals if s.kind == "temperature"]
+        if signals and signals[-1].value > 40.0:
+            return Proposal(
+                instinct_id=self.node_id, action_id="CoolDown",
+                priority=self.priority, urgency=0.8,
+                parameters={"target_temp": 35.0},
+                # evidence={"sensor_value": signals[-1].value},  # optional
+            )
+        return None  # return None explicitly when not applicable
+```
+
+### Reflex instinct node (priority >= 200, bypasses decision)
+```python
+from arachnite import BaseReflexInstinctNode, Context, Proposal
+
+class EmergencyReflex(BaseReflexInstinctNode):
+    node_id  = "EmergencyReflex"
+    priority = 250   # must be >= 200
+
+    async def evaluate(self, ctx: Context) -> Proposal | None:
+        critical = [s for s in ctx.signals if s.kind == "temperature" and s.value > 90.0]
+        if critical:
+            return Proposal(instinct_id=self.node_id, action_id="EmergencyShutdown",
+                            priority=self.priority, urgency=1.0)
+        return None
+    # RULE: EmergencyReflex and EmergencyShutdown must be on the same AgentNode
+```
+
+### LLM-backed instinct node
+```python
+from arachnite import LLMInstinctNode, Context, Proposal, LLMProvider
+
+class SmartInstinct(LLMInstinctNode):
+    node_id        = "SmartInstinct"
+    priority       = 60
+    min_interval_s = 2.0   # throttle LLM calls
+
+    def available_actions(self) -> dict[str, str]:
+        return {"CoolDown": "Activate cooling", "Alert": "Send alert"}
+
+    # Optional overrides:
+    # def system_prompt(self) -> str: ...
+    # def context_to_text(self, ctx: Context) -> str: ...
+```
+
+LLMProvider exposes two surfaces: `complete(system, user, tools) -> ToolResult | None`
+(sync, tool-calling; what `LLMInstinctNode` uses) and `async complete_text(prompt, *,
+system="", max_tokens=None) -> str` (plain text; overridden per provider because the
+tool-calling path discards assistant text blocks).
+
+### Simple action node
+```python
+from arachnite import BaseActionNode, Proposal, Result
+
+class CoolDown(BaseActionNode):
+    node_id    = "CoolDown"   # must match Proposal.action_id
+    timeout_s  = 10.0
+    max_retries = 1
+
+    async def execute(self, proposal: Proposal) -> Result:
+        target = proposal.parameters.get("target_temp", 35.0)
+        await set_fan_speed(100)          # async hardware call
+        return Result(action_id=self.node_id, success=True, output={"target": target})
+        # RULE: always return Result — never raise
+```
+
+### Multi-step action node
+```python
+from arachnite import MultiStepActionNode, ActionStep, Proposal, Result, StepResult, InterruptPolicy
+
+class CoolSequence(MultiStepActionNode):
+    node_id          = "CoolSequence"
+    interrupt_policy = InterruptPolicy.ROLLBACK
+
+    def steps(self) -> list[ActionStep]:
+        return [
+            ActionStep("ramp_up",  interruptible=True),
+            ActionStep("sustain",  interruptible=False, rollback=self._undo_sustain),
+            ActionStep("ramp_down", interruptible=True),
+        ]
+
+    async def execute_step(self, step: ActionStep, proposal: Proposal,
+                           completed: list[StepResult]) -> StepResult:
+        match step.name:
+            case "ramp_up":
+                await ramp_fan(0, 100)
+                return StepResult(step_name="ramp_up", success=True)
+            case "sustain":
+                await asyncio.sleep(5.0)
+                return StepResult(step_name="sustain", success=True)
+            case "ramp_down":
+                await ramp_fan(100, 0)
+                return StepResult(step_name="ramp_down", success=True)
+
+    async def _undo_sustain(self) -> None:
+        await ramp_fan(100, 0)   # rollback: always stop the fan
+```
+
+### Wire it all together (using RuntimeBuilder — recommended)
+```python
+import asyncio
+from arachnite import RuntimeBuilder
+
+async def main() -> None:
+    rt = (
+        RuntimeBuilder()
+        .sense(MySensor)
+        .instinct(MyInstinct)
+        .instinct(EmergencyReflex)      # reflex auto-routes
+        .action(CoolDown)
+        .action(EmergencyShutdown)
+        .tick_rate(10.0)
+        .build()
+    )
+    await rt.start()
+    await rt.wait()          # blocks until rt.stop() is called
+
+asyncio.run(main())
+```
+
+RuntimeBuilder defaults: GreedyDecisionNode strategy, 10 Hz tick rate, dispatch_all reflex conflict.
+Pass node **classes** to auto-instantiate with the builder's bus, or pre-built **instances** for custom args.
+Access the shared bus via `builder.bus`. Other chainable options: `.strategy()`, `.log_sinks()`,
+`.reflex_conflict()`, `.permissions()`, `.shutdown()`, `.overrun_warn()`, `.overrun_warn_consecutive()`.
+
+### Wire it all together (manual — full control)
+```python
+import asyncio
+from arachnite import (
+    ArachniteRuntime, SignalBus, ContextNode,
+    SenseMasterNode, InstinctMasterNode,
+    DecisionMasterNode, GreedyDecisionNode,
+    ActionMasterNode,
+)
+
+async def main() -> None:
+    bus             = SignalBus()
+    sense_master    = SenseMasterNode(bus=bus)
+    instinct_master = InstinctMasterNode(bus=bus)
+    decision_master = DecisionMasterNode(bus=bus, strategy=GreedyDecisionNode(bus=bus))
+    action_master   = ActionMasterNode(bus=bus)
+
+    sense_master.register(MySensor(bus=bus))
+    instinct_master.register(MyInstinct(bus=bus))
+    instinct_master.register(EmergencyReflex(bus=bus))   # reflex auto-routes
+    action_master.register(CoolDown(bus=bus))
+    action_master.register(EmergencyShutdown(bus=bus))
+
+    rt = ArachniteRuntime(
+        sense_master=sense_master, context=ContextNode(),
+        instinct_master=instinct_master, decision_master=decision_master,
+        action_master=action_master, bus=bus,
+        tick_rate_hz=10.0,
+    )
+    await rt.start()
+    await rt.wait()          # blocks until rt.stop() is called
+
+asyncio.run(main())
+```
+
+---
+
+## Live node registration and hot-swap
+
+Nodes can be added and removed while the runtime is running — no restart needed.
+
+```python
+# Register a new node at runtime (calls setup(), starts supervisor tracking)
+await rt.register_sense_live(new_sensor)
+await rt.register_instinct_live(new_instinct)
+await rt.register_action_live(new_action)
+
+# Unregister (calls teardown(), removes from master, untracks from supervisor)
+# Uses master.get_node(node_id) to look up the node for teardown.
+# unregister_instinct_live also calls DecisionMasterNode.clear_pending(node_id)
+# to remove any pending proposal and age tracking for the removed instinct.
+await rt.unregister_sense_live("OldSensor")
+await rt.unregister_instinct_live("OldInstinct")
+await rt.unregister_action_live("OldAction")
+
+# Full hot-swap: unregister old, register replacement
+await rt.unregister_sense_live("CameraSense")
+await rt.register_sense_live(CameraSenseV2(bus=rt.bus))
+```
+
+---
+
+## Tick instrumentation — per-stage timing hook
+
+Opt-in hook delivering wall-clock duration of each pipeline stage per tick. Zero cost when
+not installed (one branch-predicted null check per stage). Errors from the instrumenter are
+caught, logged at WARNING, and never fail the tick (ADR 0003).
+
+- `TickInstrumenter` — `@runtime_checkable` `typing.Protocol` with `on_stage(stage: str, duration_s: float) -> None` and `on_tick_complete(tick_index: int, total_s: float) -> None`.
+- `TICK_STAGE_NAMES: tuple[str, ...] = ("sense", "context", "reflex", "instinct", "decide", "act")` — six stages in pipeline order.
+- `ArachniteRuntime(..., tick_instrumenter=None)` — optional constructor kwarg.
+- `rt.set_tick_instrumenter(inst | None)` — attach/detach at any time; takes effect next tick.
+
+Stage mapping (§7.5 of spec): `sense` = `notify_tick_start` + `read_all()` + supervisor-buffer drain; `context` = `ContextNode.update()`; `reflex` = reflex evaluate + dispatch (bypass arc — fused); `instinct` = `evaluate_all()` (evaluate only); `decide` = interruptibility map + `on_new_proposals_many` + `notify_rejected` + interrupts; `act` = `dispatch_many()` + `notify_tick_end`.
+
+```python
+from arachnite import ArachniteRuntime, TickInstrumenter, TICK_STAGE_NAMES
+
+class MyCollector:
+    def __init__(self) -> None:
+        self.samples: dict[str, list[float]] = {s: [] for s in TICK_STAGE_NAMES}
+    def on_stage(self, stage: str, duration_s: float) -> None:
+        self.samples[stage].append(duration_s * 1000.0)  # ms
+    def on_tick_complete(self, tick_index: int, total_s: float) -> None:
+        pass
+
+coll = MyCollector()
+rt = ArachniteRuntime(..., tick_instrumenter=coll)
+# or later:
+rt.set_tick_instrumenter(coll)   # takes effect on the next tick
+rt.set_tick_instrumenter(None)   # detach
+```
+
+Built-in use: `benchmarks/stage_breakdown.py` ships a `StageTimingCollector` (benchmark-
+private, not exported from `arachnite`) that feeds samples into `DescriptiveStats.from_runs(
+..., run_samples=...)` for per-stage median/P95/P99 bootstrap CIs. OpenTelemetry and
+Prometheus adapters (backlog items B-15 / B-16) are expected to implement this same
+protocol.
+
+---
+
+## LLM providers
+
+Three backends, one interface. All are sync (called via asyncio.to_thread()):
+
+```python
+from arachnite import AnthropicProvider, OllamaProvider, LocalProvider
+
+# Cloud (Anthropic API)
+provider = AnthropicProvider(model="claude-haiku-4-5-20251001")
+
+# Local server (Ollama, OpenAI-compatible)
+provider = OllamaProvider(model="llama3.1", base_url="http://localhost:11434/v1")
+
+# Embedded (llama-cpp-python, no server)
+provider = LocalProvider(model_path="/models/llama-8b.gguf", n_gpu_layers=-1)
+
+# Inject into any LLMInstinctNode:
+node = SmartInstinct(bus=bus, provider=provider)
+```
+
+### Shared models on constrained devices
+
+```python
+from arachnite import SharedModelRegistry, LocalProvider
+
+registry = SharedModelRegistry()
+provider = registry.get_or_create(
+    "llama-8b",
+    lambda: LocalProvider(model_path="/models/llama-8b.gguf"),
+)
+# All nodes share one model instance, one threading.Lock:
+curiosity  = CuriosityInstinct(bus=bus, provider=provider)
+social     = SocialInstinct(bus=bus, provider=provider)
+reflection = ReflectionInstinct(bus=bus, provider=provider)
+```
+
+---
+
+## StateUpdateSignal — write to context state via bus
+
+Any node can update ContextNode.state without a direct reference:
+
+```python
+import time
+from arachnite import StateUpdateSignal
+
+await bus.publish(StateUpdateSignal(
+    source=self.node_id, kind="state_update",
+    value=None, confidence=1.0, timestamp=time.monotonic(),
+    key="world_model", state_value={"temp": 42, "faces": 1},
+))
+# Instincts see the updated state in ctx.state["world_model"] the same tick
+# ctx.state is a shallow copy — mutations do not affect ContextNode's internal state
+```
+
+---
+
+## Context state persistence
+
+```python
+from arachnite import ContextNode
+
+# State survives reboots:
+ctx = ContextNode(
+    state_path="state/self_model.json",
+    flush_on_write=True,   # flush to disk on every set()/delete()
+    max_state_keys=100,    # evict oldest key (by insertion order) when exceeded
+                           # None (default) = no limit; enforced on set(), StateUpdateSignal, and load
+)
+ctx.set("capabilities", {"camera": True, "speaker": False})
+# Reloaded automatically on next construction with the same path
+```
+
+---
+
+## MediaStore — large payloads (images, audio, video)
+
+For multi-modal agents, save large payloads to disk and pass paths through the pipeline.
+
+```python
+from arachnite import MediaStore, BaseSenseNode, Signal, BaseInstinctNode, Proposal
+import time, asyncio
+
+# 1. Create a shared store
+media = MediaStore(base_dir="/tmp/arachnite/media")
+
+# 2. SenseNode saves payload, puts path in signal
+class CameraSense(BaseSenseNode):
+    node_id = "CameraSense"
+    signal_kind = "camera"
+
+    async def read(self) -> Signal:
+        frame = await asyncio.to_thread(capture_frame)
+        path = media.store(frame, kind=self.signal_kind, source=self.node_id)
+        return Signal(
+            source=self.node_id, kind=self.signal_kind,
+            value=str(path), confidence=1.0, timestamp=time.monotonic(),
+            metadata={"media_path": str(path)},
+        )
+
+# 3. InstinctNode reads file, attaches path + summary in evidence
+class VisionInstinct(BaseInstinctNode):
+    node_id = "VisionInstinct"
+    priority = 80
+    trigger_on_signals = ["camera"]
+
+    async def evaluate(self, ctx) -> Proposal | None:
+        for sig in ctx.signals:
+            if sig.kind == "camera":
+                path = sig.metadata.get("media_path")
+                summary = await asyncio.to_thread(analyze_image, path)
+                if "fire" in summary.lower():
+                    return Proposal(
+                        instinct_id=self.node_id, action_id="Evacuate",
+                        priority=150, urgency=0.95,
+                        evidence={
+                            "camera_path": path,
+                            "camera_summary": summary,
+                        },
+                    )
+        return None
+
+# 4. DecisionNode can inspect evidence for smarter choices
+# 5. ActionNode can load file: media.load(proposal.evidence["camera_path"])
+
+# Cleanup old files periodically
+media.cleanup(max_age_s=300)   # remove files older than 5 minutes
+media.clear()                   # remove everything
+```
+
+---
+
+## Instinct throttling and signal gating
+
+```python
+class ReflectionInstinct(BaseInstinctNode):
+    node_id            = "Reflection"
+    priority           = 20
+    trigger_interval_s = 60.0   # fire at most once per 60 seconds
+    # Interval measured from evaluation *completion*, not start.
+    # None (default) = fire every tick. Does not apply to reflex nodes.
+
+class SocialInstinct(BaseInstinctNode):
+    node_id            = "Social"
+    priority           = 65
+    trigger_on_signals = ["face", "speech", "proximity"]
+    # evaluate() only called when at least one matching signal is present.
+    # None (default) = fire every tick. Does not apply to reflex nodes.
+    # Can be combined with trigger_interval_s (signal gate checked first).
+```
+
+---
+
+## Concurrent action dispatch
+
+Different ActionNodes execute concurrently — e.g. a camera instinct and an audio instinct
+targeting different ActionNodes (speaker vs display) run in parallel. The same ActionNode
+cannot run twice concurrently. `dispatch_many()` pre-filters duplicates; `_dispatch_one()`
+has an atomic check-and-set guard against `_running_nodes` to prevent TOCTOU races
+(e.g. reflex + normal proposal for the same action in one tick).
+
+```python
+# The runtime does this automatically. Manual concurrent dispatch:
+results = await action_master.dispatch_many([proposal_a, proposal_b])
+
+# Query what's running:
+running = action_master.current_actions()     # dict[str, BaseActionNode]
+ids     = action_master.running_action_ids()  # set[str]
+
+# Interrupt a specific running action:
+await action_master.request_interrupt(req, action_id="CoolDown")
+
+# Context provides plural fields:
+ctx.last_results   # list[Result] — all results from concurrent dispatch
+ctx.action_states  # list[ActionExecutionState] — all running actions
+# Singular ctx.last_result / ctx.action_state still work (highest-priority item)
+```
+
+---
+
+## Proposal persistence across ticks
+
+By default, proposals that lose the decision competition are discarded. Set `persist=True`
+on a Proposal to carry it forward to subsequent ticks until it is dispatched or superseded.
+
+```python
+class DoorbellInstinct(BaseInstinctNode):
+    node_id            = "Doorbell"
+    priority           = 70
+    trigger_on_signals = ["audio"]   # only fires on audio signals
+    trigger_interval_s = 60.0        # at most once per minute
+
+    async def evaluate(self, ctx: Context) -> Proposal | None:
+        audio = [s for s in ctx.signals if s.kind == "audio" and "doorbell" in str(s.value)]
+        if audio:
+            return Proposal(
+                instinct_id=self.node_id, action_id="AnswerDoor",
+                priority=self.priority, urgency=0.8,
+                persist=True,  # survive if a higher-priority action is running
+            )
+        return None
+```
+
+Supersession rules (managed by DecisionMasterNode):
+- New persist=True proposal from same instinct → replaces pending
+- Instinct evaluated, returns None or persist=False → clears pending (conditions changed)
+- Instinct throttled/gated (not evaluated) → pending stays
+- Proposal dispatched → removed from pending
+- Pending exceeds max_pending_ticks (default 50) → dropped
+- Instinct unregistered via unregister_instinct_live() → clear_pending(instinct_id) removes pending + age
+
+```python
+# Configure staleness cap:
+dm = DecisionMasterNode(bus=bus, strategy=strategy, max_pending_ticks=100)
+
+# Introspect pending proposals:
+dm.pending_proposals  # dict[str, Proposal] keyed by instinct_id
+
+# All proposals considered in the most recent on_new_proposals_many() call
+# (includes both fresh proposals and carried-forward pending proposals):
+dm.last_considered  # list[Proposal] — used by runtime for rejection notifications
+
+# InstinctMasterNode tracks which instincts were actually evaluated:
+im.last_evaluated_ids  # set[str] — passed to DecisionMasterNode by the runtime
+```
+
+---
+
+## Permission whitelist (opt-in sandbox)
+
+Nodes declare capabilities they need; the manifest or runtime config defines what is allowed.
+Validation is startup-only — zero runtime cost. If no permissions are configured, validation
+is skipped entirely (backward compatible).
+
+```python
+from arachnite import Permission
+
+class MyNetworkSense(BaseSenseNode):
+    node_id = "MyNetworkSense"
+    signal_kind = "remote"
+    permissions = frozenset({Permission.NETWORK})  # declares it needs network access
+    ...
+```
+
+Available permissions: `NETWORK`, `FILESYSTEM_READ`, `FILESYSTEM_WRITE`, `SUBPROCESS`, `GPU`.
+
+**Manifest syntax** — `permissions` on a node def is the allowed whitelist:
+```yaml
+agents:
+  - id: edge-01
+    nodes:
+      sense:
+        - kind: myapp.nodes.MyNetworkSense
+          permissions: [network]  # allowed — matches node's declaration
+```
+
+**Programmatic** — pass `allowed_permissions` to `ArachniteRuntime`:
+```python
+rt = ArachniteRuntime(
+    ...,
+    allowed_permissions={"MyNetworkSense": {Permission.NETWORK}},
+)
+```
+
+If a node declares a permission not in its allowed set, `PermissionValidationError` is raised
+before the tick loop starts. Nodes not listed in the map are unrestricted.
+
+---
+
+## Signal merge policies
+
+When multiple SenseNodes emit the same signal kind in one tick (redundant sensors),
+`SenseMasterNode` can merge them per-kind using a `MergePolicy`:
+
+```python
+from arachnite import SenseMasterNode, SignalBus
+from arachnite.models import MergePolicy
+
+sm = SenseMasterNode(
+    bus=SignalBus(),
+    merge_policies={
+        "temperature": MergePolicy.MEAN,               # average numeric values
+        "proximity":   MergePolicy.HIGHEST_CONFIDENCE,  # keep most confident
+        "visual":      MergePolicy.LATEST,              # keep newest timestamp
+        # kinds not listed → MergePolicy.ALL (keep all, default)
+    },
+)
+```
+
+| Policy | Behaviour |
+|---|---|
+| `ALL` (default) | Keep all signals — no merging |
+| `LATEST` | Keep signal with latest timestamp |
+| `HIGHEST_CONFIDENCE` | Keep signal with highest confidence |
+| `MEAN` | Average numeric values and confidences; falls back to `HIGHEST_CONFIDENCE` for non-numeric |
+
+Merged signals carry metadata: `merge_policy`, `merged_from` (source node_ids), `sample_count` (MEAN only).
+Single signals pass through unchanged. Zero overhead when no policies are configured.
+
+---
+
+## Hardware integration pattern
+
+No built-in HAL — nodes own their drivers. The framework provides the abstraction boundary
+(`read()` / `execute()`) and config injection. Hardware APIs vary too widely for a useful
+thin wrapper.
+
+**Pattern:** declare hardware config in manifest, lazy-import driver in `setup()`, wrap all
+I/O in `asyncio.to_thread()`, clean up in `teardown()`.
+
+```yaml
+# Manifest
+nodes:
+  sense:
+    - kind: myapp.nodes.ProximitySense
+      config:
+        gpio_pin: 17
+        backend: libgpiod
+```
+
+```python
+class ProximitySense(BaseSenseNode):
+    node_id = "ProximitySense"
+    signal_kind = "proximity"
+    permissions = frozenset({Permission.GPIO})  # optional capability declaration
+
+    async def setup(self) -> None:
+        pin = self.config.get_int("gpio_pin", 17)
+        self._driver = await asyncio.to_thread(_open_gpio, pin)
+
+    async def read(self) -> Signal:
+        value = await asyncio.to_thread(self._driver.read)
+        return Signal(source=self.node_id, kind=self.signal_kind,
+                      value=value, confidence=1.0, timestamp=time.monotonic())
+
+    async def teardown(self) -> None:
+        await asyncio.to_thread(self._driver.cleanup)
+```
+
+Test with stubs — inject a fake driver via config, no framework changes needed.
+
+---
+
+## Background task lifecycle
+
+Long-running listeners (hardware event streams, MQTT subscribers) belong in `setup()`,
+registered via `spawn_background_task()`. The framework cancels all tracked tasks automatically
+before `teardown()`.
+
+```python
+class EventDrivenSense(BaseSenseNode):
+    node_id = "EventDrivenSense"
+    signal_kind = "event"
+
+    async def setup(self) -> None:
+        self._queue: asyncio.Queue = asyncio.Queue()
+        self.spawn_background_task(self._listen())  # tracked; auto-cancelled on shutdown
+
+    async def _listen(self) -> None:
+        async for event in hardware_event_stream():
+            await self._queue.put(event)
+
+    async def read(self) -> Signal | None:
+        try:
+            event = self._queue.get_nowait()
+        except asyncio.QueueEmpty:
+            return None
+        return Signal(source=self.node_id, kind=self.signal_kind,
+                      value=event, confidence=1.0, timestamp=time.monotonic())
+```
+
+`cancel_background_tasks()` is called by all three master nodes (SenseMasterNode,
+InstinctMasterNode, ActionMasterNode) before their own `teardown()`. Override it only if
+custom cleanup ordering is required.
+
+---
+
+## Node dependency declaration
+
+Declare which node_ids must exist before this node can operate. Validated once at startup by
+`ArachniteRuntime.start()` before any `setup()` call. Raises `DependencyValidationError` if
+a required node_id is missing.
+
+```python
+from arachnite import BaseInstinctNode, DependencyValidationError
+
+class VisionInstinct(BaseInstinctNode):
+    node_id  = "VisionInstinct"
+    priority = 80
+    requires = ("CameraSense", "ObjectDetectionSense")  # must be registered
+
+    async def evaluate(self, ctx: Context) -> Proposal | None:
+        ...
+```
+
+If `CameraSense` or `ObjectDetectionSense` is not registered, startup raises:
+`DependencyValidationError: VisionInstinct requires ['CameraSense', 'ObjectDetectionSense'] but
+['CameraSense'] are not registered`.
+
+---
+
+## Artifact directory
+
+Each node has an `artifact_dir` property that returns a `Path` for writing large outputs
+(model checkpoints, debug frames, analysis dumps). The directory is created lazily and scoped
+per agent and node.
+
+```python
+class AnalysisAction(BaseActionNode):
+    node_id = "AnalysisAction"
+
+    async def execute(self, proposal: Proposal) -> Result:
+        out_path = self.artifact_dir / "analysis.json"  # created on first access
+        out_path.write_text(json.dumps(result_data))
+        return Result(action_id=self.node_id, success=True, output=str(out_path))
+```
+
+Default path: `artifacts/{agent_node_id}/{node_id}/`. Override the root via constructor:
+
+```python
+node = AnalysisAction(bus=bus, artifact_root="/mnt/data/artifacts")
+# → /mnt/data/artifacts/<agent_node_id>/AnalysisAction/
+```
+
+---
+
+## Benchmarking
+
+The framework ships with a complete benchmark suite in `benchmarks/`. Run it to measure
+framework overhead on your target hardware.
+
+`pip install -e ".[benchmarks]"` — enables psutil-based RSS measurement in memory_footprint and soak_test (also in `[all]`); without it, RSS columns render `nan` on platforms without `/proc`, latency numbers unaffected.
+
+`pip install -e ".[baselines]"` — enables the py_trees row of the cross-framework comparison harness (`python -m baselines.compare`); also rolled into `[all]`. Jason and ROS 2 are not pip-installable and stay opt-in via JVM / sourced ROS distro respectively.
+
+```bash
+# Full suite (all 5 benchmarks, 30 runs each, JSON output)
+python benchmarks/suite.py
+
+# Quick run for development
+python benchmarks/suite.py --runs 5
+
+# Individual benchmarks
+python benchmarks/tick_latency.py        # tick overhead (ms)
+python benchmarks/reflex_latency.py      # safety response time (µs)
+python benchmarks/memory_footprint.py    # RSS at steady state (MB)
+python benchmarks/scalability_sweep.py   # tick latency vs node count
+python benchmarks/scalability_extended.py # bus throughput, action dispatch, history depth
+python benchmarks/stage_breakdown.py     # per-stage tick overhead via TickInstrumenter (§8.2.1)
+python benchmarks/multistep_action_latency.py  # interrupt/rollback/mandatory-block latency (§8.2.7)
+python benchmarks/soak_test.py            # 1M-tick stability soak; per-100k-bucket mean/P99/RSS + drift verdict (§8.2.8)
+python benchmarks/transport_latency.py    # publish-to-wake latency across 4 transports × 3 payload sizes; env-gated brokers (§8.2.9)
+python -m benchmarks.active_inference_comparison # decision strategy A/B (Greedy/Weighted/Random/AI)
+```
+
+### Key metrics
+
+| Benchmark | Definition | Unit |
+|-----------|-----------|------|
+| Tick latency | L_tick = t₁ − t₀ around `runtime.tick()` | ms |
+| Reflex latency | T_reflex = t_action − t_sense (sensor read to action entry) | µs |
+| Memory footprint | Δ_RSS = RSS(config) − RSS(baseline) after 100 ticks | MB |
+| Scalability factor | S(N) = median_tick(N) / median_tick(1) | dimensionless |
+
+### Statistical rigour (`benchmarks/stats.py`)
+
+- 95% bootstrap CI (10,000 resamples, seed=42) over per-run medians (also P95 and P99 via new `DescriptiveStats.p95_ci_lower/upper`, `p99_ci_lower/upper`)
+- `bootstrap_ci(data, stat_fn=statistics.mean, ...)` accepts any `Callable[[Sequence[float]], float]`; empty input returns `(nan, nan)`
+- `percentile(data, p)` — nearest-rank percentile primitive (`all_sorted[int(n * p/100)]`)
+- `DescriptiveStats.from_runs(medians, samples, n_per_run, run_samples=None)` — when `run_samples` is supplied, P95/P99 CIs bootstrap over per-run P95/P99 estimates; else bootstrap the pooled array with a percentile statistic
+- Wilcoxon signed-rank test (α=0.05) for paired comparisons
+- Cliff's delta effect size: negligible (<0.147), small, medium, large (≥0.474)
+- Bonferroni correction for multiple comparisons
+
+### File map
+
+```
+benchmarks/
+  suite.py               unified runner — device info + all benchmarks → JSON
+  stats.py               bootstrap CI, Wilcoxon, Cliff's delta, DescriptiveStats
+  tick_latency.py        per-tick wall-clock overhead
+  reflex_latency.py      sensor-to-action reflex arc timing
+  memory_footprint.py    RSS measurement at steady state
+  scalability_sweep.py   tick latency × node count
+  scalability_extended.py  bus throughput, concurrent actions, history depth
+  stage_breakdown.py     per-stage tick overhead via TickInstrumenter (§8.2.1)
+  multistep_action_latency.py  interrupt/rollback/mandatory-block latency (§8.2.7)
+  soak_test.py           1M-tick stability soak: per-100k-bucket mean/P99/RSS + drift verdict (§8.2.8)
+  transport_latency.py   publish-to-wake latency × 4 transports × 3 payload sizes; brokers env-gated (§8.2.9)
+  active_inference_comparison.py  Greedy/Weighted/Random/ActiveInference A/B (latency + bias)
+  results/               JSON output directory (gitignored)
+```
+
+## Baseline comparison
+
+Cross-framework comparison using a shared pick-and-place robot arm scenario. All frameworks
+use the same deterministic physics stub (`baselines/shared_sim.py`) — only the framework differs.
+
+```bash
+# Run comparison (Arachnite vs py_trees, 5 runs)
+python -m baselines.compare
+
+# Publication-grade (30 runs)
+python -m baselines.compare --runs 30 --ticks 10000
+```
+
+### Compared frameworks
+
+| Framework | Available | Safety features |
+|-----------|-----------|----------------|
+| Arachnite | Always | Reflex arc, mandatory blocks, rollback, distributed |
+| py_trees | `pip install -e ".[baselines]"` (or `[all]`) | None (BT priority only) |
+| Jason | LoC only (needs JVM) | None (BDI plan priority) |
+| ROS 2 BT | LoC only (needs ROS 2) | None (DDS callback priority) |
+
+### Key findings
+
+- **py_trees ≈ 19× faster** (0.009 ms vs 0.170 ms median Arachnite) — lacks asyncio pipeline / SignalBus / reflex pass
+- **Both well under 0.5% of budget at 10 Hz** — the difference is measurable but not operationally significant
+- **Arachnite ≈ 2.5× more code than py_trees** (465 vs 187 LoC) — the extra lines buy 3 safety features absent from all baselines
+- **Cost per safety feature ≈ 93 lines** — reflex arc, mandatory blocks, rollback
+
+### Comparison metrics
+
+| Metric | Formula |
+|--------|---------|
+| Overhead ratio | R = median_arachnite / median_baseline |
+| Budget utilisation | U = median · tick_rate / 1000 |
+| Feature-normalised LoC | (LoC_A − LoC_B) / N_features |
+
+### File map
+
+```
+baselines/
+  compare.py            main comparison harness
+  shared_sim.py         ArmState physics stub, BenchmarkResult
+  py_trees/robot_arm.py behaviour tree implementation
+  jason/                AgentSpeak + Java environment (LoC only)
+  ros2/                 ROS 2 BT reference (LoC only)
+  results/              JSON output directory
+```
+
+---
+
+## Testing helpers (`arachnite.testing`)
+
+Factory functions for building pipeline objects with sensible defaults.
+Eliminates boilerplate when unit-testing instincts, actions, and decision strategies.
+
+```python
+from arachnite import make_signal, make_proposal, make_result, make_context, MockBus
+
+# Signal with defaults (kind="test", value=0.0, source="TestSense", confidence=1.0)
+sig = make_signal(kind="thermal", value=42.0)
+
+# Proposal with defaults (action_id="TestAction", priority=50, urgency=0.5)
+prop = make_proposal(action_id="CoolDown", priority=100, urgency=0.9)
+
+# Result with defaults (action_id="TestAction", success=True)
+res = make_result(success=False, error=RuntimeError("boom"))
+
+# Context with defaults (tick=1, empty signals/state/history)
+ctx = make_context(
+    tick=5,
+    signals=[make_signal(kind="thermal", value=90.0)],
+    state={"mode": "alert"},
+    last_result=make_result(),
+)
+```
+
+### MockBus — record published signals for assertions
+
+```python
+bus = MockBus()
+node = MyInstinct(bus=bus)
+
+# After running the node...
+await bus.publish(make_signal(kind="thermal"))
+
+bus.published                       # list[Signal] — all recorded signals (copy)
+bus.published_of_kind("thermal")    # list[Signal] — filtered by kind
+bus.clear()                         # reset recorded signals and subscribers
+```
+
+`MockBus` extends `SignalBus` — subscribers still fire normally, so nodes that
+subscribe to the bus during `setup()` work exactly as in production.
+
+---
+
+## Rules — never violate
+
+1. Nodes never hold references to each other — use SignalBus
+2. ReflexInstinctNode and its target ActionNode must be on the same AgentNode
+3. MultiStepActionNode mandatory blocks (interruptible=False) cannot be interrupted except by emergency_stop()
+4. execute() on any ActionNode must always return a Result — never raise
+5. evaluate() on any InstinctNode must return None when not applicable — never raise
+6. All node I/O must be async — wrap blocking calls in asyncio.to_thread()
+
+## Priority convention
+
+| Range | Use |
+|-------|-----|
+| 200+  | Reflex instincts only (BaseReflexInstinctNode) |
+| 100-199 | Normal — safety / survival |
+| 50-99   | Normal — goal-directed |
+| 1-49    | Normal — exploratory / maintenance |
+| 0       | Reserved (inactive) |
+
+## File map
+
+```
+arachnite/
+  __init__.py       public API — import everything from here
+  models.py         all dataclasses and enums (Signal.confidence rejects NaN/Inf)
+  bus.py            SignalBus
+  context.py        ContextNode (state persistence, StateUpdateSignal, max_state_keys eviction)
+  runtime.py        ArachniteRuntime (tick loop, live reg/unreg, shutdown)
+  builder.py        RuntimeBuilder (fluent construction API)
+  supervisor.py     NodeSupervisor (cancel_restart_tasks(), restart_task_count property)
+  health.py         HealthMonitor
+  shutdown.py       ShutdownCoordinator
+  logging.py        StructuredLogger, sinks
+  codec.py          SignalCodec (network_safe attr), CodecRegistry (check_network_safety)
+  config.py         NodeConfig
+  media.py          MediaStore (on-disk storage for large signal payloads; kind/source validated against [a-zA-Z0-9_][a-zA-Z0-9_.\-]*, raises PathTraversalError)
+  framework_config.py  FrameworkConfig (runtime, transport, logging settings)
+  llm_provider.py   LLMProvider, Anthropic/Ollama/Local, ThreadSafeProvider, SharedModelRegistry
+  web.py            SignalDashboard, FileLogSink
+  exceptions.py     all framework exceptions (incl. UnsafeCodecError, PathTraversalError)
+  safety_monitor.py runtime safety monitors and SafetyMonitorRegistry
+  testing.py      make_signal, make_proposal, make_result, make_context, MockBus
+  nodes/
+    base.py         BaseNode ABC
+    sense.py        BaseSenseNode, SenseMasterNode (get_node)
+    instinct.py     BaseInstinctNode, BaseReflexInstinctNode, InstinctMasterNode (get_node)
+    decision.py     BaseDecisionNode, DecisionMasterNode, built-in strategies
+    action.py       BaseActionNode, MultiStepActionNode, ActionMasterNode (get_node)
+    llm.py          LLMInstinctNode (asyncio.Lock guards _cached_proposal)
+    active_inference.py  ActiveInferenceDecisionNode
+  transport/
+    base.py         BaseTransport ABC (StructuredLogger for connect/disconnect events)
+    local.py        LocalTransport (default, in-process)
+    mqtt.py         MQTTTransport (calls check_network_safety on connect)
+    nats.py         NATSTransport (calls check_network_safety on connect)
+    redis.py        RedisTransport (calls check_network_safety on connect)
+  distributed/
+    agent_node.py   AgentNode
+    manifest.py     DeploymentManifest
+    mesh.py         MeshRuntime
+    colocation.py   reflex co-location validator
+    permissions.py  permission validation helpers
+examples/
+  minimal_agent.py          simplest complete pipeline
+  temperature_monitor.py    realistic: reflex, multi-step action, supervisor
+  web_dashboard_demo.py     adds SignalDashboard to temperature_monitor
+tests/
+  conftest.py       shared fixtures — good reference implementations
+```
