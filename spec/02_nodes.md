@@ -787,6 +787,34 @@ class ActionMasterNode\(BaseNode\):
 
     def current\_proposal\(\) \-> Proposal | None: \.\.\.
 
+    \# Pre\-dispatch guards \(optional\):
+
+    def \_\_init\_\_\(self, bus, \.\.\., guards: list\[ActionGuard\] | None = None\): \.\.\.
+
+    def register\_guard\(self, guard: ActionGuard\) \-> None: \.\.\.
+
+### __Pre\-dispatch Guards__
+
+A guard is an optional, deterministic veto consulted *before* an action executes — the runtime, parameter\-aware complement to ``Permission`` \(which is startup\-validated and parameter\-blind\)\. Use it to deny a concrete invocation based on ``proposal\.parameters`` \(a destructive shell command, a write to an out\-of\-scope path, an out\-of\-range actuation\)\.
+
+class GuardVerdict:        \# allow, or deny with a reason
+
+    allow: bool
+
+    reason: str = ''
+
+class ActionGuard\(Protocol\):
+
+    def \_\_call\_\_\(self, proposal: Proposal\) \-> GuardVerdict: \.\.\.
+
+Guards run in ``\_dispatch\_one\(\)`` after the not\-found and already\-running checks, **before** ``execute\(\)`` and **outside** the retry loop\. Semantics:
+
+- On deny, ``dispatch\(\)`` returns ``Result\(success=False, error=ActionVetoed\(reason\)\)`` with **no side effect**: ``execute\(\)`` is never called and no retry runs\. ``dispatch\_many\(\)`` honours guards identically\.
+- Guards MUST be **synchronous, bounded, and perform no I/O** \(a reflex\-class contract\)\. A coroutine function is rejected at ``register\_guard\(\)``\.
+- Guards run in registration order; the **first deny wins** \(remaining guards are skipped\)\.
+- A guard that **raises fails closed** \(treated as a deny\)\. This deliberately differs from ``InstinctMasterNode\.set\_pre\_evaluate\_gate``, which fails open — a safety veto layer must not fail open\.
+- **Reflex/safety proposals \(``priority >= 200``\) bypass all guards\.** Reflex dispatch flows through the same ``ActionMaster`` path, and silently vetoing a reflex would break the reflex\-always\-fires guarantee \(``ReflexDispatchMonitor``\)\.
+
 ### __Developer Contract__
 
 - Set node\_id to the action\_id that instincts will reference in their Proposals\.

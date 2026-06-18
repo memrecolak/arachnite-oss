@@ -70,6 +70,10 @@ __StepAbortError__
 
 A step returned abort\_sequence=True\. Carries the StepResult for diagnosis\.
 
+__ActionVetoed__
+
+An ActionGuard denied a proposal before dispatch\. Carried in Result\.error \(never raised\); the action's execute\(\) is not called and no retry runs\. See ActionMasterNode pre\-dispatch guards \(§5\.7\)\.
+
 __DependencyValidationError__
 
 A node declared a node\_id in its requires list that is not registered with any master node at startup\. Raised by ArachniteRuntime\.start\(\) before any setup\(\) call\.
@@ -208,7 +212,15 @@ The atomic unit of a MultiStepActionNode\. Declares name, interruptibility, opti
 
 __StepResult__
 
-The outcome of a single ActionStep execution\. Can signal success, failure, or request sequence abort\.
+The outcome of a single ActionStep execution\. Can signal success, failure, request sequence abort \(abort\_sequence\), or a cooperative mid\-step interrupt \(interrupted\)\.
+
+__ActionGuard__
+
+A synchronous, bounded, no\-I/O Protocol consulted by ActionMasterNode before an action executes\. Returns a GuardVerdict \(allow / deny\+reason\) to veto a concrete proposal by its parameters\. The runtime, parameter\-aware complement to the startup\-validated Permission\.
+
+__GuardVerdict__
+
+The outcome of an ActionGuard check: allow, or deny with a reason\. Returned by ActionGuard\.\_\_call\_\_\(\)\.
 
 __InterruptPolicy__
 
@@ -351,6 +363,8 @@ from arachnite import \(
     ActiveInferenceDecisionNode,
 
     BaseActionNode, MultiStepActionNode, ActionMasterNode,
+
+    ActionGuard, GuardVerdict,
 
     \# Safety monitors
 

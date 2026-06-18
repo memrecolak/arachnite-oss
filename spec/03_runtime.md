@@ -794,6 +794,14 @@ class StepResult:
 
                                        \# steps unsafe
 
+    interrupted: bool = False          \# step observed a cooperative interrupt
+
+                                       \# mid\-execution and bailed \(see 17\.4
+
+                                       \# check\_interrupt\(\)\)
+
+A step that sets ``interrupted=True`` is surfaced by ``execute\(\)`` as ``Result\(interrupted=True, stopped\_at\_step=\.\.\.\)`` via the normal interrupt path — **not** as a ``StepAbortError`` failure\. This distinguishes "the step chose to stop because a higher\-priority action wants control" from "the step aborted the sequence due to an error" \(``abort\_sequence``\)\.
+
 ## __17\.3 InterruptPolicy__
 
 InterruptPolicy declares how a MultiStepActionNode responds when the ActionMasterNode receives an interrupt request while the action is executing\.
@@ -866,6 +874,10 @@ class MultiStepActionNode\(BaseActionNode, ABC\):
 
         Must return a StepResult — never raise\."""
 
+    def check\_interrupt\(self\) \-> bool:
+
+        """Poll from inside a long\-running execute\_step\(\) to cooperatively bail\."""
+
     async def on\_interrupted\(
 
         self,
@@ -899,6 +911,8 @@ class MultiStepActionNode\(BaseActionNode, ABC\):
         Default: return StepResult\(success=False, abort\_sequence=True\)\.
 
         Override to attempt recovery before aborting\."""
+
+__Cooperative mid\-step interrupt\.__ The framework checks for interrupts *between* steps\. A single long\-running step \(an LLM call, a long subprocess\) cannot be interrupted by the framework on its own\. To let such a step yield mid\-execution, ``execute\_step\(\)`` may poll ``check\_interrupt\(\)`` and, when it returns True, stop and return ``StepResult\(\.\.\., interrupted=True\)``\. ``check\_interrupt\(\)`` returns True only when an interrupt is pending AND the current step may honour it: it returns False inside a non\-interruptible \(mandatory\) step and under ``InterruptPolicy\.NEVER``, and under ``CHECKPOINT`` it is True only at a checkpoint step\. It therefore can **never** bypass a mandatory completion block — the ``MandatoryBlockMonitor`` invariant holds\. As defense\-in\-depth, ``execute\(\)`` ignores an ``interrupted=True`` result returned from a non\-interruptible step\. Polling ``check\_interrupt\(\)`` is optional; steps that never call it behave exactly as before\.
 
 ## __17\.5 Mandatory Completion Blocks__
 
