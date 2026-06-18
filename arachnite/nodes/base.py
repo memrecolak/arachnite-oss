@@ -8,8 +8,9 @@ Spec reference: Section 5.1.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from abc import ABC
-from collections.abc import Coroutine
+from collections.abc import Awaitable, Callable, Coroutine
 from pathlib import Path
 from typing import Any
 
@@ -17,6 +18,60 @@ from arachnite.bus import SignalBus
 from arachnite.config import NodeConfig
 from arachnite.logging import BaseLogSink, StructuredLogger
 from arachnite.models import Permission
+
+#: Signature of the runtime-supplied fault sink: ``(node_id, error) -> None``.
+#: Wired to a :class:`~arachnite.supervisor.NodeSupervisor`'s ``on_fault``.
+FaultHandler = Callable[[str, BaseException], Awaitable[None]]
+
+
+class FaultReportingMixin:
+    """
+    Opt-in fault sink for master nodes that own a collection of leaf nodes.
+
+    Master nodes catch leaf-node exceptions so a single misbehaving node can
+    never crash the tick loop. Historically those exceptions were logged and
+    swallowed, which meant the supervisor was never told and the documented
+    ``node_fault`` → ``ctx.signals`` path (llms.txt tick step 2, NodeFaultSignal
+    docstring) never fired. This mixin lets the runtime wire each master's
+    fault sink to the matching supervisor's ``on_fault`` so a raise transitions
+    the node to FAULTED, emits the SupervisorSignal + NodeFaultSignal, and —
+    via the runtime's buffered-signal injection — surfaces in the *next* tick's
+    Context.
+
+    The handler is ``None`` by default, so a master driven standalone (without a
+    runtime, e.g. in tests or embedded use) keeps its swallow-and-continue
+    behaviour unchanged.
+    """
+
+    #: Set to a logger by the host class (BaseNode provides ``self.logger``).
+    logger: StructuredLogger
+
+    _fault_handler: FaultHandler | None = None
+
+    def set_fault_handler(self, handler: FaultHandler | None) -> None:
+        """Install (or clear) the fault sink. Called by the runtime at wiring time."""
+        self._fault_handler = handler
+
+    async def _report_fault(self, node_id: str, error: BaseException) -> None:
+        """
+        Forward a leaf-node fault to the installed handler, if any.
+
+        Failures inside the handler are swallowed (and logged): reporting a
+        fault must never itself crash the tick. No-op when no handler is set.
+        """
+        handler = self._fault_handler
+        if handler is None:
+            return
+        try:
+            await handler(node_id, error)
+        except Exception as exc:  # noqa: BLE001
+            with contextlib.suppress(Exception):
+                self.logger.error(
+                    "Fault handler raised while reporting node fault",
+                    node_id=node_id,
+                    error=str(exc),
+                    error_type=type(exc).__name__,
+                )
 
 
 class BaseNode(ABC):

@@ -131,7 +131,7 @@ async def main() -> None:
         await rt.stop()
 
     print("-" * 60)
-    print(f"Simulation complete.")
+    print("Simulation complete.")
     print(f"  Ticks executed : {rt.tick_count}")
     print(f"  Picks completed: {SIM.pick_count}")
     print(f"  Emergencies    : {SIM.emergency_count}")

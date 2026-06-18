@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "arachnite"
-version = "0.11.5"
+version = "0.11.6"
 description = "A biologically-inspired reactive agent framework for Python"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -94,3 +94,12 @@ select = ["E", "F", "I", "UP", "B", "SIM"]
 # web.py embeds a self-contained HTML/CSS/JS dashboard as a Python string literal;
 # long lines inside that string cannot be broken without corrupting the content.
 "arachnite/web.py" = ["E501"]
+# Examples and tutorials deliberately group `from arachnite import (...)` by
+# concept (runtime → signals → sense → instinct → decision → action → ...) to
+# mirror the framework's architecture for readers; isort (I001) would alphabetize
+# and destroy that teaching layout.
+"examples/**"  = ["I001"]
+# Exercise stubs additionally import the symbols the reader is asked to wire up
+# (so F401 "unused import" is intentional scaffolding), and favour an explicit
+# if/else over a ternary (SIM108) for clarity.
+"tutorials/**" = ["I001", "F401", "SIM108"]

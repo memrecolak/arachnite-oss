@@ -21,7 +21,7 @@ from arachnite.config import NodeConfig
 from arachnite.exceptions import NodeRegistrationError, ReflexConflictError
 from arachnite.logging import BaseLogSink
 from arachnite.models import Context, Proposal
-from arachnite.nodes.base import BaseNode
+from arachnite.nodes.base import BaseNode, FaultReportingMixin
 
 
 class BaseInstinctNode(BaseNode):
@@ -109,7 +109,7 @@ class BaseReflexInstinctNode(BaseInstinctNode):
     priority: int = 200
 
 
-class InstinctMasterNode(BaseNode):
+class InstinctMasterNode(FaultReportingMixin, BaseNode):
     """
     Evaluates all registered instinct nodes and collects proposals.
 
@@ -250,6 +250,7 @@ class InstinctMasterNode(BaseNode):
                     node_id=node.node_id,
                     error=str(exc),
                 )
+                await self._report_fault(node.node_id, exc)
                 return None
 
         results = await asyncio.gather(*(_eval(n) for n in enabled))
@@ -397,6 +398,7 @@ class InstinctMasterNode(BaseNode):
                     node_id=node.node_id,
                     error=str(exc),
                 )
+                await self._report_fault(node.node_id, exc)
                 result = None
             if node.trigger_interval_s is not None:
                 node._last_trigger_s = time.monotonic()

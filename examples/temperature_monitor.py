@@ -47,8 +47,6 @@ from arachnite import (
     BaseActionNode,
     MultiStepActionNode,
     ActionMasterNode,
-    NodeSupervisor,
-    RestartPolicy,
     StdoutLogSink,
     LogLevel,
 )

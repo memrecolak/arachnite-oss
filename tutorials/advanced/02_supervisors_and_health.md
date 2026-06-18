@@ -186,6 +186,14 @@ class CrashReflex(BaseReflexInstinctNode):
 
 Now your agent treats its own crashes as just another signal it can react to.
 
+The runtime buffers supervisor signals and injects them at the start of the
+next tick, so a node that crashes during tick *N* surfaces its `node_fault`
+signal in `ctx.signals` on tick *N+1* — `CrashReflex` fires one tick after the
+crash. A single fault appears as two signals: the `SupervisorSignal`
+(kind `"supervisor"`) and the typed `NodeFaultSignal` (kind `"node_fault"`,
+carrying `error_type` / `error_message`). Filter on `"node_fault"` when you
+only want faults.
+
 ## Tips
 
 - **Don't supervise every node.** Reserve supervision for nodes that touch

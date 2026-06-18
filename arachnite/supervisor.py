@@ -22,8 +22,10 @@ class NodeSupervisor:
     Attached to each master node. Tracks the lifecycle state of every
     registered child node and applies a restart policy when faulted.
 
-    Supervisor signals flow onto the bus so InstinctNodes — including
-    ReflexInstinctNodes — can react to node failures in the same tick.
+    Supervisor signals flow onto the bus; the runtime buffers them and injects
+    them at the start of the next tick, so InstinctNodes — including
+    ReflexInstinctNodes — can react to node failures on the tick after they
+    occur (a fault on tick N is visible in ctx.signals on tick N+1).
 
     Spec reference: Section 6.2.
     """

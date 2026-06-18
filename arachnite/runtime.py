@@ -90,6 +90,8 @@ class ArachniteRuntime:
 
     The tick sequence each cycle:
     1. SenseMasterNode.read_all()         → signals
+    1b. Inject buffered supervisor + node_fault signals captured since the
+        previous tick (a node raising during tick N surfaces here on tick N+1)
     2. ContextNode.update(signals)        → context
     3. InstinctMasterNode.evaluate_reflexes(ctx) → reflex proposals
        └─ dispatch each reflex immediately (bypass decision, sequential)
@@ -174,15 +176,32 @@ class ArachniteRuntime:
         for an in action_master.nodes:
             self._supervisors[3].track(an)
 
+        # Wire each master's fault sink to its supervisor's on_fault. This is
+        # what makes a leaf node raising during a tick actually transition the
+        # supervisor (→ FAULTED, restart policy applied) and emit the
+        # SupervisorSignal + NodeFaultSignal the buffered-signal injection
+        # surfaces in ctx.signals. Without this, master nodes swallow the
+        # exception and the documented node_fault path never fires.
+        # (supervisors[2] is reserved for the decision master, which has no
+        #  fault sink — decision exceptions are handled inline.)
+        self._sense_master.set_fault_handler(self._supervisors[0].on_fault)
+        self._instinct_master.set_fault_handler(self._supervisors[1].on_fault)
+        self._action_master.set_fault_handler(self._supervisors[3].on_fault)
+
         self._stop_event = asyncio.Event()
 
         # Buffer for supervisor signals emitted between ticks.
-        # The runtime subscribes to 'supervisor' on the bus and drains
-        # this buffer at the start of each tick so that instincts
-        # (including reflexes) can observe node faults.
+        # The runtime subscribes to BOTH 'supervisor' (lifecycle transitions:
+        # RUNNING/STOPPED/RESTARTING) and 'node_fault' (the typed NodeFaultSignal
+        # carrying error_type/error_message for FAULTED/DEAD) on the bus, and
+        # drains this buffer at the start of each tick so instincts (including
+        # reflexes) can observe node faults via ctx.signals. A single fault
+        # therefore surfaces as two signals next tick — one kind='supervisor'
+        # and one kind='node_fault' — matching the documented contract.
         self._allowed_permissions = allowed_permissions
         self._supervisor_signal_buffer: list[Signal] = []
         self._bus.subscribe("supervisor", self._on_supervisor_signal)
+        self._bus.subscribe("node_fault", self._on_supervisor_signal)
 
         # Optional per-stage timing callback (ADR 0002). When ``None``
         # the tick path short-circuits on a single branch per stage.
@@ -523,7 +542,12 @@ class ArachniteRuntime:
     # ── Supervisor signal forwarding ─────────────────────────────────────────
 
     async def _on_supervisor_signal(self, signal: Signal) -> None:
-        """Buffer supervisor signals for injection into the next tick."""
+        """
+        Buffer supervisor and node_fault signals for injection into the next
+        tick. Subscribed to both the 'supervisor' and 'node_fault' bus kinds,
+        so a node fault is surfaced in ctx.signals as both a SupervisorSignal
+        and a typed NodeFaultSignal.
+        """
         self._supervisor_signal_buffer.append(signal)
 
     # ── Tick loop ─────────────────────────────────────────────────────────────
@@ -603,14 +627,22 @@ class ArachniteRuntime:
             self._action_master.notify_tick_start(self._tick_count),
         )
 
+        # 1b. Snapshot-and-clear the buffered supervisor/node_fault signals
+        #     *before* read_all. Doing this first means a node that faults
+        #     during this tick's sense stage is deferred to the next tick's
+        #     drain, keeping fault visibility uniformly at N+1 regardless of
+        #     which stage (sense/instinct/action) raised — rather than sense
+        #     faults leaking into the same tick they occurred in.
+        buffered_signals = self._supervisor_signal_buffer
+        self._supervisor_signal_buffer = []
+
         # 1. Sense
         signals = await self._sense_master.read_all()
 
-        # 1b. Drain buffered supervisor signals so instincts can observe
-        #     node faults (FAULTED, DEAD, RESTARTING) in this tick.
-        if self._supervisor_signal_buffer:
-            signals.extend(self._supervisor_signal_buffer)
-            self._supervisor_signal_buffer.clear()
+        # Append faults observed since the last tick (sense signals first, then
+        # the buffered FAULTED/DEAD/RESTARTING + node_fault signals).
+        if buffered_signals:
+            signals.extend(buffered_signals)
 
         if instrumenter is not None:
             now = time.monotonic()

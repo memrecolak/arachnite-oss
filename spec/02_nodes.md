@@ -954,7 +954,7 @@ class RestartPolicy\(Enum\):
 
 ## __6\.4 SupervisorSignal__
 
-Whenever a node changes state, the supervisor publishes a SupervisorSignal onto the SignalBus with kind 'supervisor'\. This allows InstinctNodes — including ReflexInstinctNodes — to react to node failures in the same tick they are detected\.
+Whenever a node changes state, the supervisor publishes a SupervisorSignal onto the SignalBus with kind 'supervisor'\. The runtime buffers these signals and injects them at the start of the following tick, so InstinctNodes — including ReflexInstinctNodes — observe a node's state change in `ctx.signals` on the **next** tick after it is detected \(a fault raised during tick N is visible on tick N+1\)\.
 
 @dataclass
 

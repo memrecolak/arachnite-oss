@@ -613,6 +613,10 @@ class TestSupervisorSignalsInContext:
         node = DummySense(bus=rt.bus)
         await rt.register_sense_live(node)
         await rt.start()
+        # Pause so the manual tick is the only consumer, then drop the startup
+        # RUNNING signals so we assert solely on the fault we publish below.
+        await rt.pause()
+        rt._supervisor_signal_buffer.clear()
 
         # Simulate a supervisor fault signal being published on the bus
         sv_sig = SupervisorSignal(

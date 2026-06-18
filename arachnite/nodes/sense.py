@@ -17,7 +17,7 @@ from arachnite.config import NodeConfig
 from arachnite.exceptions import NodeRegistrationError
 from arachnite.logging import BaseLogSink
 from arachnite.models import MergePolicy, Signal
-from arachnite.nodes.base import BaseNode
+from arachnite.nodes.base import BaseNode, FaultReportingMixin
 
 
 class BaseSenseNode(BaseNode):
@@ -81,7 +81,7 @@ class BaseSenseNode(BaseNode):
         return None
 
 
-class SenseMasterNode(BaseNode):
+class SenseMasterNode(FaultReportingMixin, BaseNode):
     """
     Owns a collection of BaseSenseNode instances.
 
@@ -166,6 +166,10 @@ class SenseMasterNode(BaseNode):
                 return signal
             except Exception as exc:  # noqa: BLE001
                 node._last_read_time = time.monotonic()
+                # Report the fault to the supervisor (via the runtime-wired
+                # handler) so node_fault reaches next tick's Context, then still
+                # give the node its on_error fallback chance for this tick.
+                await self._report_fault(node.node_id, exc)
                 return await node.on_error(exc)
 
         results = await asyncio.gather(*(_read_one(n) for n in self._nodes.values()))

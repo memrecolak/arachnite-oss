@@ -2,14 +2,7 @@
 from __future__ import annotations
 
 import asyncio
-
-from examples.temperature_monitor import (
-    CoolFan,
-    CriticalReflex,
-    EmergencyStop,
-    SimTempSensor,
-    WarnInstinct,
-)
+import contextlib
 
 from arachnite import (
     ActionMasterNode,
@@ -22,6 +15,13 @@ from arachnite import (
     SenseMasterNode,
     SignalBus,
     SignalDashboard,
+)
+from examples.temperature_monitor import (
+    CoolFan,
+    CriticalReflex,
+    EmergencyStop,
+    SimTempSensor,
+    WarnInstinct,
 )
 
 
@@ -74,7 +74,5 @@ async def main() -> None:
 
 
 if __name__ == "__main__":
-    try:
+    with contextlib.suppress(KeyboardInterrupt):
         asyncio.run(main())
-    except KeyboardInterrupt:
-        pass

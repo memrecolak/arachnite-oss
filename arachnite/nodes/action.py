@@ -36,7 +36,7 @@ from arachnite.models import (
     Result,
     StepResult,
 )
-from arachnite.nodes.base import BaseNode
+from arachnite.nodes.base import BaseNode, FaultReportingMixin
 
 # Proposals at or above this priority are reflex/safety actions. They bypass
 # ActionGuards to preserve the framework's "reflexes always fire" guarantee
@@ -408,7 +408,7 @@ class MultiStepActionNode(BaseActionNode):
 # ActionMasterNode
 # ══════════════════════════════════════════════════════════════════════════════
 
-class ActionMasterNode(BaseNode):
+class ActionMasterNode(FaultReportingMixin, BaseNode):
     """
     Routes Proposals to the correct ActionNode, enforces timeouts and
     retries, and manages interrupt requests for running actions.
@@ -746,6 +746,7 @@ class ActionMasterNode(BaseNode):
                     error=str(exc),
                     error_type=type(exc).__name__,
                 )
+                await self._report_fault(node.node_id, exc)
                 result = Result(
                     action_id=node.node_id,
                     success=False,
