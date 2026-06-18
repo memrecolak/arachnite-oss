@@ -9,6 +9,7 @@ import pytest
 from arachnite import SignalBus
 from arachnite.exceptions import (
     ActionNotFoundError,
+    ActionVetoed,
     MandatoryBlockViolation,
     NodeRegistrationError,
     RollbackError,
@@ -23,8 +24,10 @@ from arachnite.models import (
     StepResult,
 )
 from arachnite.nodes.action import (
+    ActionGuard,
     ActionMasterNode,
     BaseActionNode,
+    GuardVerdict,
     MultiStepActionNode,
 )
 
@@ -829,3 +832,277 @@ class TestDispatchOneTOCTOUGuard:
 
         assert am._running_nodes == {}
         assert am._running_proposals == {}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# P2 — ActionGuard pre-dispatch veto
+# ══════════════════════════════════════════════════════════════════════════════
+
+class _CountingAction(BaseActionNode):
+    """Counts how many times execute() is actually called."""
+    node_id = "_CountingAction"
+
+    def __init__(self, bus: SignalBus, **kwargs: object) -> None:
+        super().__init__(bus, **kwargs)  # type: ignore[arg-type]
+        self.calls = 0
+
+    async def execute(self, proposal: Proposal) -> Result:
+        self.calls += 1
+        return Result(action_id=self.node_id, success=True)
+
+
+class _CountingRetryAction(_CountingAction):
+    """Like _CountingAction but with retries — proves a veto skips them."""
+    node_id     = "_CountingRetryAction"
+    max_retries = 2
+
+
+class _ActA(_CountingAction):
+    node_id = "ActA"
+
+
+class _ActB(_CountingAction):
+    node_id = "ActB"
+
+
+def _allow_guard(proposal: Proposal) -> GuardVerdict:
+    return GuardVerdict(allow=True)
+
+
+def _deny_guard(proposal: Proposal) -> GuardVerdict:
+    return GuardVerdict(allow=False, reason="nope")
+
+
+class TestActionGuard:
+    @pytest.mark.asyncio
+    async def test_guard_allow_dispatches(self) -> None:
+        bus = _bus()
+        am  = ActionMasterNode(bus=bus)
+        act = _CountingAction(bus=bus)
+        am.register(act)
+        am.register_guard(_allow_guard)
+
+        result = await am.dispatch(_proposal("_CountingAction"))
+
+        assert result.success is True
+        assert act.calls == 1
+
+    @pytest.mark.asyncio
+    async def test_guard_deny_no_side_effect_no_retry(self) -> None:
+        bus = _bus()
+        am  = ActionMasterNode(bus=bus)
+        act = _CountingRetryAction(bus=bus)
+        am.register(act)
+        am.register_guard(_deny_guard)
+
+        result = await am.dispatch(_proposal("_CountingRetryAction"))
+
+        assert result.success is False
+        assert isinstance(result.error, ActionVetoed)
+        assert result.error.reason == "nope"
+        assert act.calls == 0                     # never executed, never retried
+        assert am._running_nodes == {}            # running-state cleaned up
+        assert am._running_proposals == {}
+
+    @pytest.mark.asyncio
+    async def test_guard_raising_fails_closed(self) -> None:
+        bus = _bus()
+        am  = ActionMasterNode(bus=bus)
+        act = _CountingAction(bus=bus)
+        am.register(act)
+
+        def _raising_guard(proposal: Proposal) -> GuardVerdict:
+            raise RuntimeError("boom")
+
+        am.register_guard(_raising_guard)
+        result = await am.dispatch(_proposal("_CountingAction"))
+
+        assert result.success is False
+        assert isinstance(result.error, ActionVetoed)
+        assert "boom" in result.error.reason
+        assert act.calls == 0
+
+    @pytest.mark.asyncio
+    async def test_first_deny_wins(self) -> None:
+        bus = _bus()
+        am  = ActionMasterNode(bus=bus)
+        am.register(_CountingAction(bus=bus))
+        consulted: list[str] = []
+
+        def _g1(proposal: Proposal) -> GuardVerdict:
+            consulted.append("g1")
+            return GuardVerdict(allow=False, reason="g1")
+
+        def _g2(proposal: Proposal) -> GuardVerdict:
+            consulted.append("g2")
+            return GuardVerdict(allow=True)
+
+        am.register_guard(_g1)
+        am.register_guard(_g2)
+        result = await am.dispatch(_proposal("_CountingAction"))
+
+        assert isinstance(result.error, ActionVetoed)
+        assert result.error.reason == "g1"
+        assert consulted == ["g1"]                # g2 never consulted
+
+    @pytest.mark.asyncio
+    async def test_reflex_bypasses_guards(self) -> None:
+        bus = _bus()
+        am  = ActionMasterNode(bus=bus)
+        act = _CountingAction(bus=bus)
+        am.register(act)
+        am.register_guard(_deny_guard)
+
+        reflex = Proposal(
+            instinct_id="reflex", action_id="_CountingAction",
+            priority=200, urgency=1.0,
+        )
+        result = await am.dispatch(reflex)
+
+        assert result.success is True             # reflex fired despite deny-all
+        assert act.calls == 1
+
+    @pytest.mark.asyncio
+    async def test_dispatch_many_honors_guards(self) -> None:
+        bus = _bus()
+        am  = ActionMasterNode(bus=bus)
+        a   = _ActA(bus=bus)
+        b   = _ActB(bus=bus)
+        am.register(a)
+        am.register(b)
+
+        def _deny_b(proposal: Proposal) -> GuardVerdict:
+            if proposal.action_id == "ActB":
+                return GuardVerdict(allow=False, reason="no B")
+            return GuardVerdict(allow=True)
+
+        am.register_guard(_deny_b)
+        results = await am.dispatch_many([_proposal("ActA"), _proposal("ActB")])
+        by_id   = {r.action_id: r for r in results}
+
+        assert by_id["ActA"].success is True
+        assert by_id["ActB"].success is False
+        assert isinstance(by_id["ActB"].error, ActionVetoed)
+        assert a.calls == 1
+        assert b.calls == 0
+
+    @pytest.mark.asyncio
+    async def test_guards_via_constructor(self) -> None:
+        bus = _bus()
+        am  = ActionMasterNode(bus=bus, guards=[_deny_guard])
+        act = _CountingAction(bus=bus)
+        am.register(act)
+
+        result = await am.dispatch(_proposal("_CountingAction"))
+
+        assert isinstance(result.error, ActionVetoed)
+        assert act.calls == 0
+
+    def test_register_guard_rejects_coroutine(self) -> None:
+        am = ActionMasterNode(bus=_bus())
+
+        async def _async_guard(proposal: Proposal) -> GuardVerdict:
+            return GuardVerdict(allow=True)
+
+        with pytest.raises(TypeError):
+            am.register_guard(_async_guard)  # type: ignore[arg-type]
+
+    def test_guard_is_runtime_checkable(self) -> None:
+        assert isinstance(_allow_guard, ActionGuard)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# P4 — Cooperative mid-step interrupt
+# ══════════════════════════════════════════════════════════════════════════════
+
+class _LongPollStep(MultiStepActionNode):
+    """A single long step that polls check_interrupt() and bails when set."""
+    node_id          = "_LongPollStep"
+    interrupt_policy = InterruptPolicy.ALWAYS
+
+    def steps(self) -> list[ActionStep]:
+        return [ActionStep("long", interruptible=True)]
+
+    async def execute_step(
+        self, step: ActionStep, proposal: Proposal, completed: list[StepResult]
+    ) -> StepResult:
+        for _ in range(200):
+            if self.check_interrupt():
+                return StepResult(step_name=step.name, success=False, interrupted=True)
+            await asyncio.sleep(0.005)
+        return StepResult(step_name=step.name, success=True)
+
+
+class _MandatoryPollStep(MultiStepActionNode):
+    """A non-interruptible step — check_interrupt() must stay False throughout."""
+    node_id          = "_MandatoryPollStep"
+    interrupt_policy = InterruptPolicy.ALWAYS
+
+    def steps(self) -> list[ActionStep]:
+        return [ActionStep("mand", interruptible=False)]
+
+    async def execute_step(
+        self, step: ActionStep, proposal: Proposal, completed: list[StepResult]
+    ) -> StepResult:
+        saw_interrupt = False
+        for _ in range(20):
+            if self.check_interrupt():
+                saw_interrupt = True
+            await asyncio.sleep(0.005)
+        return StepResult(step_name=step.name, success=not saw_interrupt)
+
+
+class _NeverPollStep(MultiStepActionNode):
+    """Interruptible step but NEVER policy — check_interrupt() must stay False."""
+    node_id          = "_NeverPollStep"
+    interrupt_policy = InterruptPolicy.NEVER
+
+    def steps(self) -> list[ActionStep]:
+        return [ActionStep("step", interruptible=True)]
+
+    async def execute_step(
+        self, step: ActionStep, proposal: Proposal, completed: list[StepResult]
+    ) -> StepResult:
+        saw_interrupt = False
+        for _ in range(20):
+            if self.check_interrupt():
+                saw_interrupt = True
+            await asyncio.sleep(0.005)
+        return StepResult(step_name=step.name, success=not saw_interrupt)
+
+
+class TestCooperativeInterrupt:
+    @pytest.mark.asyncio
+    async def test_long_step_polls_and_bails(self) -> None:
+        node = _LongPollStep(bus=_bus())
+        task = asyncio.create_task(node.execute(_proposal("_LongPollStep")))
+        await asyncio.sleep(0.02)
+        node.request_interrupt(_interrupt())
+        result = await task
+
+        assert result.interrupted is True
+        assert result.success is False
+        assert result.stopped_at_step == "long"
+
+    @pytest.mark.asyncio
+    async def test_mandatory_step_check_interrupt_false(self) -> None:
+        node = _MandatoryPollStep(bus=_bus())
+        task = asyncio.create_task(node.execute(_proposal("_MandatoryPollStep")))
+        await asyncio.sleep(0.02)
+        node.request_interrupt(_interrupt())
+        result = await task
+
+        # Mandatory block ran to completion; the interrupt was never honoured.
+        assert result.success is True
+        assert result.interrupted is False
+
+    @pytest.mark.asyncio
+    async def test_never_policy_check_interrupt_false(self) -> None:
+        node = _NeverPollStep(bus=_bus())
+        task = asyncio.create_task(node.execute(_proposal("_NeverPollStep")))
+        await asyncio.sleep(0.02)
+        node.request_interrupt(_interrupt())
+        result = await task
+
+        assert result.success is True
+        assert result.interrupted is False

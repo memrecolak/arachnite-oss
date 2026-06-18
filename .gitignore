@@ -76,3 +76,14 @@ arachnite.bat
 
 # Local toolchain (PlantUML jar, etc.)
 .tools/
+
+# Claude Code local config and personal sub-agents — never commit
+.claude/
+
+# Local run/scratch logs
+*.log
+
+# Internal governance — kept locally for process, never committed to the public mirror
+CHANGELOG.md
+TODO.md
+docs/decisions/

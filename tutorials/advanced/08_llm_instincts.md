@@ -208,6 +208,11 @@ laptop instead of in the cloud.
 - Anything safety-critical (use a deterministic instinct or a reflex).
 - Hot paths where you can't tolerate the cost of API calls.
 - Cases where a simple `if` statement would do the job.
+- **Interactive "ask and wait for an answer" flows.** `LLMInstinctNode` is *not* a
+  request/response primitive — `evaluate()` returns the last *cached* proposal and only
+  refreshes it in the background every `min_interval_s`. There is no synchronous answer
+  to await. For a chat-style "user asks, agent replies" loop, call the provider SDK (or
+  `provider.complete_text()`) directly, outside the tick path.
 
 A practical pattern is to combine both:
 

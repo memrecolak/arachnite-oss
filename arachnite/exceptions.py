@@ -75,6 +75,21 @@ class ActionNotFoundError(ArachniteError):
         self.action_id = action_id
 
 
+class ActionVetoed(ArachniteError):
+    """
+    An ActionGuard denied a proposal before dispatch.
+
+    Carried in ``Result.error`` (never raised) so the veto flows through the
+    normal Result feedback channel like any other failed action. The action's
+    ``execute()`` is never called and no retry is attempted.
+    """
+
+    def __init__(self, action_id: str, reason: str) -> None:
+        super().__init__(f"Action '{action_id}' vetoed by guard: {reason}")
+        self.action_id = action_id
+        self.reason    = reason
+
+
 # ── Multi-step / Interruption ─────────────────────────────────────────────────
 
 class InterruptError(ArachniteError):

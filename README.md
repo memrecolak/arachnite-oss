@@ -163,6 +163,26 @@ registered instances:
 5. `evaluate()` on any `InstinctNode` must return `None` when not applicable — never raise.
 6. All node I/O must be async — wrap blocking hardware calls in `asyncio.to_thread()`.
 
+### Runtime vs. runtime-less
+
+The full deliberative runtime (`RuntimeBuilder` → `InstinctMaster` → `DecisionMaster` →
+the free-running tick loop) is **not** required to use Arachnite. The node primitives
+work standalone with a bare `SignalBus`:
+
+```python
+bus = SignalBus()
+action_master = ActionMasterNode(bus)
+action_master.register(MyActionNode(bus))
+# Drive it on a loop you own — no runtime, no tick loop:
+result = await action_master.dispatch(proposal)
+```
+
+**Reach for the deliberative runtime only when ≥2 autonomous behaviors compete
+continuously on dynamic priority** — the robotics / edge control shape it was built for.
+For a single agent or a human-in-the-loop app with a *static* priority order (a coding
+cockpit, a one-shot pipeline, a request-driven service), prefer direct dispatch and your
+own arbitration. See `spec/03_runtime.md` §7.2.2 for the direct-drive pattern.
+
 ## Distributed deployments
 
 A `DeploymentManifest` declares which nodes run on which `AgentNode`. The

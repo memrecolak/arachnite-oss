@@ -165,6 +165,7 @@ class StepResult:
     error:          BaseException | None = None
     duration_s:     float = 0.0
     abort_sequence: bool = False   # step requests immediate sequence abort
+    interrupted:    bool = False   # step observed a cooperative interrupt and bailed
 
 
 class InterruptPolicy(Enum):

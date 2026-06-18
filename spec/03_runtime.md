@@ -296,6 +296,12 @@ Lifecycle per tick N\+1, given dispatch in tick N:
 
 This bounds staleness to one tick: an instinct that fires once and then stops firing will see its own ``Result`` exactly once \(on the immediately following tick\), never repeatedly\.
 
+### __7\.2\.2 Using nodes without the runtime \(direct\-drive\)__
+
+``ArachniteRuntime`` and the tick loop are **optional**\. The node primitives — ``BaseSenseNode``, ``BaseActionNode``, ``ActionMasterNode`` — are usable standalone with a bare ``SignalBus``, driven on a loop the caller owns\. Construct the nodes, ``register\(\)`` actions on an ``ActionMasterNode``, and call ``read\(\)`` / ``evaluate\(\)`` / ``execute\(\)`` / ``await dispatch\(proposal\)`` directly\. No ``RuntimeBuilder``, no ``InstinctMaster``, no ``DecisionMaster``, no free\-running tick\.
+
+**When is the deliberative runtime warranted?** Only when **≥2 autonomous behaviors compete continuously on dynamic priority** — the robotics / edge control shape the ``InstinctMaster`` → ``DecisionMaster`` → tick pipeline is built for\. For a single agent, or a human\-in\-the\-loop application with a *static* priority order \(a coding cockpit, a one\-shot pipeline, a request\-driven service\), prefer direct dispatch \+ your own arbitration\. The direct\-drive pattern used in unit tests \(see ``04_extension_testing``\) is also a legitimate production deployment shape — it is not a test\-only affordance\.
+
 ## __7\.3 Quick\-Start Example__
 
 import asyncio

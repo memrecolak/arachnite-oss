@@ -1,6 +1,12 @@
 """arachnite.nodes — all node types and master nodes."""
 
-from arachnite.nodes.action import ActionMasterNode, BaseActionNode, MultiStepActionNode
+from arachnite.nodes.action import (
+    ActionGuard,
+    ActionMasterNode,
+    BaseActionNode,
+    GuardVerdict,
+    MultiStepActionNode,
+)
 from arachnite.nodes.base import BaseNode
 from arachnite.nodes.decision import (
     BaseDecisionNode,
@@ -31,4 +37,6 @@ __all__ = [
     "BaseActionNode",
     "MultiStepActionNode",
     "ActionMasterNode",
+    "ActionGuard",
+    "GuardVerdict",
 ]

@@ -229,6 +229,14 @@ async def test_fires_on_hot(make_signal, make_context):
 Cleaner, less repetitive, and mistakes in the helpers get fixed in one
 place.
 
+> **This direct-drive style is not test-only.** Notice that the unit tests above
+> construct a node with a bare `SignalBus()` and call `read()` / `evaluate()` /
+> `dispatch()` directly — no `ArachniteRuntime`, no tick loop. That same pattern is a
+> legitimate **production** deployment shape for a single agent or a human-in-the-loop
+> app with a static priority order. You only need the full deliberative runtime when
+> ≥2 autonomous behaviors compete continuously on dynamic priority. See
+> `spec/03_runtime.md` §7.2.2.
+
 ## Integration tests — running a real tick or two
 
 Unit tests cover individual nodes. Sometimes you also want to make sure the

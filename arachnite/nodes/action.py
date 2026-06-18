@@ -8,15 +8,19 @@ Spec reference: Sections 5.7, 17.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import time
 from abc import abstractmethod
 from collections.abc import Sequence
+from dataclasses import dataclass
+from typing import Protocol, runtime_checkable
 
 from arachnite.bus import SignalBus
 from arachnite.config import NodeConfig
 from arachnite.exceptions import (
     ActionNotFoundError,
     ActionTimeoutError,
+    ActionVetoed,
     MandatoryBlockViolation,
     NodeRegistrationError,
     RollbackError,
@@ -33,6 +37,35 @@ from arachnite.models import (
     StepResult,
 )
 from arachnite.nodes.base import BaseNode
+
+# Proposals at or above this priority are reflex/safety actions. They bypass
+# ActionGuards to preserve the framework's "reflexes always fire" guarantee
+# (see Proposal.priority: "200+ reflex, 100-199 safety").
+REFLEX_PRIORITY_FLOOR = 200
+
+
+@dataclass(frozen=True, slots=True)
+class GuardVerdict:
+    """The outcome of an ActionGuard check: allow, or deny with a reason."""
+
+    allow:  bool
+    reason: str = ""
+
+
+@runtime_checkable
+class ActionGuard(Protocol):
+    """
+    A synchronous, bounded, no-I/O pre-dispatch veto.
+
+    Consulted by ActionMasterNode before an action executes. Return
+    ``GuardVerdict(allow=False, reason=...)`` to deny a concrete proposal
+    based on its parameters (e.g. an out-of-scope path, a destructive
+    command). Guards must be deterministic and fast — they run on the
+    dispatch path, not in a background task.
+    """
+
+    def __call__(self, proposal: Proposal) -> GuardVerdict: ...
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # BaseActionNode
@@ -176,6 +209,27 @@ class MultiStepActionNode(BaseActionNode):
             return True
         return self._current_step.interruptible
 
+    def check_interrupt(self) -> bool:
+        """
+        Poll from inside a long-running ``execute_step`` to cooperatively bail.
+
+        Returns True only when an interrupt has been requested AND the current
+        step may honour it. Returns False inside a non-interruptible (mandatory
+        completion) step or under ``InterruptPolicy.NEVER`` — it can never
+        bypass a mandatory block (see ``MandatoryBlockMonitor``). Under
+        ``CHECKPOINT`` it is True only at a checkpoint step. A step that sees
+        True should stop and return ``StepResult(..., interrupted=True)``.
+        """
+        if not self._interrupt_requested:
+            return False
+        if self._current_step is None or not self._current_step.interruptible:
+            return False
+        if self.interrupt_policy == InterruptPolicy.NEVER:
+            return False
+        if self.interrupt_policy == InterruptPolicy.CHECKPOINT:
+            return self._current_step.checkpoint
+        return True
+
     def execution_state(self) -> ActionExecutionState:
         """Return a snapshot of current execution progress for the Context."""
         completed_names = [sr.step_name for sr in self._completed_steps]
@@ -244,6 +298,19 @@ class MultiStepActionNode(BaseActionNode):
             step_result  = await self._run_step_timed(step, proposal, step_timeout)
             self._completed_steps.append(step_result)
 
+            # Step cooperatively bailed mid-execution on an interrupt — surface
+            # it like the between-steps interrupt path (Result.interrupted), not
+            # as an abort/failure. Defense-in-depth: never honour it inside a
+            # mandatory block (check_interrupt() already returns False there),
+            # so a contract-violating step cannot bypass MandatoryBlockMonitor.
+            if step_result.interrupted:
+                if step.interruptible:
+                    return await self._handle_interrupt(proposal, pending, start_time)
+                self.logger.warning(
+                    "Ignoring interrupted=True from non-interruptible step",
+                    step=step.name,
+                )
+
             # Step requested abort
             if step_result.abort_sequence:
                 self._current_step = None
@@ -297,6 +364,7 @@ class MultiStepActionNode(BaseActionNode):
             error      = result.error,
             duration_s = time.monotonic() - step_start,
             abort_sequence = result.abort_sequence,
+            interrupted    = result.interrupted,
         )
         self.logger.debug(
             "Step complete",
@@ -360,17 +428,42 @@ class ActionMasterNode(BaseNode):
         config: NodeConfig | None = None,
         log_sinks: list[BaseLogSink] | None = None,
         agent_node_id: str = "local",
+        guards: list[ActionGuard] | None = None,
     ) -> None:
         super().__init__(bus, config, log_sinks, agent_node_id)
         self._nodes: dict[str, BaseActionNode] = {}
         self._running_nodes: dict[str, BaseActionNode] = {}
         self._running_proposals: dict[str, Proposal] = {}
+        self._guards: list[ActionGuard] = []
+        for guard in guards or ():
+            self.register_guard(guard)
 
     def register(self, node: BaseActionNode) -> None:
         if node.node_id in self._nodes:
             raise NodeRegistrationError(node.node_id, self.node_id)
         self._nodes[node.node_id] = node
         self.logger.debug("Registered action node", action_node_id=node.node_id)
+
+    def register_guard(self, guard: ActionGuard) -> None:
+        """
+        Install a synchronous, bounded, no-I/O pre-dispatch veto.
+
+        Guards run in registration order inside ``_dispatch_one``, BEFORE the
+        action executes and OUTSIDE the retry loop. The first deny wins
+        (remaining guards are skipped) and the action's ``execute()`` is never
+        called. A guard that raises FAILS CLOSED (treated as a deny) — unlike
+        ``InstinctMasterNode.set_pre_evaluate_gate``, which fails open, because
+        this is a safety layer.
+
+        Reflex/safety proposals (``priority >= REFLEX_PRIORITY_FLOOR``) bypass
+        all guards to preserve the framework's reflex-always-fires guarantee.
+        """
+        if inspect.iscoroutinefunction(guard):
+            raise TypeError(
+                "ActionGuard must be synchronous; got coroutine function "
+                f"{getattr(guard, '__qualname__', guard)!r}"
+            )
+        self._guards.append(guard)
 
     def get_node(self, node_id: str) -> BaseActionNode | None:
         """Return a registered action node by ID, or None"""
@@ -548,6 +641,25 @@ class ActionMasterNode(BaseNode):
             )
         self._running_nodes[proposal.action_id] = node
         self._running_proposals[proposal.action_id] = proposal
+
+        # Pre-dispatch guards — deterministic veto BEFORE execution and outside
+        # the retry loop. Reflex/safety proposals bypass guards (always fire).
+        if self._guards and proposal.priority < REFLEX_PRIORITY_FLOOR:
+            verdict = self._run_guards(proposal)
+            if not verdict.allow:
+                self._running_nodes.pop(proposal.action_id, None)
+                self._running_proposals.pop(proposal.action_id, None)
+                self.logger.info(
+                    "Action vetoed by guard",
+                    action_id=proposal.action_id,
+                    reason=verdict.reason,
+                )
+                return Result(
+                    action_id=proposal.action_id,
+                    success=False,
+                    error=ActionVetoed(proposal.action_id, verdict.reason),
+                )
+
         start = time.monotonic()
 
         self.logger.info(
@@ -580,6 +692,23 @@ class ActionMasterNode(BaseNode):
             duration_ms=round(result.duration_s * 1000, 2),
         )
         return result
+
+    def _run_guards(self, proposal: Proposal) -> GuardVerdict:
+        """Consult guards in order. First deny wins; a raising guard fails closed."""
+        for guard in self._guards:
+            try:
+                verdict = guard(proposal)
+            except Exception as exc:  # noqa: BLE001 — fail closed on guard error
+                self.logger.error(
+                    "ActionGuard raised; failing closed",
+                    action_id=proposal.action_id,
+                    error=str(exc),
+                    error_type=type(exc).__name__,
+                )
+                return GuardVerdict(allow=False, reason=f"guard error: {exc}")
+            if not verdict.allow:
+                return verdict
+        return GuardVerdict(allow=True)
 
     async def _execute_with_retry(
         self, node: BaseActionNode, proposal: Proposal

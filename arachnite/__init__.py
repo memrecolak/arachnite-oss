@@ -23,6 +23,7 @@ from arachnite.codec import CodecRegistry, SignalCodec, default_registry
 from arachnite.config import NodeConfig
 from arachnite.context import ContextNode
 from arachnite.exceptions import (
+    ActionVetoed,
     ArachniteError,
     DependencyValidationError,
     PathTraversalError,
@@ -75,7 +76,13 @@ from arachnite.models import (
     StepResult,
     SupervisorSignal,
 )
-from arachnite.nodes.action import ActionMasterNode, BaseActionNode, MultiStepActionNode
+from arachnite.nodes.action import (
+    ActionGuard,
+    ActionMasterNode,
+    BaseActionNode,
+    GuardVerdict,
+    MultiStepActionNode,
+)
 from arachnite.nodes.active_inference import ActiveInferenceDecisionNode
 from arachnite.nodes.base import BaseNode
 from arachnite.nodes.decision import (
@@ -110,7 +117,7 @@ from arachnite.supervisor import NodeSupervisor
 from arachnite.testing import MockBus, make_context, make_proposal, make_result, make_signal
 from arachnite.web import FileLogSink, SignalDashboard
 
-__version__ = "0.11.4"
+__version__ = "0.11.5"
 __all__ = [
     # Core
     "ArachniteRuntime",
@@ -160,6 +167,7 @@ __all__ = [
     "default_registry",
     # Errors
     "ArachniteError",
+    "ActionVetoed",
     "DependencyValidationError",
     "PathTraversalError",
     "PermissionValidationError",
@@ -212,6 +220,8 @@ __all__ = [
     "BaseActionNode",
     "MultiStepActionNode",
     "ActionMasterNode",
+    "ActionGuard",
+    "GuardVerdict",
     # Testing helpers
     "make_signal",
     "make_proposal",

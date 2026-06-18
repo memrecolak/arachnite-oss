@@ -4,7 +4,26 @@
 > Models the nervous system of arachnids: sense → context → reflex → instinct → decide → act.
 > Designed for edge devices (Raspberry Pi, Jetson Nano), laptops, and cloud servers.
 
-Full spec: SPEC.md  |  Examples: examples/  |  Tests: tests/ (1101)
+Full spec: SPEC.md  |  Examples: examples/  |  Tests: tests/ (1130)
+
+---
+
+## Where the docs live (read this first)
+
+Arachnite's documentation spans several top-level trees — sweep *all* of them
+before concluding something is undocumented:
+
+- **`llms.txt`** (this file) — condensed, LLM-oriented overview of the architecture,
+  public API, and invariants. Start here.
+- **`README.md`** — human quick-start and project overview.
+- **`spec/`** — the formal specification, numbered `01`–`08` (introduction/architecture,
+  nodes, runtime, extension & testing, distributed, infrastructure, reference,
+  benchmarks). Source docstrings cite these section numbers.
+- **`tutorials/`** — hands-on course: `01`–`09` core lessons, `advanced/01`–`13` deep
+  dives (incl. `08_llm_instincts.md`, `09_testing_your_agents.md`,
+  `12_safety_monitors.md`), plus `exercises/` and `glossary.md`.
+- **`docs/uml/`** — class/sequence diagrams (`.puml` sources + rendered `.png`).
+- **`examples/`** — runnable reference agents (e.g. `robot_arm/`).
 
 ---
 
@@ -48,6 +67,9 @@ most recent result that background work has already produced.
   spawns the LLM call as a background task via `spawn_background_task()`.
 - That call finishes seconds later and swaps in the fresh proposal under an
   `asyncio.Lock`. The *next* tick picks it up. The loop never blocks on the model.
+- This means `LLMInstinctNode` is **not** a request/response primitive: it is a cached,
+  cooldown-throttled reactive control input. For an interactive "user asks, waits for an
+  answer" flow, call the model SDK directly in your own loop — don't reach for this node.
 
 So when modelling any slow or asynchronous capability, don't force it into the tick.
 Instead:
@@ -63,6 +85,34 @@ The event-driven `read()` in *Background task lifecycle* and the non-blocking
 `LLMInstinctNode` are the same pattern: **produce off the loop, hand the loop a ready
 value.** Only deterministic, statically-bounded logic (classical instincts, reflexes,
 fast sensor reads) should compute its result inline on the tick.
+
+---
+
+## Using nodes without the runtime (direct-drive)
+
+The node primitives do **not** require `ArachniteRuntime` or the tick loop. They are
+usable standalone with a bare `SignalBus`, driven on a loop you own:
+
+```python
+bus = SignalBus()
+sensor = MySenseNode(bus)
+action_master = ActionMasterNode(bus)
+action_master.register(MyActionNode(bus))
+
+# Drive it yourself — no RuntimeBuilder, no tick loop:
+signals = await sensor.read()
+result  = await action_master.dispatch(Proposal(
+    instinct_id="caller", action_id="MyActionNode", priority=100, urgency=1.0,
+))
+```
+
+**When do you actually need `InstinctMaster` / `DecisionMaster` / the tick loop?**
+Only when **≥2 autonomous behaviors compete continuously on dynamic priority** — the
+robotics/edge control shape the deliberative layer is built for. For a single agent or a
+human-in-the-loop app with a *static* priority order (e.g. a coding cockpit, a one-shot
+pipeline, a request-driven service), prefer direct dispatch: construct the nodes, call
+`read()` / `evaluate()` / `execute()` / `dispatch()` yourself. The same direct-drive
+pattern used in unit tests is a legitimate production deployment shape.
 
 ---
 

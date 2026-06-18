@@ -449,6 +449,8 @@ class LLMInstinctNode\(BaseInstinctNode, ABC\):
 
 The LLM is called with two tools: propose\_action \(returns action\_id, urgency, parameters, rationale\) and no\_action \(returns reason\)\. Tool use guarantees a structured, parseable response regardless of model verbosity\.
 
+**Not a request/response primitive\.** ``LLMInstinctNode`` is a cached, cooldown\-throttled reactive control input: ``evaluate\(\)`` returns the last cached ``Proposal`` immediately and only spawns a fresh model call when ``min_interval_s`` has elapsed \(see §7\.2 on the tick loop as a sampling cadence\)\. It is therefore **wrong** for an interactive "user asks, waits for an answer" flow — there is no synchronous answer to await\. For that, call the model SDK \(or ``provider\.complete_text\(\)``\) directly in your own loop, outside the tick path\.
+
 **Concurrency:** `_cached_proposal` is read by `evaluate()` and written by the background `_call_llm()` task\. An `asyncio.Lock` MUST guard both accesses to prevent a TOCTOU race\. Logging MUST remain outside the lock to avoid holding it during I/O\.
 
 **setup\(\) and preloading:** `LLMInstinctNode.setup()` calls `provider.preload()` if the injected provider supports it \(e\.g\. `LocalProvider`\)\. This loads the GGUF model eagerly before the first tick, avoiding a latency spike on the first `evaluate()` call\.
