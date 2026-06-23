@@ -85,10 +85,14 @@ exclude                = ["baselines/"]
 # numpy's published stubs use PEP 695 `type` statements (valid only on 3.12+).
 # Because we type-check against python_version 3.10, mypy rejects that syntax
 # and aborts before analysing our code. We don't type-check against numpy's
-# internals, so skip following into it.
+# internals, so skip following into it. Note: the module pattern must list
+# "numpy" itself (numpy/__init__.pyi) and not only "numpy.*" submodules, and
+# follow_imports=skip is ignored for .pyi stubs unless follow_imports_for_stubs
+# is also enabled — numpy ships inline stubs, so both are required.
 [[tool.mypy.overrides]]
-module         = "numpy.*"
-follow_imports = "skip"
+module                   = ["numpy", "numpy.*"]
+follow_imports           = "skip"
+follow_imports_for_stubs = true
 
 [tool.ruff]
 target-version = "py310"
