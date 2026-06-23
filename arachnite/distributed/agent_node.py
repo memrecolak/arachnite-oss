@@ -54,8 +54,12 @@ class AgentNode:
         self.description = description
 
     async def start(self) -> None:
-        """Connect transport, then start runtime loop."""
+        """Connect transport, bridge it to the bus, then start the runtime."""
         await self.transport.connect()
+        # Subscribe the bus's inbound handler on the transport for every kind
+        # that has a local subscriber, so remote signals are delivered here.
+        # No-op when the bus has no transport attached.
+        await self.runtime.bus.start_transport()
         await self.runtime.start()
 
     async def stop(self) -> None:
@@ -105,7 +109,7 @@ class AgentNode:
         if transport is None:
             transport = _build_transport(ac.transport, agent_id, ac.transport_config)
 
-        bus     = SignalBus()
+        bus     = SignalBus(transport=transport, agent_node_id=agent_id)
         context = ContextNode()
 
         sense_master    = SenseMasterNode(bus=bus, agent_node_id=agent_id)

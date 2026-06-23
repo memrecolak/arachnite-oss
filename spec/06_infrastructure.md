@@ -459,7 +459,7 @@ On constrained edge devices, Signal\.value may be large \(camera frames, audio b
 - ContextNode\.history\_length limits the number of ticks retained\. For large signal kinds, consider a smaller history or per\-kind limits via history\_config\.
 - HistoryConfig\.max\_ticks: keep only the most recent N tick occurrences of this kind in history\. Older occurrences are evicted in place \(value set to None, metadata\["evicted"\]=True, metadata\["reason"\]="max\_ticks"\) so signals of other kinds in the same tick slot remain readable\. `None` \(default\) falls back to ContextNode\.history\_length; `0` evicts every occurrence\.
 - HistoryConfig\.value\_ttl\_s: signals older than this are evicted from history \(value set to None, confidence to 0\.0\) regardless of history\_length\. Useful for high\-frequency sensors on memory\-constrained devices\.
-- Large values are never transmitted over the bus unless a subscriber on a different AgentNode has subscribed to that kind\. The transport filters before serialising\.
+- Large values are never transmitted over the bus unless a subscriber on a different AgentNode has subscribed to that kind\. The transport filters before serialising\. \(Planned optimisation: the SignalBus↔transport bridge is wired \(spec §10\), but it currently forwards every published signal to the transport; the publish\-side filtering by remote subscription described here is not yet implemented\.\)
 
 \# Per\-kind history configuration \(optional, overrides history\_length\):
 

@@ -3,14 +3,21 @@ arachnite.safety_monitor
 ~~~~~~~~~~~~~~~~~~~~~~~~~
 Runtime safety monitors that continuously verify invariants.
 
-Monitors are lightweight checkers attached to the runtime that verify
-safety properties after each tick. They complement the static formal
-verification (UPPAAL model, §6) with dynamic runtime assurance.
+Monitors are lightweight checkers that verify safety properties after each
+tick. They complement the static formal verification (UPPAAL model, §6) with
+dynamic runtime assurance.
+
+The runtime does NOT run these automatically. You wire them into your own run
+loop: build a `SafetyMonitorRegistry`, assemble a `MonitorState` from the
+tick's outcome, and call `registry.check_all(tick, state)` after each tick.
+See tutorials/advanced/12_safety_monitors.md for the integration pattern.
 
 Each monitor implements a single safety invariant and emits a
 SafetyViolationSignal on the SignalBus if the invariant is breached.
-Reflex instincts can subscribe to these signals and trigger
-compensating actions (e.g., emergency stop, safe mode).
+`check_all()` also returns the violations directly. To react to them inside
+the tick pipeline, subscribe a callback with `bus.subscribe("safety_violation",
+...)` — note that violations are NOT injected into `ctx.signals`, so reading
+`ctx.signals` (the node_fault pattern) will not see them.
 
 References:
   - Leucker & Schallhart, "A Brief Account of Runtime Verification,"
@@ -57,7 +64,9 @@ class BaseSafetyMonitor(ABC):
     """Base class for runtime safety monitors.
 
     Subclass and implement check() to verify a specific safety invariant.
-    The runtime calls check() after each tick with the tick's state.
+    Drive it from your own run loop — typically via
+    SafetyMonitorRegistry.check_all() after each tick — passing a MonitorState
+    built from that tick's outcome. The runtime does not call check() for you.
     """
 
     monitor_id: str = "BaseSafetyMonitor"
@@ -260,7 +269,9 @@ class TickBudgetMonitor(BaseSafetyMonitor):
 class SafetyMonitorRegistry:
     """Manages a set of safety monitors.
 
-    Attached to ArachniteRuntime to run all monitors after each tick.
+    Call check_all(tick, state) from your run loop after each tick to run all
+    registered monitors. This is not attached to ArachniteRuntime automatically
+    — see tutorials/advanced/12_safety_monitors.md for the wiring pattern.
     """
 
     def __init__(self, bus: SignalBus) -> None:

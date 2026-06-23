@@ -6,6 +6,8 @@ Arachnite supports deployment across multiple physical devices and cloud environ
 
 The core principle is that the Transport layer sits beneath the SignalBus\. Every node continues to call bus\.publish\(\) and bus\.subscribe\(\) exactly as before\. The transport handles serialisation and delivery, whether that means an in\-process queue or an MQTT broker on the other side of a WiFi link\.
 
+> **How the bridge works:** `SignalBus(transport=transport, agent_node_id=…)` attaches a transport\. `publish()` then dispatches to local subscribers **and** forwards the signal to the transport; signals arriving from the transport are dispatched to local subscribers\. Nodes keep calling `publish()`/`subscribe()` unchanged\. After the transport is connected, the bus must subscribe its inbound handler for each locally\-subscribed kind — call `await bus.start_transport()` once; `AgentNode.start()` does this automatically\. Loop/echo prevention: each forwarded signal is tagged with its originating `agent_node_id`, and the inbound handler drops messages that originated from this same agent \(so a broker echo, or a shared `LocalTransport`, never double\-delivers\)\. Note: every published signal is currently forwarded to the transport regardless of whether a remote agent has subscribed to that kind — the publish\-side "transmit only subscribed kinds" filtering \(spec §11\) is not yet implemented\.
+
 ## __10\.1 Deployment Patterns__
 
 __Pattern__
@@ -134,9 +136,10 @@ transport = MQTTTransport\(
 
 \)
 
-bus = SignalBus\(transport=transport\)
+bus = SignalBus\(transport=transport, agent_node_id='pi\-body'\)
 
-\# All nodes using this bus now communicate over MQTT transparently
+\# All nodes using this bus now communicate over MQTT transparently\.
+\# \(AgentNode wires this for you; standalone, call `await bus\.start_transport\(\)` after transport\.connect\(\)\.\)
 
 ## __10\.3 AgentNode__
 

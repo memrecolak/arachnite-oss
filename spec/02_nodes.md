@@ -303,7 +303,7 @@ The state dict persists across ticks\. Nodes can use it to remember facts beyond
 
 **State persistence:** Pass `state_path` to persist the state dict across reboots\. The file is written as JSON\. Pass `flush_on_write=True` to flush automatically on every `set()`/`delete()` call \(appropriate for the Ariadne self\-model and world\-model\), or call `flush_state()` explicitly from teardown\(\)\.
 
-**StateUpdateSignal:** Any node can write to `ContextNode._state` without holding a direct reference to ContextNode by emitting a `StateUpdateSignal` onto the bus\. The ContextNode intercepts these during `update()` and applies them before returning the snapshot\.
+**StateUpdateSignal:** Any node can write to `ContextNode._state` without holding a direct reference to ContextNode by emitting a `StateUpdateSignal`\. Timing depends on the emitter\. A **sense node** returning one from `read()` has it applied in the **same tick** — it rides the sense output into `update()`, which intercepts it before the snapshot is built and before instincts run\. **Any other node** \(instinct / action / reflex\) publishing one onto the bus has it buffered by the runtime and applied at the **start of the next tick** \(N\+1\), mirroring the `node_fault` path: instincts and actions run after `update()`, so a write they emit cannot land in the tick it was published\.
 
 @dataclass
 
@@ -317,7 +317,7 @@ class StateUpdateSignal\(Signal\):
 
     delete: bool = False         \# True → remove key from state
 
-Example \(sense node updating world model\)::
+Example \(publishing on the bus — applied next tick, N\+1\)::
 
     await self\.bus\.publish\(StateUpdateSignal\(
 
@@ -1064,7 +1064,7 @@ class NodeFaultReflex\(BaseReflexInstinctNode\):
 
 ## __6\.5 Runtime Safety Monitors__
 
-The safety monitor subsystem provides continuous runtime verification of the safety properties formalised in the UPPAAL model\. Monitors are lightweight checkers attached to the runtime that verify invariants after each tick and emit `SafetyViolationSignal` on the `SignalBus` when an invariant is breached\.
+The safety monitor subsystem provides continuous runtime verification of the safety properties formalised in the UPPAAL model\. Monitors are lightweight checkers that verify invariants after each tick and emit `SafetyViolationSignal` on the `SignalBus` when an invariant is breached\. The runtime does not run them automatically: build a `SafetyMonitorRegistry`, and call `check_all\(tick, state\)` from your run loop after each tick \(see the safety\-monitors tutorial\)\. `check_all\(\)` returns the violations directly; violations are also published on the bus but are not injected into `ctx\.signals`\.
 
 ### __BaseSafetyMonitor__
 

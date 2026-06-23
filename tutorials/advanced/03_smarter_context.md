@@ -112,9 +112,22 @@ class DailyAlertInstinct(BaseInstinctNode):
 
 Because the `ctx` your instinct sees is a **snapshot**. If you mutate it,
 you're only mutating the snapshot — the next tick will hand you a fresh copy
-and your change will be lost. To make a change stick, you have to publish a
-`StateUpdateSignal` and let the `ContextNode` apply it during its update
-phase.
+and your change will be lost. To make a change stick, you publish a
+`StateUpdateSignal` and let the `ContextNode` apply it.
+
+**When does the write become visible?** That depends on who emits it:
+
+- A **sense node** that *returns* a `StateUpdateSignal` from `read()` has it
+  applied in the **same tick**, before any instinct runs.
+- An **instinct, action, or reflex** that *publishes* one on the bus has it
+  applied at the **start of the next tick** (N+1). Instincts and actions run
+  *after* the `ContextNode` update phase, so a write they emit can't land
+  until the following tick's update.
+
+That N+1 lag is exactly why the latch pattern above works: it sets the flag
+this tick and *reads it back on a later tick*, never the same one. As long as
+you check durable state on a subsequent tick — which is the whole point of
+durable state — the timing is what you want.
 
 This is the most surprising thing about state in Arachnite. Get it wrong
 and your "memory" silently disappears. Get it right and your agent has

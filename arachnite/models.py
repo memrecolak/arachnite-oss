@@ -322,18 +322,39 @@ class StateUpdateSignal(Signal):
     """
     A Signal that carries a key/value write to ContextNode.state.
 
-    Any node can publish a StateUpdateSignal onto the bus to update the
-    shared world model or self-model without holding a direct reference to
-    ContextNode.  The runtime processes these during ContextNode.update().
+    Any node can update shared state (world model or self-model) without
+    holding a direct reference to ContextNode by emitting a StateUpdateSignal.
+    There are two emission paths, with different visibility timing:
+
+    - A **sense node** returning one from ``read()``: it rides the tick's
+      sense output into ``ContextNode.update()`` and is applied in the **same
+      tick**, before instincts evaluate.
+    - **Any other node** (instinct / action / reflex) publishing one on the
+      bus: the runtime buffers it and drains it into the signals list at the
+      **start of the next tick** (N+1), so it becomes visible to instincts one
+      tick after it is published. This mirrors the node_fault buffering path.
+
+    The N+1 lag for bus publishes is intrinsic, not an implementation choice:
+    instincts and actions run *after* ContextNode.update() within a tick, so a
+    write they emit cannot be applied before that same tick's update phase,
+    which has already run.
 
     Set delete=True to remove a key rather than set it.
 
-    Example::
+    Example (sense node updating the world model — applied same tick)::
 
-        bus.publish(StateUpdateSignal(
+        return StateUpdateSignal(
             source=self.node_id, kind="state_update",
             value=None, confidence=1.0, timestamp=time.monotonic(),
             key="world", state_value={"temp": 72},
+        )
+
+    Example (instinct latching a flag — visible next tick)::
+
+        await self.bus.publish(StateUpdateSignal(
+            source=self.node_id, kind="state_update",
+            value=None, confidence=1.0, timestamp=time.monotonic(),
+            key="alerted_today", state_value=True,
         ))
 
     Spec reference: Section 5.3.

@@ -203,6 +203,16 @@ class ArachniteRuntime:
         self._bus.subscribe("supervisor", self._on_supervisor_signal)
         self._bus.subscribe("node_fault", self._on_supervisor_signal)
 
+        # Buffer for StateUpdateSignals published onto the bus by non-sense
+        # nodes (instincts, actions, reflexes). Sense nodes inject their
+        # StateUpdateSignals via read_all(), so those are applied in the SAME
+        # tick; bus-published ones cannot be — instincts/actions run *after*
+        # ContextNode.update() — so they are drained into the signals list at
+        # the start of the NEXT tick (N+1), identical to the node_fault path
+        # above. See StateUpdateSignal in models.py for the timing contract.
+        self._state_update_buffer: list[Signal] = []
+        self._bus.subscribe("state_update", self._on_state_update_signal)
+
         # Optional per-stage timing callback (ADR 0002). When ``None``
         # the tick path short-circuits on a single branch per stage.
         self._tick_instrumenter: TickInstrumenter | None = tick_instrumenter
@@ -550,6 +560,17 @@ class ArachniteRuntime:
         """
         self._supervisor_signal_buffer.append(signal)
 
+    async def _on_state_update_signal(self, signal: Signal) -> None:
+        """
+        Buffer a bus-published StateUpdateSignal for application at the start of
+        the next tick. ContextNode.update() intercepts it from the drained
+        signals list and writes ctx.state, exactly as it does for a
+        StateUpdateSignal returned by a sense node. Because instincts and
+        actions run after the ContextNode update phase, a write they publish is
+        applied at N+1 (the following tick), not the tick it was published.
+        """
+        self._state_update_buffer.append(signal)
+
     # ── Tick loop ─────────────────────────────────────────────────────────────
 
     async def _loop(self) -> None:
@@ -636,6 +657,13 @@ class ArachniteRuntime:
         buffered_signals = self._supervisor_signal_buffer
         self._supervisor_signal_buffer = []
 
+        # Drain bus-published StateUpdateSignals collected since the last tick.
+        # Snapshot-and-cleared here (before read_all) for the same reason as the
+        # supervisor buffer: a signal published during this tick is deferred to
+        # the next tick's drain, keeping bus-write visibility uniformly at N+1.
+        buffered_state_updates = self._state_update_buffer
+        self._state_update_buffer = []
+
         # 1. Sense
         signals = await self._sense_master.read_all()
 
@@ -643,6 +671,12 @@ class ArachniteRuntime:
         # the buffered FAULTED/DEAD/RESTARTING + node_fault signals).
         if buffered_signals:
             signals.extend(buffered_signals)
+
+        # Append bus-published StateUpdateSignals after sense output so that,
+        # within this drain, an explicit bus write wins over a same-key sense
+        # write (ContextNode.update() applies them in list order, last wins).
+        if buffered_state_updates:
+            signals.extend(buffered_state_updates)
 
         if instrumenter is not None:
             now = time.monotonic()
