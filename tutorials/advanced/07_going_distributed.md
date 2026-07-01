@@ -154,6 +154,52 @@ manifest, starts them concurrently, and shuts them all down cleanly. It's
 especially useful for testing and simulation, where you want to run "fake
 edge" + "fake cloud" in one process.
 
+## Keeping signals off the wire
+
+By default, once a bus has a transport, **every** signal it publishes goes to
+the broker — even kinds nobody on another machine subscribes to. Not
+subscribing elsewhere only stops the signal from being *consumed*; it was still
+serialised and sent. For high-frequency internal chatter (ticks, debug,
+intermediate proposals) that's wasted bandwidth, and for sensitive data it's a
+privacy leak.
+
+To keep a kind local you gate it at the publisher with an egress allowlist.
+`SignalBus` takes a `wire_kinds` set — only those kinds leave for the transport;
+everything else stays in-process:
+
+```python
+from arachnite import SignalBus
+
+# Only 'alert' and 'remote_command' cross the mesh; everything else is local.
+bus = SignalBus(
+    transport=transport,
+    agent_node_id="edge-1",
+    wire_kinds={"alert", "remote_command"},
+)
+```
+
+- `wire_kinds=None` (the default) forwards every kind — unchanged behaviour.
+- A set restricts egress to those kinds; `'*'` is a catch-all; an empty set
+  forwards nothing (a transport attached for receiving only).
+- It's **egress-only**: you still *receive* any kind you subscribe to, even one
+  you don't publish onto the wire.
+
+In a manifest, set it per agent — omit it to forward everything:
+
+```yaml
+agents:
+  - id: "edge-1"
+    transport: "mqtt"
+    wire_kinds: ["alert", "remote_command"]   # egress allowlist
+    nodes:
+      # ...
+```
+
+Prefer this over hoping remote nodes don't subscribe: the set of kinds that
+must cross the mesh is usually far smaller than the internal traffic, so an
+allowlist is both less error-prone and auditable — one list tells you exactly
+what leaves the device.
+
 ## Co-location and reflexes
 
 There's one rule you have to know about distributed agents:

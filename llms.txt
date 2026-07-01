@@ -706,6 +706,40 @@ before the tick loop starts. Nodes not listed in the map are unrestricted.
 
 ---
 
+## Egress allowlist — keep signal kinds off the wire
+
+A bus with a transport forwards **every** published kind to the broker by default; not
+subscribing elsewhere only stops *consumption*, not egress. To keep a kind local, gate it at
+the publisher with `SignalBus(wire_kinds=…)`. Egress-only — inbound delivery is unaffected, so
+a node can still receive a kind it does not publish onto the wire. Unrelated to
+`permissions.py`, which is a startup capability validator, not a router.
+
+```python
+from arachnite import SignalBus
+
+# Only 'alert' and 'remote_command' leave this device; everything else stays local.
+bus = SignalBus(transport=transport, agent_node_id="edge-1",
+                wire_kinds={"alert", "remote_command"})
+```
+
+- `wire_kinds=None` (default) forwards every kind — unchanged behaviour.
+- A set restricts egress to those kinds; `'*'` is a catch-all; an empty set forwards nothing.
+- `bus.wire_kinds()` returns the allowlist (or `None`).
+
+**Manifest syntax** — per agent; omit to forward every kind, empty list forwards nothing:
+```yaml
+agents:
+  - id: edge-01
+    transport: mqtt
+    wire_kinds: [alert, remote_command]   # egress allowlist; ManifestValidationError if not a list
+```
+
+Prefer an explicit allowlist over relying on remote nodes not subscribing: the kinds that must
+cross the mesh are usually far fewer than internal chatter, so it is less error-prone and
+auditable.
+
+---
+
 ## Signal merge policies
 
 When multiple SenseNodes emit the same signal kind in one tick (redundant sensors),
