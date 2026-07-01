@@ -135,6 +135,10 @@ class AgentNodeConfig:
     node_sections: dict[str, list[dict[str, Any]]]  # section -> list of node defs
     transport_config: dict[str, Any] = field(default_factory=dict)
     on_transport_fault: dict[str, Any] = field(default_factory=dict)
+    # Egress allowlist for this AgentNode's bus. None = forward every kind onto
+    # the transport (default); a set restricts egress to those kinds. See
+    # SignalBus(wire_kinds=…). An empty set forwards nothing (inbound only).
+    wire_kinds: set[str] | None = None
 
 
 class DeploymentManifest:
@@ -199,6 +203,18 @@ class DeploymentManifest:
 
     @staticmethod
     def _parse_agent(raw: dict[str, Any], mesh: dict[str, Any]) -> AgentNodeConfig:
+        # Egress allowlist: absent (or null) => forward every kind; a list =>
+        # restrict egress to those kinds; an empty list => forward nothing.
+        wire_kinds_raw = raw.get("wire_kinds")
+        wire_kinds: set[str] | None = None
+        if wire_kinds_raw is not None:
+            if not isinstance(wire_kinds_raw, list):
+                raise ManifestValidationError(
+                    [f"AgentNode '{raw.get('id')}': 'wire_kinds' must be a list "
+                     "of signal kinds (or omitted to forward every kind)."]
+                )
+            wire_kinds = {str(k) for k in wire_kinds_raw}
+
         return AgentNodeConfig(
             agent_id      = str(raw["id"]),
             description   = str(raw.get("description", "")),
@@ -208,6 +224,7 @@ class DeploymentManifest:
             node_sections = raw.get("nodes", {}),
             transport_config = raw.get("transport_config", {}),
             on_transport_fault = raw.get("on_transport_fault", {}),
+            wire_kinds    = wire_kinds,
         )
 
     @staticmethod

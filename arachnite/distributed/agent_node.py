@@ -109,7 +109,11 @@ class AgentNode:
         if transport is None:
             transport = _build_transport(ac.transport, agent_id, ac.transport_config)
 
-        bus     = SignalBus(transport=transport, agent_node_id=agent_id)
+        bus     = SignalBus(
+            transport=transport,
+            agent_node_id=agent_id,
+            wire_kinds=ac.wire_kinds,
+        )
         context = ContextNode()
 
         sense_master    = SenseMasterNode(bus=bus, agent_node_id=agent_id)

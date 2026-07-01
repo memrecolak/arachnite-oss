@@ -217,6 +217,44 @@ When a signal is published on one AgentNode, the transport delivers it to all Ag
 
 \}
 
+### __Keeping Signal Kinds Local \(Egress Allowlist\)__
+
+By default, attaching a transport forwards __every__ published kind onto the wire — so any signal a bus publishes reaches the broker, with the privacy and bandwidth cost that implies\. Declining to subscribe to a kind on other AgentNodes only stops it from being _consumed_; it is still serialised and published to the broker topic on the sender\. Locality must therefore be enforced at the publisher\.
+
+SignalBus accepts a `wire_kinds` egress allowlist for this:
+
+\# Only 'telemetry' and 'alert' leave this device; everything else stays local\.
+
+bus = SignalBus\(
+
+    transport=transport,
+
+    agent_node_id='pi\-body',
+
+    wire_kinds=\{'telemetry', 'alert'\},
+
+\)
+
+\- `wire_kinds=None` \(the default\) forwards every kind — the historical publish\-everything behaviour\.
+
+\- A set restricts egress to those kinds; `'*'` is a catch\-all meaning "forward everything"\.
+
+\- An empty set forwards nothing — a transport attached for inbound delivery only\.
+
+\- The allowlist is __egress\-only__: inbound delivery is unaffected, so an AgentNode can still receive a kind it chooses not to publish onto the wire\.
+
+The same allowlist is configurable declaratively per agent in a DeploymentManifest, so you need not construct the `SignalBus` by hand:
+
+agents:
+
+  \- id: pi\-body
+
+    wire\_kinds: \['telemetry', 'alert'\]   \# only these leave this device
+
+`AgentNode.from_manifest` threads the parsed set through to the agent's `SignalBus`\. Omitting the `wire_kinds` key \(or setting it null\) forwards every kind; an empty list forwards nothing; a non\-list value raises `ManifestValidationError`\.
+
+__Recommended\.__ In privacy\- or bandwidth\-sensitive deployments, prefer an explicit `wire_kinds` allowlist over relying on remote nodes simply not subscribing\. In a typical agent the set of kinds that must cross the mesh is far smaller than the internal chatter \(ticks, debug, intermediate proposals\), so an allowlist is both less error\-prone — you enumerate the small set that leaves rather than remembering to exclude the large set that stays — and auditable: one set tells you exactly what leaves the device\.
+
 ## __10\.6 Distributed Supervisor Health__
 
 SupervisorSignals flow over the transport like any other signal\. This means a NodeFaultReflex on one AgentNode can react to a node failure on a different AgentNode\. The HealthMonitor on each AgentNode receives RemoteNodeState updates from other agents via the bus and maintains a mesh\-wide health picture\.
@@ -282,6 +320,8 @@ agents:
     tags: \[edge, arm64\]
 
     tick\_rate\_hz: 20
+
+    wire\_kinds: \[alert, remote\_command\]   \# egress allowlist; omit to forward every kind
 
     nodes:
 

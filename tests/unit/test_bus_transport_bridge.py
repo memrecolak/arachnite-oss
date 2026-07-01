@@ -150,3 +150,72 @@ class TestSubscriptionTiming:
         await bus_a.publish(_sig(kind="late", value="hi"))
         assert len(b_cb.seen) == 1
         assert b_cb.seen[0].value == "hi"
+
+
+# ── Egress allowlist (wire_kinds) ─────────────────────────────────────────────
+
+class TestWireKindsAllowlist:
+    async def test_default_forwards_every_kind(self) -> None:
+        transport = LocalTransport()
+        await transport.connect()
+        bus = SignalBus(transport=transport, agent_node_id="A")
+        assert bus.wire_kinds() is None
+        relay = _Collector()
+        await transport.subscribe("secret", relay)
+        await bus.publish(_sig(kind="secret"))
+        assert len(relay.seen) == 1  # no allowlist => everything egresses
+
+    async def test_allowlisted_kind_egresses(self) -> None:
+        transport = LocalTransport()
+        await transport.connect()
+        bus = SignalBus(transport=transport, agent_node_id="A", wire_kinds={"pub"})
+        assert bus.wire_kinds() == {"pub"}
+        relay = _Collector()
+        await transport.subscribe("pub", relay)
+        await bus.publish(_sig(kind="pub"))
+        assert len(relay.seen) == 1
+
+    async def test_non_allowlisted_kind_stays_local(self) -> None:
+        transport = LocalTransport()
+        await transport.connect()
+        bus = SignalBus(transport=transport, agent_node_id="A", wire_kinds={"pub"})
+        wire = _Collector()
+        local = _Collector()
+        await transport.subscribe("secret", wire)  # would fire if it egressed
+        bus.subscribe("secret", local)
+        await bus.publish(_sig(kind="secret", value=7))
+        assert len(wire.seen) == 0   # never reached the transport
+        assert len(local.seen) == 1  # but local delivery is unaffected
+        assert local.seen[0].value == 7
+
+    async def test_wildcard_allowlist_forwards_everything(self) -> None:
+        transport = LocalTransport()
+        await transport.connect()
+        bus = SignalBus(transport=transport, agent_node_id="A", wire_kinds={"*"})
+        relay = _Collector()
+        await transport.subscribe("anything", relay)
+        await bus.publish(_sig(kind="anything"))
+        assert len(relay.seen) == 1
+
+    async def test_empty_allowlist_forwards_nothing(self) -> None:
+        transport = LocalTransport()
+        await transport.connect()
+        bus = SignalBus(transport=transport, agent_node_id="A", wire_kinds=set())
+        relay = _Collector()
+        await transport.subscribe("k", relay)
+        await bus.publish(_sig(kind="k"))
+        assert len(relay.seen) == 0
+
+    async def test_inbound_unaffected_by_allowlist(self) -> None:
+        # A node may receive a kind it chooses not to publish onto the wire.
+        transport = LocalTransport(agent_node_id="shared")
+        await transport.connect()
+        bus_a = SignalBus(transport=transport, agent_node_id="A")  # publisher, no gate
+        bus_b = SignalBus(transport=transport, agent_node_id="B", wire_kinds=set())
+        b_cb = _Collector()
+        bus_b.subscribe("k", b_cb)
+        await bus_a.start_transport()
+        await bus_b.start_transport()
+        await bus_a.publish(_sig(value=99))
+        assert len(b_cb.seen) == 1        # inbound delivery still works
+        assert b_cb.seen[0].value == 99

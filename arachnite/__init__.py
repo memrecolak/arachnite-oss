@@ -117,7 +117,7 @@ from arachnite.supervisor import NodeSupervisor
 from arachnite.testing import MockBus, make_context, make_proposal, make_result, make_signal
 from arachnite.web import FileLogSink, SignalDashboard
 
-__version__ = "0.11.7"
+__version__ = "0.11.8"
 __all__ = [
     # Core
     "ArachniteRuntime",

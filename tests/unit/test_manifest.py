@@ -459,3 +459,66 @@ class TestImportNodeClass:
         }
         with pytest.raises(ManifestValidationError, match="TotallyMadeUpNode"):
             DeploymentManifest.from_dict(manifest_data)
+
+
+class TestWireKinds:
+    def test_absent_wire_kinds_is_none(self) -> None:
+        """No wire_kinds key => None (forward every kind, back-compat default)."""
+        manifest_data = {
+            "mesh": {},
+            "agents": [{
+                "id": "a", "transport": "local", "tick_rate_hz": 10.0, "nodes": {},
+            }],
+        }
+        manifest = DeploymentManifest.from_dict(manifest_data)
+        assert manifest.agent_config("a").wire_kinds is None
+
+    def test_list_wire_kinds_parsed_as_set(self) -> None:
+        manifest_data = {
+            "mesh": {},
+            "agents": [{
+                "id": "a", "transport": "local", "tick_rate_hz": 10.0, "nodes": {},
+                "wire_kinds": ["telemetry", "alert"],
+            }],
+        }
+        manifest = DeploymentManifest.from_dict(manifest_data)
+        assert manifest.agent_config("a").wire_kinds == {"telemetry", "alert"}
+
+    def test_empty_list_wire_kinds_is_empty_set(self) -> None:
+        """An explicit empty list means "forward nothing", distinct from absent."""
+        manifest_data = {
+            "mesh": {},
+            "agents": [{
+                "id": "a", "transport": "local", "tick_rate_hz": 10.0, "nodes": {},
+                "wire_kinds": [],
+            }],
+        }
+        manifest = DeploymentManifest.from_dict(manifest_data)
+        assert manifest.agent_config("a").wire_kinds == set()
+
+    def test_non_list_wire_kinds_raises(self) -> None:
+        manifest_data = {
+            "mesh": {},
+            "agents": [{
+                "id": "a", "transport": "local", "tick_rate_hz": 10.0, "nodes": {},
+                "wire_kinds": "telemetry",   # string, not a list
+            }],
+        }
+        with pytest.raises(ManifestValidationError, match="wire_kinds"):
+            DeploymentManifest.from_dict(manifest_data)
+
+    def test_wire_kinds_threaded_into_bus(self) -> None:
+        """AgentNode.from_manifest passes wire_kinds through to the SignalBus."""
+        from arachnite.distributed.agent_node import AgentNode
+
+        manifest_data = {
+            "mesh": {},
+            "agents": [{
+                "id": "a", "transport": "local", "tick_rate_hz": 10.0,
+                "nodes": {"action": [{"kind": "tests.conftest.RecordingAction"}]},
+                "wire_kinds": ["alert"],
+            }],
+        }
+        manifest = DeploymentManifest.from_dict(manifest_data)
+        node = AgentNode.from_manifest(manifest, "a")
+        assert node.runtime.bus.wire_kinds() == {"alert"}

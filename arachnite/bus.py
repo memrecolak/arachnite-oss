@@ -55,12 +55,23 @@ class SignalBus:
     - After the transport is connected, call ``await bus.start_transport()``
       once so the bus subscribes its inbound handler for every kind that has a
       local subscriber. ``AgentNode.start()`` does this automatically.
+
+    Egress allowlist (``wire_kinds``):
+    - By default a transport-bridged bus forwards *every* published kind to the
+      transport, so anything published reaches the broker. Pass ``wire_kinds``
+      to restrict egress to an explicit allowlist: only those kinds (plus '*'
+      if listed) leave for the transport; all other kinds stay local even
+      though a transport is attached. ``wire_kinds=None`` (the default) keeps
+      the historical publish-everything behaviour; an empty set forwards
+      nothing. This gate is egress-only — inbound delivery is unaffected, so a
+      node can still receive kinds it chooses not to publish onto the wire.
     """
 
     def __init__(
         self,
         transport: BaseTransport | None = None,
         agent_node_id: str = "local",
+        wire_kinds: set[str] | None = None,
     ) -> None:
         # kind -> list of callbacks
         self._subscribers: dict[str, list[Callback]] = defaultdict(list)
@@ -72,6 +83,12 @@ class SignalBus:
         self._transport_kinds: set[str] = set()    # kinds we want from the wire
         self._transport_active: set[str] = set()   # kinds subscribed on transport
         self._transport_started = False
+
+        # Egress allowlist. None => forward every kind (back-compat default);
+        # a set => only these kinds (or '*') may egress to the transport.
+        self._wire_kinds: frozenset[str] | None = (
+            None if wire_kinds is None else frozenset(wire_kinds)
+        )
 
     # ── Subscription management ───────────────────────────────────────────────
 
@@ -118,13 +135,15 @@ class SignalBus:
         the exception is captured; remaining callbacks still run.
 
         When a transport is attached, the signal is also forwarded to the
-        transport for delivery to other AgentNodes. After all local callbacks
-        and the transport forward complete, a SignalBusError is raised if any
-        of them failed, carrying the first exception as .cause.
+        transport for delivery to other AgentNodes — unless an egress allowlist
+        (``wire_kinds``) is configured and this kind is not on it, in which case
+        the signal is dispatched locally only. After all local callbacks and the
+        transport forward complete, a SignalBusError is raised if any of them
+        failed, carrying the first exception as .cause.
         """
         errors = await self._dispatch_local(signal)
 
-        if self._transport is not None:
+        if self._transport is not None and self._may_egress(signal.kind):
             # Tag the originating agent so we can drop our own message if the
             # transport echoes it back to us (broker echo / shared transport).
             signal.metadata.setdefault(ORIGIN_AGENT_KEY, self._agent_node_id)
@@ -164,6 +183,18 @@ class SignalBus:
 
         await asyncio.gather(*(_safe_call(cb) for cb in callbacks))
         return errors
+
+    def _may_egress(self, kind: str) -> bool:
+        """Return True if a signal of this kind may be forwarded to the transport.
+
+        With no allowlist (``wire_kinds is None``) every kind egresses, matching
+        the historical publish-everything behaviour. With an allowlist, only
+        listed kinds — or '*' as a catch-all — egress; every other kind stays
+        local. Egress-only: this does not affect inbound delivery.
+        """
+        if self._wire_kinds is None:
+            return True
+        return kind in self._wire_kinds or "*" in self._wire_kinds
 
     # ── Transport bridge ──────────────────────────────────────────────────────
 
@@ -219,6 +250,10 @@ class SignalBus:
     def subscribed_kinds(self) -> list[str]:
         """Return all kinds that have at least one subscriber."""
         return [k for k, v in self._subscribers.items() if v]
+
+    def wire_kinds(self) -> set[str] | None:
+        """Return the egress allowlist, or None when every kind is forwarded."""
+        return None if self._wire_kinds is None else set(self._wire_kinds)
 
     def __repr__(self) -> str:
         total = sum(len(v) for v in self._subscribers.values())
