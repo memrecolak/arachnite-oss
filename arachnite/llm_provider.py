@@ -20,9 +20,10 @@ Providers expose two completion surfaces:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import threading
 from abc import ABC, abstractmethod
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from typing import Any
 
 # ── Tool definition format (OpenAI-compatible, canonical) ─────────────────────
@@ -130,6 +131,39 @@ class LLMProvider(ABC):
             "the tool-calling complete() path discards assistant text and "
             "cannot be used as a fallback."
         )
+
+    @contextlib.contextmanager
+    def locked(self) -> Iterator[LLMProvider]:
+        """
+        Yield the concrete provider while holding whatever lock serialises
+        ``complete()`` / ``complete_text()``.
+
+        A bare (unwrapped) provider has no lock to hold, so the default
+        implementation simply yields ``self``. ``ThreadSafeProvider`` overrides
+        this to acquire the same lock that guards ``complete()`` before yielding
+        the *wrapped* provider.
+
+        Intended for advanced consumers that must call a provider-native API on
+        the same non-thread-safe resource ``complete()`` guards — e.g. reaching
+        ``LocalProvider._llm`` to drive llama-cpp's ``create_chat_completion``
+        directly for a response shape the ``ToolResult`` abstraction discards::
+
+            with provider.locked() as inner:
+                resp = inner._llm.create_chat_completion(...)
+
+        Rules (enforced by ``ThreadSafeProvider``):
+
+        1. The yielded provider is only safe to use inside the ``with`` block.
+           Do not stash it or its internal handles for use afterwards.
+        2. Do not call back into ``complete()`` / ``complete_text()`` /
+           ``locked()`` on the same provider from inside the block — the
+           underlying model is not reentrant, so this raises ``RuntimeError``
+           rather than deadlocking.
+        3. Keep the block short (one inference). When the provider is shared via
+           ``SharedModelRegistry``, the lock is shared across every node, so a
+           long-held block starves all co-tenant nodes' ``complete()`` calls.
+        """
+        yield self
 
 
 # ── Anthropic ──────────────────────────────────────────────────────────────────
@@ -434,6 +468,30 @@ class ThreadSafeProvider(LLMProvider):
     def __init__(self, provider: LLMProvider) -> None:
         self._provider = provider
         self._lock = threading.Lock()
+        # ident of the thread currently holding _lock, or None. Used to turn
+        # same-thread re-entry (which would deadlock on a non-reentrant Lock,
+        # and cannot be allowed anyway — the model is not reentrant) into an
+        # immediate, debuggable RuntimeError. See locked().
+        self._owner: int | None = None
+
+    def _check_not_reentrant(self) -> None:
+        """
+        Raise if the calling thread already holds the lock.
+
+        The read is intentionally done *without* acquiring _lock: the point is
+        to detect that *this* thread already holds it higher up the stack.
+        Reading _owner lock-free is sound because thread idents are unique — a
+        thread can only match an ident it wrote itself, and only writes its own
+        ident while holding the lock (so same-thread visibility is guaranteed).
+        """
+        if self._owner == threading.get_ident():
+            raise RuntimeError(
+                "reentrant access to ThreadSafeProvider: the current thread "
+                "already holds the provider lock. A callable running under "
+                "locked() must not call back into complete() / complete_text() "
+                "/ locked() on the same provider — the underlying model is not "
+                "reentrant."
+            )
 
     def complete(
         self,
@@ -441,8 +499,13 @@ class ThreadSafeProvider(LLMProvider):
         user: str,
         tools: ToolList,
     ) -> ToolResult | None:
+        self._check_not_reentrant()
         with self._lock:
-            return self._provider.complete(system, user, tools)
+            self._owner = threading.get_ident()
+            try:
+                return self._provider.complete(system, user, tools)
+            finally:
+                self._owner = None
 
     def _complete_text_sync(
         self, prompt: str, system: str, max_tokens: int | None
@@ -450,8 +513,36 @@ class ThreadSafeProvider(LLMProvider):
         # Hold the same lock as complete() so concurrent text and tool-calling
         # paths are mutually serialised — critical for llama-cpp-python, which
         # is not thread-safe across either surface.
+        self._check_not_reentrant()
         with self._lock:
-            return self._provider._complete_text_sync(prompt, system, max_tokens)
+            self._owner = threading.get_ident()
+            try:
+                return self._provider._complete_text_sync(prompt, system, max_tokens)
+            finally:
+                self._owner = None
+
+    @contextlib.contextmanager
+    def locked(self) -> Iterator[LLMProvider]:
+        """
+        Acquire the same lock ``complete()`` uses, then yield the wrapped
+        provider for the duration of the block.
+
+        This lets a consumer run provider-native calls (e.g. driving
+        ``LocalProvider._llm`` directly) serialised against every node's
+        ``complete()`` on the shared model. See ``LLMProvider.locked()`` for the
+        usage rules; violating rule 2 (re-entry) raises ``RuntimeError``.
+        """
+        self._check_not_reentrant()
+        with self._lock:
+            self._owner = threading.get_ident()
+            try:
+                # Unwrap one further level so nested wrappers resolve to the
+                # concrete provider. For an ordinary inner provider this is the
+                # no-op default and yields the provider itself.
+                with self._provider.locked() as inner:
+                    yield inner
+            finally:
+                self._owner = None
 
     def preload(self) -> None:
         """Forward preload() to the inner provider if supported."""

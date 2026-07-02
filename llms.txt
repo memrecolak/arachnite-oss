@@ -473,6 +473,22 @@ social     = SocialInstinct(bus=bus, provider=provider)
 reflection = ReflectionInstinct(bus=bus, provider=provider)
 ```
 
+If you need a provider-native call the `complete()` abstraction doesn't
+expose (e.g. driving `LocalProvider._llm` for the full OpenAI-style
+`create_chat_completion` response), use `locked()` to run it under the *same*
+lock that serialises every node's `complete()` — otherwise your raw call races
+the shared, non-thread-safe model handle:
+
+```python
+with provider.locked() as inner:          # holds the shared lock
+    resp = inner._llm.create_chat_completion(...)
+```
+
+Only use the yielded provider inside the block, keep the block to one inference
+(the lock is shared across all nodes), and don't call back into `complete()` /
+`locked()` from within it — the model is not reentrant, so re-entry raises
+`RuntimeError` rather than deadlocking.
+
 ---
 
 ## StateUpdateSignal — write to context state via bus

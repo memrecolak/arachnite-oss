@@ -653,3 +653,107 @@ class TestThreadSafeCompleteText:
         assert names == ["tool-enter", "tool-exit", "text-enter", "text-exit"]
         assert call_log[2][1] >= call_log[1][1]
 
+
+# ── ThreadSafeProvider.locked() ───────────────────────────────────────────────
+
+class _RecordingProvider(LLMProvider):
+    """Concrete LLMProvider that records complete() entry/exit for timing.
+
+    A real subclass (not a bare mock) is required: ThreadSafeProvider.locked()
+    unwraps via ``self._provider.locked()``, which relies on the ABC default.
+    """
+
+    def __init__(self) -> None:
+        self.call_log: list[tuple[str, float]] = []
+        self.entered = __import__("threading").Event()
+
+    def complete(
+        self, system: str, user: str, tools: ToolList
+    ) -> ToolResult | None:
+        import time
+        self.call_log.append(("complete-enter", time.monotonic()))
+        self.entered.set()
+        time.sleep(0.05)
+        self.call_log.append(("complete-exit", time.monotonic()))
+        return None
+
+
+class TestThreadSafeProviderLocked:
+    def test_locked_yields_wrapped_provider(self) -> None:
+        inner = _RecordingProvider()
+        tsp = ThreadSafeProvider(inner)
+        with tsp.locked() as yielded:
+            assert yielded is inner
+
+    def test_bare_provider_locked_yields_self(self) -> None:
+        inner = _RecordingProvider()
+        with inner.locked() as yielded:
+            assert yielded is inner
+
+    def test_locked_serialises_against_complete(self) -> None:
+        """A held locked() block blocks a concurrent complete() until it exits."""
+        import threading
+        import time
+
+        inner = _RecordingProvider()
+        tsp = ThreadSafeProvider(inner)
+
+        order: list[str] = []
+        in_block = threading.Event()
+        release = threading.Event()
+
+        def hold_locked() -> None:
+            with tsp.locked():
+                order.append("locked-enter")
+                in_block.set()
+                release.wait(timeout=1.0)
+                time.sleep(0.02)
+                order.append("locked-exit")
+
+        t_hold = threading.Thread(target=hold_locked)
+        t_hold.start()
+        in_block.wait(timeout=1.0)  # ensure the locked() block is entered
+
+        def run_complete() -> None:
+            order.append("complete-called")
+            tsp.complete("s", "u", [])
+            order.append("complete-returned")
+
+        t_complete = threading.Thread(target=run_complete)
+        t_complete.start()
+        time.sleep(0.02)  # give complete() a chance to (wrongly) proceed
+        release.set()
+        t_hold.join()
+        t_complete.join()
+
+        # complete() must not finish before the locked() block released.
+        assert order.index("locked-exit") < order.index("complete-returned")
+
+    def test_locked_reentry_into_complete_raises(self) -> None:
+        inner = _RecordingProvider()
+        tsp = ThreadSafeProvider(inner)
+        # Nested with is intentional: locked() must be held *before* the
+        # reentrant complete() fires, so the contexts cannot be merged.
+        with tsp.locked():  # noqa: SIM117
+            with pytest.raises(RuntimeError, match="reentrant access"):
+                tsp.complete("s", "u", [])
+
+    def test_locked_reentry_into_locked_raises(self) -> None:
+        inner = _RecordingProvider()
+        tsp = ThreadSafeProvider(inner)
+        with tsp.locked():  # noqa: SIM117
+            with pytest.raises(RuntimeError, match="reentrant access"):
+                with tsp.locked():
+                    pass
+
+    def test_exception_in_block_releases_lock(self) -> None:
+        """An exception inside locked() must not wedge the lock or _owner."""
+        inner = _RecordingProvider()
+        tsp = ThreadSafeProvider(inner)
+        with pytest.raises(ValueError):  # noqa: SIM117
+            with tsp.locked():
+                raise ValueError("boom")
+        # Lock and owner-guard are clear: a subsequent call succeeds.
+        assert tsp._owner is None
+        assert tsp.complete("s", "u", []) is None
+
