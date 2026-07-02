@@ -136,6 +136,27 @@ class NodeSupervisor:
     async def mark_stopped(self, node_id: str) -> None:
         await self._transition(node_id, NodeState.STOPPED)
 
+    def _budget_exhausted(self, node_id: str) -> bool:
+        """
+        Single source of truth for the restart budget.
+
+        Returns True when the node has no restart attempts left, i.e. the number
+        of attempts recorded in ``_restart_counts`` has reached ``max_restarts``.
+        The count is incremented exactly once per attempt, at the top of
+        ``_restart``; both budget checks compare the *stored* count against
+        ``max_restarts`` but sit on opposite sides of that single increment:
+
+        - ``on_fault`` checks *before* scheduling an attempt, so the count
+          reflects already-completed restarts ("have we used them all?").
+        - ``_restart`` checks *after* incrementing for the attempt it just made,
+          so the count reflects that attempt ("did this one hit the limit?").
+
+        Routing both through here keeps the comparison identical and gives the
+        budget one owner, so the invariant — exactly ``max_restarts`` restart
+        attempts, no more — cannot drift if one call site is later edited.
+        """
+        return self._restart_counts.get(node_id, 0) >= self._max_restarts
+
     async def on_fault(self, node_id: str, error: BaseException) -> None:
         """
         Called when a node raises an unhandled exception.
@@ -143,17 +164,15 @@ class NodeSupervisor:
         """
         await self._transition(node_id, NodeState.FAULTED, error=error)
 
-        policy = self._restart_policy
-        count  = self._restart_counts.get(node_id, 0)
-
-        if policy == RestartPolicy.NEVER:
+        if self._restart_policy == RestartPolicy.NEVER:
             await self._transition(node_id, NodeState.DEAD, error=error)
             return
 
         # ON_FAILURE: restart on unhandled exception (always the case in on_fault).
         # ALWAYS: restart on any non-STOPPED exit.
-        # Both policies reach here; check the restart budget.
-        if count >= self._max_restarts:
+        # Both policies reach here; check the restart budget *before* this
+        # attempt (count reflects already-completed restarts).
+        if self._budget_exhausted(node_id):
             await self._transition(node_id, NodeState.DEAD, error=error)
             return
 
@@ -197,8 +216,9 @@ class NodeSupervisor:
             await self._transition(node_id, NodeState.RUNNING)
         except Exception as exc:  # noqa: BLE001
             await self._transition(node_id, NodeState.FAULTED, error=exc)
-            count = self._restart_counts.get(node_id, 0)
-            if count >= self._max_restarts:
+            # Budget checked *after* the increment above, so the count includes
+            # the attempt that just failed.
+            if self._budget_exhausted(node_id):
                 await self._transition(node_id, NodeState.DEAD, error=exc)
                 if raise_on_exhaustion:
                     raise SupervisorError(node_id, exc) from exc
