@@ -166,7 +166,23 @@ class NodeSupervisor:
             raise KeyError(f"Node '{node_id}' is not tracked.")
         await self._restart(node_id)
 
-    async def _restart(self, node_id: str) -> None:
+    async def _restart(self, node_id: str, *, raise_on_exhaustion: bool = True) -> None:
+        """
+        Tear down and rebuild a node, applying the restart budget.
+
+        On exhausting ``max_restarts`` the node transitions to DEAD and the
+        terminal error is published on the bus (SupervisorSignal +
+        NodeFaultSignal). ``raise_on_exhaustion`` controls whether the terminal
+        failure is *also* raised as a SupervisorError:
+
+        - Directly-awaited callers (the public ``restart()`` API) get the
+          default ``True`` so the caller can observe and handle the failure.
+        - The fire-and-forget path scheduled by ``_schedule_restart`` passes
+          ``False``: nobody awaits that task, so raising would only produce an
+          un-retrieved "Task exception was never retrieved" warning. Terminal
+          failure there is surfaced purely as the DEAD transition + bus signals,
+          matching the framework's best-effort fault-reporting contract.
+        """
         await asyncio.sleep(self._restart_delay)
         node = self._nodes.get(node_id)
         if node is None:
@@ -184,15 +200,20 @@ class NodeSupervisor:
             count = self._restart_counts.get(node_id, 0)
             if count >= self._max_restarts:
                 await self._transition(node_id, NodeState.DEAD, error=exc)
-                raise SupervisorError(node_id, exc) from exc
+                if raise_on_exhaustion:
+                    raise SupervisorError(node_id, exc) from exc
+                return
             self._schedule_restart(node_id)
 
     # ── Restart-task management ─────────────────────────────────────────────────
 
     def _schedule_restart(self, node_id: str) -> None:
         """Schedule a tracked restart task"""
+        # Fire-and-forget: nobody awaits this task, so terminal failure must not
+        # raise (it would leak as an un-retrieved task exception). It is reported
+        # via the DEAD transition + bus signals instead.
         task = asyncio.create_task(
-            self._restart(node_id),
+            self._restart(node_id, raise_on_exhaustion=False),
             name=f"supervisor_restart_{node_id}",
         )
         self._restart_tasks.add(task)
