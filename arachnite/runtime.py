@@ -837,7 +837,10 @@ class ArachniteRuntime:
         if to_dispatch:
             results = await self._action_master.dispatch_many(to_dispatch)
             self._last_results = reflex_results + results
-            self._last_result = self._last_results[0]
+            # dispatch_many returns [] when every proposal was filtered (all their
+            # action_ids are already running); combined with an empty reflex_results
+            # that would IndexError on [0]. Fall back to None (the tick's default).
+            self._last_result = self._last_results[0] if self._last_results else None
 
         # 7. Tick-end hooks on all leaf nodes (charged to `act` per ADR 0002)
         tick_duration = time.monotonic() - tick_start

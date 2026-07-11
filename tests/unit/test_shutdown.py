@@ -144,6 +144,29 @@ class TestShutdownLoopTaskTimeout:
         assert hanging.cancelled()
 
 
+# ── Teardown-timeout path (phase 6) ──────────────────────────────────────────
+
+class TestShutdownTeardownTimeout:
+    @pytest.mark.asyncio
+    async def test_slow_teardown_does_not_escape_stop(self) -> None:
+        # A node teardown that overruns the grace period makes asyncio.wait_for raise
+        # asyncio.TimeoutError — a distinct class from the builtin TimeoutError on
+        # Python 3.10. The Phase-6 suppress must catch the asyncio one, or execute()
+        # (and stop()) would raise instead of completing.
+        sc = ShutdownCoordinator(teardown_timeout_s=0.02)
+        rt = _make_runtime(shutdown_coordinator=sc)
+        await rt.start()
+        await asyncio.sleep(0.01)   # let the real loop task settle
+
+        async def slow_teardown() -> None:
+            await asyncio.sleep(1000)
+
+        rt._action_master.teardown = slow_teardown  # type: ignore[method-assign]
+
+        await sc.execute(rt)   # must not raise
+        assert sc.completed
+
+
 # ── Interrupt-action phase (lines 104-119) ────────────────────────────────────
 
 class TestShutdownInterruptAction:

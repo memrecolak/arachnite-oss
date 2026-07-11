@@ -115,9 +115,10 @@ from arachnite.safety_monitor import (
 from arachnite.shutdown import ShutdownCoordinator
 from arachnite.supervisor import NodeSupervisor
 from arachnite.testing import MockBus, make_context, make_proposal, make_result, make_signal
+from arachnite.toolcodec import ParsedToolCall, parse_tool_calls, render_tool_schemas
 from arachnite.web import FileLogSink, SignalDashboard
 
-__version__ = "0.11.10"
+__version__ = "0.11.11"
 __all__ = [
     # Core
     "ArachniteRuntime",
@@ -228,4 +229,8 @@ __all__ = [
     "make_result",
     "make_context",
     "MockBus",
+    # Tool codec
+    "ParsedToolCall",
+    "parse_tool_calls",
+    "render_tool_schemas",
 ]

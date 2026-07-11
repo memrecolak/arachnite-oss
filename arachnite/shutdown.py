@@ -130,7 +130,11 @@ class ShutdownCoordinator:
 
         # Phase 6: Teardown nodes — concurrent with grace period.
         self._phase = ShutdownPhase.TEARDOWN_NODES
-        with contextlib.suppress(TimeoutError):
+        # ``asyncio.wait_for`` raises ``asyncio.TimeoutError``, which is a distinct
+        # class from the builtin ``TimeoutError`` on Python 3.10 (aliased only on
+        # 3.11+). Suppress the asyncio one — same reasoning as the Phase 3 handler
+        # above — so a teardown that overruns the grace period doesn't escape stop().
+        with contextlib.suppress(asyncio.TimeoutError):
             await asyncio.wait_for(
                 asyncio.gather(
                     runtime._sense_master.teardown(),

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import time
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -46,6 +47,27 @@ def _build_rt(
         tick_rate_hz=tick_rate_hz,
     )
     return rt, am, action
+
+
+# ── act stage: empty combined results ────────────────────────────────────────
+
+class TestActStageEmptyResults:
+    @pytest.mark.asyncio
+    async def test_tick_survives_when_all_proposals_filtered(self) -> None:
+        # ``dispatch_many`` returns [] when every proposal's action_id is already
+        # running (all filtered). With no reflex firing this tick, ``reflex_results
+        # + results`` is empty — the act stage must not IndexError on results[0].
+        rt, _am, _action = _build_rt()
+        prop = Proposal(
+            instinct_id="i", action_id="ghost", priority=1.0, urgency=1.0,
+            parameters={}, rationale="", evidence=[],
+        )
+        rt._decision_master.on_new_proposals_many = AsyncMock(  # type: ignore[method-assign]
+            return_value=([prop], []),
+        )
+        rt._action_master.dispatch_many = AsyncMock(return_value=[])  # type: ignore[method-assign]
+        await rt.tick()   # must not raise
+        assert rt._last_result is None
 
 
 # ── bus property ──────────────────────────────────────────────────────────────
