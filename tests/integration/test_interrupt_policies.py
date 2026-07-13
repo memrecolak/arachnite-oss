@@ -285,6 +285,43 @@ class TestEmergencyStop:
         assert not rt.is_running
 
     @pytest.mark.asyncio
+    async def test_emergency_stop_cancels_and_awaits_loop_task(self) -> None:
+        # The tick loop must be cancelled and awaited BEFORE masters are torn
+        # down, so an in-flight tick cannot race node teardown. After the call
+        # the loop task is cleared and done (regression: it was previously left
+        # running while teardown proceeded concurrently).
+        SlowAction.started  = False
+        SlowAction.finished = False
+
+        bus             = SignalBus()
+        sense_master    = SenseMasterNode(bus=bus)
+        instinct_master = InstinctMasterNode(bus=bus)
+        decision_master = DecisionMasterNode(bus=bus, strategy=GreedyDecisionNode(bus=bus))
+        action_master   = ActionMasterNode(bus=bus)
+
+        sense_master.register(SlowSense(bus=bus))
+        instinct_master.register(AlwaysInstinct(bus=bus))
+        action_master.register(SlowAction(bus=bus))
+
+        rt = ArachniteRuntime(
+            sense_master    = sense_master,
+            context         = ContextNode(),
+            instinct_master = instinct_master,
+            decision_master = decision_master,
+            action_master   = action_master,
+            bus             = bus,
+            tick_rate_hz    = 20.0,
+        )
+        await rt.start()
+        await asyncio.sleep(0.05)          # let at least one tick start
+        loop_task = rt._loop_task
+        assert loop_task is not None
+        await rt.emergency_stop()
+
+        assert rt._loop_task is None       # cleared
+        assert loop_task.done()            # no leaked, still-running tick loop
+
+    @pytest.mark.asyncio
     async def test_emergency_stop_sets_stop_event(self) -> None:
         bus             = SignalBus()
         sense_master    = SenseMasterNode(bus=bus)

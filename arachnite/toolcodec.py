@@ -51,6 +51,12 @@ _FN_PAREN_RE = re.compile(r"^/?(\w+)\s*\(\s*(\{.*\})\s*\)\s*$", re.DOTALL)
 #: A whole-content markdown code fence, e.g. ```json\n{...}\n``` — some models wrap
 #: their tool-call JSON in one, which would otherwise be missed.
 _FENCE_RE = re.compile(r"^```[a-zA-Z0-9_]*\s*\n(.*?)\n?```$", re.DOTALL)
+#: An opening angle-bracket tag token, e.g. ``<function-call>`` or ``<|python_tag|>``.
+#: Dialect 5 only fires when such a wrapper precedes the embedded object, so prose
+#: that merely quotes — or narrates an example of — a tool-call JSON is not mistaken
+#: for a real invocation. Requires a non-space char right after ``<`` so a prose
+#: ``x < 5`` comparison never matches.
+_TAG_TOKEN_RE = re.compile(r"<[^<>\s][^<>]{0,60}>")
 
 
 @dataclass(frozen=True)
@@ -114,7 +120,9 @@ def parse_tool_calls(content: str | None) -> list[ParsedToolCall]:
 
     Tries the dialects in priority order and returns as soon as one yields at least
     one call (a model emits one dialect, not a mix). Returns ``[]`` when nothing
-    parses — including plain prose, which yields no false positives.
+    parses. Plain prose yields nothing, and prose that merely quotes — or narrates
+    an example of — a tool-call JSON is not mistaken for a call: the last-resort
+    embedded-object dialect fires only when a wrapper tag precedes the object.
     """
     if not content:
         return []
@@ -169,14 +177,23 @@ def parse_tool_calls(content: str | None) -> list[ParsedToolCall]:
                 if c is not None:
                     return [c]
 
-    # Dialect 5 (last-resort): a {"name":..} object embedded in an arbitrary wrapper
-    # tag. Extract the first brace-balanced object anywhere and parse it. Prose/shell
-    # (no JSON object) yields nothing — no false positives.
-    obj = _first_json_object(content)
-    if obj is not None:
-        c = _call_from_name_args(obj, source="embedded_json")
-        if c is not None:
-            return [c]
+    # Dialect 5 (last-resort): a {"name":..} object recovered from content the
+    # earlier dialects could not parse whole. Two legitimate shapes: the object is
+    # at the START (a valid call followed by trailing prose — d3 rejected it only
+    # because json.loads choked on the trailing junk), or it is wrapped in a NON-
+    # <tool_call> tag (``<function-call>{…}</function-call>``, ``<|python_tag|>{…}``).
+    # Fire ONLY in those two cases, so an object sitting AFTER prose — text that
+    # merely quotes a JSON object or *narrates* an example call — is not mistaken
+    # for an invocation (the false positives this gate exists to reject).
+    brace = content.find("{")
+    if brace >= 0:
+        prefix = content[:brace]
+        if prefix.strip() == "" or _TAG_TOKEN_RE.search(prefix):
+            obj = _first_json_object(content)
+            if obj is not None:
+                c = _call_from_name_args(obj, source="embedded_json")
+                if c is not None:
+                    return [c]
 
     return []
 

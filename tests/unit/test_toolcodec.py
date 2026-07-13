@@ -69,6 +69,32 @@ def test_parse_prose_yields_nothing() -> None:
     assert parse_tool_calls("I think we should create a calculator module.") == []
 
 
+def test_parse_prose_with_embedded_json_object_yields_nothing() -> None:
+    # A bare {"name": ...} object inside prose (no wrapper tag) is NOT a call.
+    assert parse_tool_calls('I think the user {"name": "bob"} wants coffee.') == []
+
+
+def test_parse_narrated_example_call_yields_nothing() -> None:
+    # A fully-formed tool-call JSON the model merely *describes* as an example,
+    # with no wrapper tag, must not be executed as a real invocation.
+    text = 'Here is an example: {"name": "get_weather", "arguments": {"city": "NYC"}}'
+    assert parse_tool_calls(text) == []
+
+
+def test_parse_comparison_operator_is_not_a_tag() -> None:
+    # A prose `<` comparison before a JSON object must not be read as a wrapper tag.
+    assert parse_tool_calls('if x < 5 then {"name": "f", "arguments": {}}') == []
+
+
+def test_parse_valid_call_with_trailing_prose() -> None:
+    # A valid call object at the START, followed by chatter, is a real invocation
+    # (the whole-string json.loads in dialect 3 chokes on the trailing text, so
+    # this must be recovered by the last-resort dialect).
+    text = '{"name": "f", "arguments": {"x": 1}}\n\nLet me know if that works.'
+    calls = parse_tool_calls(text)
+    assert calls and calls[0].name == "f" and calls[0].arguments == {"x": 1}
+
+
 def test_parse_empty_and_none() -> None:
     assert parse_tool_calls("") == []
     assert parse_tool_calls(None) == []

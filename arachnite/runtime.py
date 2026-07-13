@@ -391,6 +391,21 @@ class ArachniteRuntime:
                     )
             except Exception:  # noqa: BLE001
                 pass
+        # Cancel and await the tick loop BEFORE tearing masters down, so an
+        # in-flight tick cannot race node teardown (use-after-teardown). Unlike
+        # the graceful path (ShutdownCoordinator phase 3) there is no grace wait —
+        # emergency means stop now. Skipped when called from within the loop
+        # itself (self-cancel would deadlock).
+        loop_task = self._loop_task
+        if (
+            loop_task is not None
+            and not loop_task.done()
+            and loop_task is not asyncio.current_task()
+        ):
+            loop_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await loop_task
+            self._loop_task = None
         await asyncio.gather(
             self._sense_master.teardown(),
             self._instinct_master.teardown(),
