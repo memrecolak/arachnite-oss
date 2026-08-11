@@ -70,6 +70,17 @@ class TestRun:
         assert buckets[-1].tick_end - buckets[-1].tick_start + 1 == 25
 
     @pytest.mark.asyncio
+    async def test_run_invokes_on_bucket_per_completed_bucket(self) -> None:
+        """The checkpoint hook fires once per bucket, tail included."""
+        seen: list[BucketStats] = []
+        buckets = await run(
+            ticks=175, bucket_size=50, warmup=5, on_bucket=seen.append,
+        )
+        # 3 full buckets + 1 tail of 25 — hook saw exactly the same rows.
+        assert seen == buckets
+        assert len(seen) == 4
+
+    @pytest.mark.asyncio
     async def test_run_rejects_bad_arguments(self) -> None:
         with pytest.raises(ValueError):
             await run(ticks=0, bucket_size=50, warmup=0)
@@ -210,6 +221,20 @@ class TestCLI:
                     "verdict", "rss_growth_threshold_mb",
                     "p99_drift_threshold_ms"):
             assert key in payload["drift"], f"missing drift.{key}"
+
+        # Crash-safe checkpoint sidecar: header line + one line per bucket,
+        # sharing the final JSON's timestamp.
+        ckpts = list(tmp_path.glob("soak_progress_*.jsonl"))
+        assert len(ckpts) == 1, f"expected one checkpoint, got {ckpts}"
+        assert ckpts[0].stem.split("soak_progress_")[1] == \
+            outputs[0].stem.split("soak_test_")[1]
+        lines = [json.loads(ln) for ln in ckpts[0].read_text().splitlines()]
+        assert lines[0]["record"] == "header"
+        assert lines[0]["ticks"] == 10_000
+        bucket_lines = [ln for ln in lines if ln["record"] == "bucket"]
+        assert len(bucket_lines) == 10
+        assert [b["bucket_index"] for b in bucket_lines] == \
+            [row["bucket_index"] for row in payload["buckets"]]
 
 
 # ── Suite integration ───────────────────────────────────────────────────────

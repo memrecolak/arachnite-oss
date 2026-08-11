@@ -43,6 +43,18 @@ CI / smoke runs use ``--quick``, which sets ``--ticks=10_000
 bucketing, RSS readings, drift verdict, JSON emission) exercises in a
 few seconds.
 
+Power-loss resilience
+---------------------
+Every completed bucket is appended as one JSON line to a
+``soak_progress_<timestamp>.jsonl`` checkpoint file in the output
+directory (flushed and fsync'd per bucket), so a multi-hour soak
+interrupted by a power cut or reboot retains all completed buckets.
+The final ``soak_test_<timestamp>.json`` remains the canonical output;
+the checkpoint is its crash-safe sidecar and shares the timestamp. An
+interrupted soak cannot be resumed (the RSS baseline resets with the
+process) — report the completed buckets from the checkpoint file
+rather than silently restarting the run.
+
 Run:
     python benchmarks/soak_test.py --quick
     python benchmarks/soak_test.py                 # full 1M-tick soak
@@ -54,10 +66,12 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
 import platform
 import statistics
 import sys
 import time
+from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
@@ -279,8 +293,13 @@ async def run(
     ticks: int = _TICKS_DEFAULT,
     bucket_size: int = _BUCKET_SIZE_DEFAULT,
     warmup: int = _WARMUP_DEFAULT,
+    on_bucket: Callable[[BucketStats], None] | None = None,
 ) -> list[BucketStats]:
     """Execute the soak and return per-bucket statistics.
+
+    ``on_bucket``, when given, is invoked synchronously with each
+    ``BucketStats`` the moment its bucket completes (checkpointing hook;
+    runs between ticks, outside every timed window).
 
     The tick loop is driven manually (``setup()`` + ``tick()`` +
     ``teardown()``) per the discipline established by the audit-2026-04-16
@@ -344,6 +363,8 @@ async def run(
                     rss_mb=_rss_mb(),
                 )
             )
+            if on_bucket is not None:
+                on_bucket(buckets[-1])
             bucket_index += 1
             tick_start = tick_end + 1
             bucket_samples = []
@@ -361,6 +382,8 @@ async def run(
                 rss_mb=_rss_mb(),
             )
         )
+        if on_bucket is not None:
+            on_bucket(buckets[-1])
 
     for m in (am, dm, im, sm):
         await m.teardown()
@@ -460,16 +483,58 @@ def main() -> None:
         f"|  Bucket: {bucket_size:,}"
     )
     print(f"Platform : {sys.platform} / CPython {platform.python_version()}")
+
+    # Crash-safe checkpoint sidecar: one fsync'd JSON line per completed
+    # bucket, so a power cut mid-soak loses at most the current bucket.
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    total_buckets = (ticks + bucket_size - 1) // bucket_size
+    ckpt_file = out_dir / f"soak_progress_{timestamp}.jsonl"
+    ckpt = open(ckpt_file, "w")
+    header = {
+        "record": "header",
+        "benchmark": "soak_test",
+        "platform": f"{sys.platform} / CPython {platform.python_version()}",
+        "arachnite_version": _arachnite_version(),
+        "ticks": ticks,
+        "bucket_size": bucket_size,
+        "warmup": warmup,
+        "started": timestamp,
+    }
+    ckpt.write(json.dumps(header) + "\n")
+    ckpt.flush()
+    os.fsync(ckpt.fileno())
+
+    def _checkpoint(b: BucketStats) -> None:
+        ckpt.write(json.dumps({"record": "bucket", **asdict(b)}) + "\n")
+        ckpt.flush()
+        os.fsync(ckpt.fileno())
+        print(
+            f"  [bucket {b.bucket_index}/{total_buckets}] "
+            f"mean {b.mean_ms:.4f} ms  p99 {b.p99_ms:.4f} ms  "
+            f"rss {b.rss_mb:.1f} MB",
+            flush=True,
+        )
+
+    print(f"Checkpoint: {ckpt_file} (per-bucket, survives power loss)")
     print("-" * 72)
 
     t0 = time.perf_counter()
-    buckets = asyncio.run(run(ticks=ticks, bucket_size=bucket_size, warmup=warmup))
+    try:
+        buckets = asyncio.run(
+            run(
+                ticks=ticks,
+                bucket_size=bucket_size,
+                warmup=warmup,
+                on_bucket=_checkpoint,
+            )
+        )
+    finally:
+        ckpt.close()
     elapsed = time.perf_counter() - t0
 
     drift = compute_drift(buckets)
     report(buckets, drift)
 
-    timestamp = time.strftime("%Y%m%d_%H%M%S")
     out_file = out_dir / f"soak_test_{timestamp}.json"
     payload = {
         "benchmark": "soak_test",
