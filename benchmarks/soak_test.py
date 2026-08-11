@@ -489,37 +489,36 @@ def main() -> None:
     timestamp = time.strftime("%Y%m%d_%H%M%S")
     total_buckets = (ticks + bucket_size - 1) // bucket_size
     ckpt_file = out_dir / f"soak_progress_{timestamp}.jsonl"
-    ckpt = open(ckpt_file, "w")
-    header = {
-        "record": "header",
-        "benchmark": "soak_test",
-        "platform": f"{sys.platform} / CPython {platform.python_version()}",
-        "arachnite_version": _arachnite_version(),
-        "ticks": ticks,
-        "bucket_size": bucket_size,
-        "warmup": warmup,
-        "started": timestamp,
-    }
-    ckpt.write(json.dumps(header) + "\n")
-    ckpt.flush()
-    os.fsync(ckpt.fileno())
-
-    def _checkpoint(b: BucketStats) -> None:
-        ckpt.write(json.dumps({"record": "bucket", **asdict(b)}) + "\n")
+    with open(ckpt_file, "w") as ckpt:
+        header = {
+            "record": "header",
+            "benchmark": "soak_test",
+            "platform": f"{sys.platform} / CPython {platform.python_version()}",
+            "arachnite_version": _arachnite_version(),
+            "ticks": ticks,
+            "bucket_size": bucket_size,
+            "warmup": warmup,
+            "started": timestamp,
+        }
+        ckpt.write(json.dumps(header) + "\n")
         ckpt.flush()
         os.fsync(ckpt.fileno())
-        print(
-            f"  [bucket {b.bucket_index}/{total_buckets}] "
-            f"mean {b.mean_ms:.4f} ms  p99 {b.p99_ms:.4f} ms  "
-            f"rss {b.rss_mb:.1f} MB",
-            flush=True,
-        )
 
-    print(f"Checkpoint: {ckpt_file} (per-bucket, survives power loss)")
-    print("-" * 72)
+        def _checkpoint(b: BucketStats) -> None:
+            ckpt.write(json.dumps({"record": "bucket", **asdict(b)}) + "\n")
+            ckpt.flush()
+            os.fsync(ckpt.fileno())
+            print(
+                f"  [bucket {b.bucket_index}/{total_buckets}] "
+                f"mean {b.mean_ms:.4f} ms  p99 {b.p99_ms:.4f} ms  "
+                f"rss {b.rss_mb:.1f} MB",
+                flush=True,
+            )
 
-    t0 = time.perf_counter()
-    try:
+        print(f"Checkpoint: {ckpt_file} (per-bucket, survives power loss)")
+        print("-" * 72)
+
+        t0 = time.perf_counter()
         buckets = asyncio.run(
             run(
                 ticks=ticks,
@@ -528,9 +527,7 @@ def main() -> None:
                 on_bucket=_checkpoint,
             )
         )
-    finally:
-        ckpt.close()
-    elapsed = time.perf_counter() - t0
+        elapsed = time.perf_counter() - t0
 
     drift = compute_drift(buckets)
     report(buckets, drift)
