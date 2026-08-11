@@ -81,6 +81,34 @@ class TestRun:
         assert len(seen) == 4
 
     @pytest.mark.asyncio
+    async def test_run_paced_honours_tick_rate(self) -> None:
+        """Pacing stretches wall-clock to ~ticks/rate; buckets unchanged."""
+        import time as _time
+        stats: dict[str, int] = {}
+        t0 = _time.perf_counter()
+        buckets = await run(
+            ticks=40, bucket_size=20, warmup=2,
+            tick_rate_hz=200.0, pacing_stats=stats,
+        )
+        elapsed = _time.perf_counter() - t0
+        # 42 paced ticks at 200 Hz = 0.21 s floor (generous upper bound for CI).
+        assert elapsed >= 0.15
+        assert len(buckets) == 2
+        assert buckets[-1].tick_end == 39
+        assert "overrun_ticks" in stats
+
+    @pytest.mark.asyncio
+    async def test_run_unpaced_leaves_pacing_stats_empty(self) -> None:
+        stats: dict[str, int] = {}
+        await run(ticks=20, bucket_size=10, warmup=0, pacing_stats=stats)
+        assert stats == {}
+
+    @pytest.mark.asyncio
+    async def test_run_rejects_negative_tick_rate(self) -> None:
+        with pytest.raises(ValueError):
+            await run(ticks=10, bucket_size=5, tick_rate_hz=-1.0)
+
+    @pytest.mark.asyncio
     async def test_run_rejects_bad_arguments(self) -> None:
         with pytest.raises(ValueError):
             await run(ticks=0, bucket_size=50, warmup=0)

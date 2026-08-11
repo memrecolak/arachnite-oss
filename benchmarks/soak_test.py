@@ -57,7 +57,8 @@ rather than silently restarting the run.
 
 Run:
     python benchmarks/soak_test.py --quick
-    python benchmarks/soak_test.py                 # full 1M-tick soak
+    python benchmarks/soak_test.py                 # full 1M-tick soak (tight loop)
+    python benchmarks/soak_test.py --tick-rate-hz 10   # deployment-paced, ~28 h
     python benchmarks/soak_test.py --ticks=500000  # half-soak
 """
 
@@ -294,12 +295,25 @@ async def run(
     bucket_size: int = _BUCKET_SIZE_DEFAULT,
     warmup: int = _WARMUP_DEFAULT,
     on_bucket: Callable[[BucketStats], None] | None = None,
+    tick_rate_hz: float = 0.0,
+    pacing_stats: dict[str, int] | None = None,
 ) -> list[BucketStats]:
     """Execute the soak and return per-bucket statistics.
 
     ``on_bucket``, when given, is invoked synchronously with each
     ``BucketStats`` the moment its bucket completes (checkpointing hook;
     runs between ticks, outside every timed window).
+
+    ``tick_rate_hz`` > 0 paces the drive loop to that rate with
+    absolute-deadline scheduling (sleep happens *before* the timed window,
+    so per-tick latency still measures ``rt.tick()`` alone). 0 (default)
+    keeps the legacy tight-loop drive. Pacing changes the *absolute*
+    per-tick latencies (an idle process cools caches), so paced and
+    unpaced soaks are distinct workloads — comparable in their drift
+    verdicts, not in their latency magnitudes. If a tick overruns its
+    period by more than one full period, the schedule skips ahead rather
+    than bursting to catch up; ``pacing_stats``, when given, receives the
+    ``overrun_ticks`` count.
 
     The tick loop is driven manually (``setup()`` + ``tick()`` +
     ``teardown()``) per the discipline established by the audit-2026-04-16
@@ -312,6 +326,8 @@ async def run(
         raise ValueError(f"bucket_size must be > 0, got {bucket_size}")
     if warmup < 0:
         raise ValueError(f"warmup must be >= 0, got {warmup}")
+    if tick_rate_hz < 0:
+        raise ValueError(f"tick_rate_hz must be >= 0, got {tick_rate_hz}")
 
     bus = SignalBus()
     sm = SenseMasterNode(bus=bus)
@@ -336,8 +352,29 @@ async def run(
     for m in (sm, im, dm, am):
         await m.setup()
 
+    # Optional pacing — absolute-deadline scheduling, skip-ahead on overrun.
+    overruns = 0
+    period = 1.0 / tick_rate_hz if tick_rate_hz > 0 else 0.0
+    loop = asyncio.get_running_loop()
+    deadline = loop.time()
+
+    async def _pace() -> None:
+        nonlocal deadline, overruns
+        now = loop.time()
+        wait = deadline - now
+        if wait > 0:
+            await asyncio.sleep(wait)
+        elif -wait > period:
+            # Fell more than one full period behind — skip ahead so the
+            # loop never bursts to catch up (matches deployment tick loops).
+            overruns += 1
+            deadline = loop.time()
+        deadline += period
+
     # Warm-up — discarded wholesale.
     for _ in range(warmup):
+        if period > 0.0:
+            await _pace()
         await rt.tick()
 
     # Measurement — bucketed.
@@ -347,6 +384,8 @@ async def run(
     tick_start = 0
 
     for _i in range(ticks):
+        if period > 0.0:
+            await _pace()
         t0 = time.perf_counter()
         await rt.tick()
         bucket_samples.append((time.perf_counter() - t0) * 1_000.0)
@@ -387,6 +426,9 @@ async def run(
 
     for m in (am, dm, im, sm):
         await m.teardown()
+
+    if pacing_stats is not None and period > 0.0:
+        pacing_stats["overrun_ticks"] = overruns
 
     return buckets
 
@@ -455,6 +497,16 @@ def main() -> None:
         help="Directory for the JSON output file (default: benchmarks/results)",
     )
     parser.add_argument(
+        "--tick-rate-hz", type=float, default=0.0,
+        help=(
+            "Pace the drive loop to this rate (deployment-realistic soak; "
+            "e.g. 10 for a ~28 h 1M-tick soak). 0 (default) keeps the "
+            "legacy tight-loop drive. Pacing changes absolute per-tick "
+            "latencies (idle process, cold caches) — paced and unpaced "
+            "soaks are comparable in drift verdicts, not in magnitudes."
+        ),
+    )
+    parser.add_argument(
         "--quick", action="store_true",
         help=(
             f"Quick / CI mode: ticks={_QUICK_TICKS:,} "
@@ -483,6 +535,12 @@ def main() -> None:
         f"|  Bucket: {bucket_size:,}"
     )
     print(f"Platform : {sys.platform} / CPython {platform.python_version()}")
+    if args.tick_rate_hz > 0:
+        est_s = (warmup + ticks) / args.tick_rate_hz
+        print(
+            f"Pacing   : {args.tick_rate_hz:g} Hz "
+            f"(estimated duration ~{est_s / 3600.0:.1f} h)"
+        )
 
     # Crash-safe checkpoint sidecar: one fsync'd JSON line per completed
     # bucket, so a power cut mid-soak loses at most the current bucket.
@@ -498,6 +556,7 @@ def main() -> None:
             "ticks": ticks,
             "bucket_size": bucket_size,
             "warmup": warmup,
+            "tick_rate_hz": args.tick_rate_hz,
             "started": timestamp,
         }
         ckpt.write(json.dumps(header) + "\n")
@@ -519,12 +578,15 @@ def main() -> None:
         print("-" * 72)
 
         t0 = time.perf_counter()
+        pacing_stats: dict[str, int] = {}
         buckets = asyncio.run(
             run(
                 ticks=ticks,
                 bucket_size=bucket_size,
                 warmup=warmup,
                 on_bucket=_checkpoint,
+                tick_rate_hz=args.tick_rate_hz,
+                pacing_stats=pacing_stats,
             )
         )
         elapsed = time.perf_counter() - t0
@@ -542,6 +604,8 @@ def main() -> None:
         "ticks": ticks,
         "bucket_size": bucket_size,
         "warmup": warmup,
+        "tick_rate_hz": args.tick_rate_hz,
+        "overrun_ticks": pacing_stats.get("overrun_ticks"),
         "elapsed_s": round(elapsed, 2),
         "buckets": [asdict(b) for b in buckets],
         "drift": asdict(drift),
