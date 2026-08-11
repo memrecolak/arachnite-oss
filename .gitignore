@@ -91,3 +91,4 @@ ECOSYSTEM.md
 
 # Local benchmark output — published via the paper's Zenodo archive, not the repo
 benchmarks/results/
+baselines/results/

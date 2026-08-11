@@ -71,6 +71,14 @@ class ArmState:
     start_time:          float       = field(default_factory=time.monotonic)
     pick_count:          int         = 0
     emergency_count:     int         = 0
+    # Per-pick wall-clock instrumentation — mirrors
+    # ``baselines/shared_sim.py:ArmState`` so the cross-framework comparison
+    # reports a per-pick latency distribution that means the same thing for
+    # Arachnite as for py_trees / Jason / ROS 2 BT. Set in
+    # ProximitySenseNode.read() when the object first becomes graspable;
+    # recorded + reset in PickAndPlaceAction's release_gripper step.
+    pick_start_ns:       int         = -1
+    pick_durations_ms:   list[float] = field(default_factory=list)
 
 
 # Module-level singleton — shared by all nodes in a single-process simulation.
@@ -118,6 +126,16 @@ class ProximitySenseNode(BaseSenseNode):
             elapsed = time.monotonic() - SIM.start_time
             dist = max(0.10, 1.5 - elapsed * 0.067)
         SIM.object_distance = round(dist, 4)
+        # Per-pick stopwatch — start when the object first becomes graspable
+        # with no pick already in flight. Mirrors baselines/shared_sim.py so
+        # per-pick latency is comparable across frameworks. The 0.10–0.35 m
+        # window matches ObjectDetectionSenseNode and GraspInstinct.
+        if (
+            SIM.pick_start_ns < 0
+            and not SIM.holding
+            and 0.10 <= SIM.object_distance <= 0.35
+        ):
+            SIM.pick_start_ns = time.monotonic_ns()
         return Signal(
             source    = self.node_id,
             kind      = self.signal_kind,
@@ -341,6 +359,15 @@ class PickAndPlaceAction(MultiStepActionNode):
                 SIM.holding  = False
                 SIM.pick_count += 1
                 SIM.start_time = time.monotonic()  # reset conveyor cycle
+                # Record per-pick wall-clock latency for cross-framework
+                # comparison. Stopwatch was started in
+                # ProximitySenseNode.read() the first time the object entered
+                # the grasp window after the previous release.
+                if SIM.pick_start_ns >= 0:
+                    SIM.pick_durations_ms.append(
+                        (time.monotonic_ns() - SIM.pick_start_ns) / 1e6
+                    )
+                    SIM.pick_start_ns = -1
                 return StepResult(step_name="release_gripper", success=True,
                                   output={"pick_count": SIM.pick_count})
 
@@ -395,6 +422,8 @@ class EmergencyRetractAction(BaseActionNode):
         SIM.collision_imminent = False
         SIM.start_time = time.monotonic()
         SIM.emergency_count += 1
+        # Discard the in-flight pick stopwatch — the pick was aborted.
+        SIM.pick_start_ns = -1
         await _sim_sleep(0.005)      # sim: 5 ms retract
         return Result(
             action_id = self.node_id,
