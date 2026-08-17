@@ -43,6 +43,14 @@ class MQTTTransport(BaseTransport):
         1 = at-least-once (default, recommended for sensor data)
         2 = exactly-once  (slow, use for critical commands)
 
+    Deployment note (latency): this transport disables Nagle's algorithm on
+    its own sockets, but the broker's outbound sockets are outside its reach.
+    A broker-mediated round trip has four TCP legs, and brokers commonly ship
+    with Nagle enabled — mosquitto's ``set_tcp_nodelay`` defaults to false,
+    which alone leaves a ~40-50 ms floor on sub-MSS publishes over a real
+    network. For latency-sensitive deployments enable the broker's no-delay
+    option (mosquitto: ``set_tcp_nodelay true``).
+
     Spec reference: Section 10.2.
     """
 
