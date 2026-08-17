@@ -13,11 +13,13 @@ Measurement shape
 -----------------
 A single ``BaseTransport`` instance acts as both
 publisher and subscriber (the self-publish path that all four transports
-support). The subscriber callback captures ``time.monotonic()`` and sets
-an ``asyncio.Event``; the publisher records its send-side timestamp,
+support). The subscriber callback captures ``time.perf_counter()`` and
+sets an ``asyncio.Event``; the publisher records its send-side timestamp,
 publishes, and awaits the event. The latency sample is
-``recv_ts - send_ts``, both measured from the same monotonic clock in
-the same process. Samples are serialised: the publisher waits for the
+``recv_ts - send_ts``, both measured from the same monotonic
+``perf_counter`` clock in the same process (``time.monotonic()`` is only
+~15.6 ms granular on Windows CPython <= 3.12 and would quantise
+microsecond loopback samples to zero). Samples are serialised: the publisher waits for the
 event before sending the next sample (no in-flight queueing
 confounding).
 
@@ -217,7 +219,7 @@ async def _measure_loopback(
     recv_ts: list[float] = []
 
     async def _on_signal(sig: Signal) -> None:
-        recv_ts.append(time.monotonic())
+        recv_ts.append(time.perf_counter())
         received.set()
 
     await transport.subscribe(_BENCH_SIGNAL_KIND, _on_signal)
@@ -245,7 +247,7 @@ async def _measure_loopback(
             received.clear()
             recv_ts.clear()
             sig = _signal_for(payload)
-            send_ts = time.monotonic()
+            send_ts = time.perf_counter()
             await transport.publish(sig)
             try:
                 await asyncio.wait_for(received.wait(), timeout=_RECV_TIMEOUT_S)
