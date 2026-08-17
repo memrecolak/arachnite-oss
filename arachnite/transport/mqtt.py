@@ -103,6 +103,7 @@ class MQTTTransport(BaseTransport):
                     tls_context = tls_context,
                 )
                 await self._client.__aenter__()
+                self._enable_tcp_nodelay()
                 self._connected   = True
                 self._listen_task = asyncio.create_task(self._listen_loop())
                 self._logger.info("Transport connected", transport=type(self).__name__)
@@ -121,6 +122,31 @@ class MQTTTransport(BaseTransport):
                         f"Failed after {attempts} attempts: {exc}",
                     ) from exc
                 await asyncio.sleep(self._reconnect_interval)
+
+    def _enable_tcp_nodelay(self) -> None:
+        """Disable Nagle's algorithm on the underlying paho socket.
+
+        paho-mqtt (through at least 2.1) never sets TCP_NODELAY, so on a
+        real network every sub-MSS publish can stall for a Nagle /
+        delayed-ACK interaction (~40-45 ms per leg on Linux) before it
+        leaves the host. Loopback benchmarks never show this; cross-host
+        ones do (revision experiment E4 measured a ~90-100 ms RTT floor
+        that disappears at 64 KiB payloads). Must be re-applied after
+        every (re)connect — paho creates a fresh socket each time.
+        """
+        import socket
+        try:
+            paho_client = self._client._client  # type: ignore[union-attr]
+            sock = paho_client.socket()
+            if sock is not None and hasattr(sock, "setsockopt"):
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        except Exception:
+            # Non-fatal: websocket transports expose no raw socket, and a
+            # failed setsockopt only restores the pre-fix latency profile.
+            self._logger.warning(
+                "Could not set TCP_NODELAY on MQTT socket",
+                transport=type(self).__name__,
+            )
 
     async def disconnect(self) -> None:
         """Close the MQTT connection cleanly."""
