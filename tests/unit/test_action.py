@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 
 import pytest
 
@@ -1106,3 +1107,216 @@ class TestCooperativeInterrupt:
 
         assert result.success is True
         assert result.interrupted is False
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Mutation-evidence hardening (revision E7) — kills mutants that survived the
+# first cosmic-ray pass on the Table 6 enforcement functions
+# ══════════════════════════════════════════════════════════════════════════════
+
+class _RecordingParamAction(BaseActionNode):
+    """Records which proposal's instinct_id actually executed."""
+    node_id = "_RecordingParamAction"
+
+    def __init__(self, bus: SignalBus, **kwargs: object) -> None:
+        super().__init__(bus=bus, **kwargs)
+        self.seen: list[str] = []
+
+    async def execute(self, proposal: Proposal) -> Result:
+        self.seen.append(proposal.instinct_id)
+        return Result(action_id=self.node_id, success=True)
+
+
+class _NoStepsAction(MultiStepActionNode):
+    """Degenerate multi-step action with an empty step list."""
+    node_id = "_NoStepsAction"
+
+    def steps(self) -> list[ActionStep]:
+        return []
+
+    async def execute_step(
+        self, step: ActionStep, proposal: Proposal, completed: list[StepResult]
+    ) -> StepResult:
+        raise AssertionError("execute_step must never be called with no steps")
+
+
+class _FinalStepFailsAction(MultiStepActionNode):
+    """Second (final) step fails without aborting the sequence."""
+    node_id = "_FinalStepFailsAction"
+
+    def steps(self) -> list[ActionStep]:
+        return [
+            ActionStep("ok", interruptible=True),
+            ActionStep("bad", interruptible=True),
+        ]
+
+    async def execute_step(
+        self, step: ActionStep, proposal: Proposal, completed: list[StepResult]
+    ) -> StepResult:
+        if step.name == "ok":
+            return StepResult(step_name="ok", success=True, output="ok-out")
+        return StepResult(step_name="bad", success=False, output="bad-out")
+
+
+class _EventRollbackAction(MultiStepActionNode):
+    """Four interruptible steps; one blocks on an event so the test can inject
+    the interrupt deterministically. on_interrupted records what it was given."""
+    node_id          = "_EventRollbackAction"
+    interrupt_policy = InterruptPolicy.ROLLBACK
+
+    def __init__(self, bus: SignalBus, hold_step: str, **kwargs: object) -> None:
+        super().__init__(bus=bus, **kwargs)
+        self.hold_step = hold_step
+        self.started   = asyncio.Event()
+        self.release   = asyncio.Event()
+        self.recorded_pending:   list[str] | None = None
+        self.recorded_completed: list[str] | None = None
+
+    def steps(self) -> list[ActionStep]:
+        return [ActionStep(f"s{i}", interruptible=True) for i in (1, 2, 3, 4)]
+
+    async def execute_step(
+        self, step: ActionStep, proposal: Proposal, completed: list[StepResult]
+    ) -> StepResult:
+        if step.name == self.hold_step:
+            self.started.set()
+            await self.release.wait()
+        return StepResult(step_name=step.name, success=True)
+
+    async def on_interrupted(
+        self,
+        completed: list[StepResult],
+        pending: list[ActionStep],
+        proposal: Proposal,
+    ) -> None:
+        self.recorded_completed = [sr.step_name for sr in completed]
+        self.recorded_pending   = [s.name for s in pending]
+
+
+class _QuiescentPollStep(MultiStepActionNode):
+    """Interruptible step under ALWAYS that polls check_interrupt() with no
+    interrupt ever requested — every poll must be False."""
+    node_id          = "_QuiescentPollStep"
+    interrupt_policy = InterruptPolicy.ALWAYS
+
+    def __init__(self, bus: SignalBus, **kwargs: object) -> None:
+        super().__init__(bus=bus, **kwargs)
+        self.polls: list[bool] = []
+
+    def steps(self) -> list[ActionStep]:
+        return [ActionStep("p", interruptible=True)]
+
+    async def execute_step(
+        self, step: ActionStep, proposal: Proposal, completed: list[StepResult]
+    ) -> StepResult:
+        for _ in range(3):
+            self.polls.append(self.check_interrupt())
+            await asyncio.sleep(0)
+        return StepResult(step_name=step.name, success=True)
+
+
+class TestResultTotalityDetails:
+    @pytest.mark.asyncio
+    async def test_zero_step_action_returns_success(self) -> None:
+        node = _NoStepsAction(bus=_bus())
+        t0 = time.monotonic()
+        result = await node.execute(_proposal("_NoStepsAction"))
+        elapsed = time.monotonic() - t0
+
+        assert result.success is True
+        assert result.output is None
+        assert result.step_results == []
+        assert abs(result.duration_s - elapsed) < 0.5
+
+    @pytest.mark.asyncio
+    async def test_final_step_failure_and_output_propagate(self) -> None:
+        node = _FinalStepFailsAction(bus=_bus())
+        t0 = time.monotonic()
+        result = await node.execute(_proposal("_FinalStepFailsAction"))
+        elapsed = time.monotonic() - t0
+
+        # Result mirrors the LAST step: failed, with its output
+        assert result.success is False
+        assert result.output == "bad-out"
+        assert [sr.step_name for sr in result.step_results] == ["ok", "bad"]
+        assert abs(result.duration_s - elapsed) < 0.5
+
+
+class TestDispatchManyTieBreak:
+    @pytest.mark.asyncio
+    async def test_highest_priority_wins_regardless_of_order(self) -> None:
+        bus  = _bus()
+        am   = ActionMasterNode(bus=bus)
+        node = _RecordingParamAction(bus=bus)
+        am.register(node)
+
+        def _p(instinct_id: str, priority: int) -> Proposal:
+            return Proposal(instinct_id=instinct_id,
+                            action_id="_RecordingParamAction",
+                            priority=priority, urgency=0.5)
+
+        await am.dispatch_many([_p("low", 10), _p("high", 90)])
+        assert node.seen == ["high"]
+
+        node.seen.clear()
+        await am.dispatch_many([_p("high", 90), _p("low", 10)])
+        assert node.seen == ["high"]
+
+    @pytest.mark.asyncio
+    async def test_equal_priority_first_proposal_wins(self) -> None:
+        bus  = _bus()
+        am   = ActionMasterNode(bus=bus)
+        node = _RecordingParamAction(bus=bus)
+        am.register(node)
+
+        first  = Proposal(instinct_id="first",  action_id="_RecordingParamAction",
+                          priority=50, urgency=0.5)
+        second = Proposal(instinct_id="second", action_id="_RecordingParamAction",
+                          priority=50, urgency=0.5)
+        await am.dispatch_many([first, second])
+        assert node.seen == ["first"]
+
+
+class TestRollbackPendingSteps:
+    @pytest.mark.asyncio
+    async def test_pending_after_interrupt_during_first_step(self) -> None:
+        # Interrupt lands while s1 runs -> honoured at the s2 boundary (index 1):
+        # completed=[s1], stopped at s2, pending=[s3, s4]
+        node = _EventRollbackAction(bus=_bus(), hold_step="s1")
+        task = asyncio.create_task(node.execute(_proposal("_EventRollbackAction")))
+        await node.started.wait()
+        node.request_interrupt(_interrupt())
+        node.release.set()
+        result = await task
+
+        assert result.interrupted is True
+        assert result.rolled_back is True
+        assert result.stopped_at_step == "s2"
+        assert node.recorded_completed == ["s1"]
+        assert node.recorded_pending == ["s3", "s4"]
+
+    @pytest.mark.asyncio
+    async def test_pending_after_interrupt_during_second_step(self) -> None:
+        # Interrupt lands while s2 runs -> honoured at the s3 boundary (index 2):
+        # completed=[s1, s2], stopped at s3, pending=[s4]
+        node = _EventRollbackAction(bus=_bus(), hold_step="s2")
+        task = asyncio.create_task(node.execute(_proposal("_EventRollbackAction")))
+        await node.started.wait()
+        node.request_interrupt(_interrupt())
+        node.release.set()
+        result = await task
+
+        assert result.interrupted is True
+        assert result.stopped_at_step == "s3"
+        assert node.recorded_completed == ["s1", "s2"]
+        assert node.recorded_pending == ["s4"]
+
+
+class TestCheckInterruptQuiescent:
+    @pytest.mark.asyncio
+    async def test_check_interrupt_false_when_never_requested(self) -> None:
+        node = _QuiescentPollStep(bus=_bus())
+        result = await node.execute(_proposal("_QuiescentPollStep"))
+
+        assert result.success is True
+        assert node.polls == [False, False, False]

@@ -522,3 +522,38 @@ class TestWireKinds:
         manifest = DeploymentManifest.from_dict(manifest_data)
         node = AgentNode.from_manifest(manifest, "a")
         assert node.runtime.bus.wire_kinds() == {"alert"}
+
+
+# ── Mutation-evidence hardening (revision E7) ─────────────────────────────────
+
+class TestValidateColocationErrorAccumulation:
+    def test_errors_accumulate_across_both_early_continue_branches(self) -> None:
+        # Three faulty reflexes: one missing its reflex_action_id, two whose
+        # targets do not exist. Validation must report ALL of them, not stop
+        # at the first (the `continue` statements must not behave like breaks).
+        assignments = [
+            _assignment("NoIdReflex", "edge-01", "instinct",
+                        is_reflex=True, reflex_action_id=""),
+            _assignment("GhostReflexA", "edge-01", "instinct",
+                        is_reflex=True, reflex_action_id="GhostActionA"),
+            _assignment("GhostReflexB", "edge-01", "instinct",
+                        is_reflex=True, reflex_action_id="GhostActionB"),
+        ]
+        with pytest.raises(ManifestValidationError) as exc_info:
+            validate_colocation(assignments)
+        msg = str(exc_info.value)
+        assert "NoIdReflex" in msg
+        assert "GhostActionA" in msg
+        assert "GhostActionB" in msg
+
+    def test_non_action_section_does_not_satisfy_reflex_target(self) -> None:
+        # A non-action node carrying the target node_id must NOT count as the
+        # reflex's target action, even on the same agent.
+        assignments = [
+            _assignment("EmergencyStop", "edge-01", "instinct"),
+            _assignment("CriticalReflex", "edge-01", "instinct",
+                        is_reflex=True, reflex_action_id="EmergencyStop"),
+        ]
+        with pytest.raises(ManifestValidationError) as exc_info:
+            validate_colocation(assignments)
+        assert "no ActionNode" in str(exc_info.value)

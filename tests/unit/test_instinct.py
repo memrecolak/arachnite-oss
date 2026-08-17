@@ -743,3 +743,41 @@ class TestPreEvaluateGate:
         """Sanity: a sync function is accepted; only ``async def`` is rejected."""
         im = InstinctMasterNode(bus=_bus())
         im.set_pre_evaluate_gate(lambda node, ctx: True)   # must not raise
+
+
+# ── Mutation-evidence hardening (revision E7) ─────────────────────────────────
+
+class HigherPriorityReflex(BaseReflexInstinctNode):
+    """Priority above the two 200-priority reflex fixtures."""
+    node_id  = "HigherPriorityReflex"
+    priority = 250
+
+    async def evaluate(self, ctx: Context) -> Proposal | None:
+        return Proposal(
+            instinct_id=self.node_id, action_id="EmergencyStop",
+            priority=self.priority, urgency=1.0,
+        )
+
+
+class TestReflexPriorityOrdering:
+    @pytest.mark.asyncio
+    async def test_proposals_sorted_priority_descending(self) -> None:
+        # Register the LOWER-priority reflex first so registration order and
+        # priority order disagree — the sort must win.
+        im = InstinctMasterNode(bus=_bus(), reflex_conflict="dispatch_all")
+        im.register(AlwaysProposesReflex(bus=_bus()))
+        im.register(HigherPriorityReflex(bus=_bus()))
+        proposals = await im.evaluate_reflexes(_ctx())
+        assert [p.priority for p in proposals] == [250, 200]
+
+    @pytest.mark.asyncio
+    async def test_raise_policy_unique_top_with_tied_lower_no_error(self) -> None:
+        # Two reflexes tie at 200 BELOW a unique 250 top — only a tie at the
+        # TOP priority is a conflict, so this must not raise.
+        im = InstinctMasterNode(bus=_bus(), reflex_conflict="raise")
+        im.register(AlwaysProposesReflex(bus=_bus()))
+        im.register(AnotherReflex(bus=_bus()))
+        im.register(HigherPriorityReflex(bus=_bus()))
+        proposals = await im.evaluate_reflexes(_ctx())
+        assert len(proposals) == 3
+        assert proposals[0].priority == 250
