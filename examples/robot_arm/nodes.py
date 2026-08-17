@@ -49,6 +49,7 @@ from arachnite import (
     StepResult,
 )
 from arachnite.nodes.action import MultiStepActionNode
+from examples.robot_arm import noise as _noise
 
 # ── Physics stub ──────────────────────────────────────────────────────────────
 
@@ -125,6 +126,7 @@ class ProximitySenseNode(BaseSenseNode):
         else:
             elapsed = time.monotonic() - SIM.start_time
             dist = max(0.10, 1.5 - elapsed * 0.067)
+        dist = _noise.apply_sensor_noise(dist)
         SIM.object_distance = round(dist, 4)
         # Per-pick stopwatch — start when the object first becomes graspable
         # with no pick already in flight. Mirrors baselines/shared_sim.py so
@@ -355,6 +357,7 @@ class PickAndPlaceAction(MultiStepActionNode):
             case "release_gripper":
                 self.logger.info("Releasing object at target")
                 await _sim_sleep(0.01)
+                await _noise.actuation_delay()
                 SIM.gripper  = 0.0
                 SIM.holding  = False
                 SIM.pick_count += 1
@@ -416,6 +419,7 @@ class EmergencyRetractAction(BaseActionNode):
             distance=dist,
         )
         # Immediate home: zero all joints, open gripper
+        await _noise.actuation_delay()
         SIM.joints   = [0.0] * 6
         SIM.gripper  = 0.0
         SIM.holding  = False

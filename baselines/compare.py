@@ -73,7 +73,9 @@ def count_loc(
 
 # ── Arachnite benchmark ─────────────────────────────────────────────────────
 
-async def bench_arachnite(n_ticks: int, warmup: int) -> dict[str, Any]:
+async def bench_arachnite(
+    n_ticks: int, warmup: int, noise: bool = False, run_idx: int = 0,
+) -> dict[str, Any]:
     """Run Arachnite pick-and-place and return latency samples."""
     from arachnite import (
         ActionMasterNode,
@@ -102,6 +104,11 @@ async def bench_arachnite(n_ticks: int, warmup: int) -> dict[str, Any]:
     # overhead at parity with the sleep-free py_trees baseline. See
     # docs/audits/2026-05-04-architecture-and-fairness-audit.md, finding #1.
     _example_nodes.BENCHMARK_MODE = True
+    # E5 noise arm: sensor noise + actuation delay, per-run seeded.
+    from examples.robot_arm import noise as _example_noise
+    _example_noise.NOISE_MODE = noise
+    if noise:
+        _example_noise.reset_noise_rng(run_idx)
 
     # Sense nodes default to poll_interval_s=0.1 (10 Hz). At the benchmark's
     # 10 kHz tick rate that throttles reads to ~1 per 1000 ticks, so the
@@ -182,7 +189,9 @@ async def bench_arachnite(n_ticks: int, warmup: int) -> dict[str, Any]:
 
 # ── py_trees benchmark ──────────────────────────────────────────────────────
 
-def bench_py_trees(n_ticks: int, warmup: int) -> dict[str, Any] | None:
+def bench_py_trees(
+    n_ticks: int, warmup: int, noise: bool = False, run_idx: int = 0,
+) -> dict[str, Any] | None:
     """Run py_trees pick-and-place. Returns None if py_trees not installed."""
     try:
         import py_trees  # noqa: F401
@@ -198,6 +207,9 @@ def bench_py_trees(n_ticks: int, warmup: int) -> dict[str, Any] | None:
     # 2026-05-04 #1 (alternative-fix branch).
     import baselines.shared_sim as _shared_sim
     _shared_sim.BENCHMARK_MODE = True
+    _shared_sim.NOISE_MODE = noise
+    if noise:
+        _shared_sim.reset_noise_rng(run_idx)
 
     from baselines.py_trees.robot_arm import run_benchmark
     result = run_benchmark(n_ticks=n_ticks, warmup=warmup)
@@ -214,16 +226,22 @@ def bench_py_trees(n_ticks: int, warmup: int) -> dict[str, Any] | None:
 
 # ── Jason benchmark ─────────────────────────────────────────────────────────
 
-def bench_jason(n_ticks: int, warmup: int) -> dict[str, Any] | None:
+def bench_jason(
+    n_ticks: int, warmup: int, noise: bool = False, run_idx: int = 0,
+) -> dict[str, Any] | None:
     """Run Jason BDI baseline. Returns None if Jason or JVM is unavailable."""
     from baselines.jason.run_jason import jason_available, run_benchmark
+    from baselines.shared_sim import NOISE_SEED
 
     ok, why = jason_available()
     if not ok:
         print(f"  [SKIP] Jason not available: {why}")
         return None
 
-    result = run_benchmark(n_ticks=n_ticks, warmup=warmup)
+    result = run_benchmark(
+        n_ticks=n_ticks, warmup=warmup,
+        noise=noise, noise_seed=NOISE_SEED + run_idx,
+    )
     return {
         "framework": "Jason",
         "samples": result.tick_latencies_ms,
@@ -236,7 +254,9 @@ def bench_jason(n_ticks: int, warmup: int) -> dict[str, Any] | None:
 
 # ── ROS 2 benchmark ─────────────────────────────────────────────────────────
 
-def bench_ros2(n_ticks: int, warmup: int) -> dict[str, Any] | None:
+def bench_ros2(
+    n_ticks: int, warmup: int, noise: bool = False, run_idx: int = 0,
+) -> dict[str, Any] | None:
     """Run ROS 2 + py_trees baseline. Returns None if rclpy is unavailable."""
     from baselines.ros2.robot_arm import ros2_available, run_benchmark
 
@@ -248,6 +268,9 @@ def bench_ros2(n_ticks: int, warmup: int) -> dict[str, Any] | None:
     # Match the workload of the other frameworks — see bench_py_trees note.
     import baselines.shared_sim as _shared_sim
     _shared_sim.BENCHMARK_MODE = True
+    _shared_sim.NOISE_MODE = noise
+    if noise:
+        _shared_sim.reset_noise_rng(run_idx)
 
     result = run_benchmark(n_ticks=n_ticks, warmup=warmup)
     return {
@@ -463,6 +486,12 @@ def main() -> None:
     parser.add_argument("--runs", type=int, default=5, help="Independent runs per framework")
     parser.add_argument("--ticks", type=int, default=10_000, help="Ticks per run")
     parser.add_argument("--warmup", type=int, default=1_000, help="Warmup ticks")
+    parser.add_argument(
+        "--noise", action="store_true",
+        help="E5 noise arm: Gaussian sensor noise + seeded actuation delay "
+             "in the shared simulation (all four frameworks identically). "
+             "Deterministic mode remains the fairness baseline.",
+    )
     parser.add_argument("--output-dir", type=str, default="baselines/results")
     args = parser.parse_args()
 
@@ -480,12 +509,22 @@ def main() -> None:
     # Runtime benchmarks. Each entry is (name, callable -> dict | None).
     # Callables either return a result dict or print a [SKIP] line and
     # return None. Order matters only for the printed report.
-    baselines: list[tuple[str, Callable[[], dict[str, Any] | None]]] = [
-        ("Arachnite", lambda: asyncio.run(bench_arachnite(args.ticks, args.warmup))),
-        ("py_trees",  lambda: bench_py_trees(args.ticks, args.warmup)),
-        ("Jason",     lambda: bench_jason(args.ticks, args.warmup)),
-        ("ROS 2 BT",  lambda: bench_ros2(args.ticks, args.warmup)),
+    baselines: list[tuple[str, Callable[[int], dict[str, Any] | None]]] = [
+        ("Arachnite", lambda ri: asyncio.run(
+            bench_arachnite(args.ticks, args.warmup, args.noise, ri))),
+        ("py_trees",  lambda ri: bench_py_trees(args.ticks, args.warmup, args.noise, ri)),
+        ("Jason",     lambda ri: bench_jason(args.ticks, args.warmup, args.noise, ri)),
+        ("ROS 2 BT",  lambda ri: bench_ros2(args.ticks, args.warmup, args.noise, ri)),
     ]
+    if args.noise:
+        from baselines.shared_sim import (
+            NOISE_ACTUATION_DELAY_MS,
+            NOISE_SEED,
+            NOISE_SENSOR_SIGMA_M,
+        )
+        print(f"\n  NOISE MODE (E5): sensor sigma={NOISE_SENSOR_SIGMA_M} m, "
+              f"actuation delay={NOISE_ACTUATION_DELAY_MS} ms, "
+              f"seed={NOISE_SEED}+run_idx")
 
     print(f"\n  Running {args.runs} independent runs, {args.ticks} ticks each...")
     if args.runs < 10:
@@ -506,7 +545,7 @@ def main() -> None:
                 continue
             print(f"  {name}...", end=" ", flush=True)
             try:
-                res = fn()
+                res = fn(run_idx)
             except RuntimeError as exc:
                 print(f"[SKIP] {exc}")
                 skipped.add(name)
@@ -614,13 +653,29 @@ def main() -> None:
     # LoC in results
     analysis["lines_of_code"] = loc
 
+    # E5: record the simulation arm so noisy and deterministic result files
+    # are never mistaken for one another.
+    analysis["noise_mode"] = args.noise
+    if args.noise:
+        from baselines.shared_sim import (
+            NOISE_ACTUATION_DELAY_MS,
+            NOISE_SEED,
+            NOISE_SENSOR_SIGMA_M,
+        )
+        analysis["noise_config"] = {
+            "sensor_sigma_m": NOISE_SENSOR_SIGMA_M,
+            "actuation_delay_ms": list(NOISE_ACTUATION_DELAY_MS),
+            "seed_base": NOISE_SEED,
+        }
+
     # Save. Tag the filename with hostname + Python version so successive
     # runs from different machines or interpreters don't overwrite each
     # other in the shared results directory.
     timestamp = time.strftime("%Y%m%d_%H%M%S")
     device_tag = platform.node().replace(" ", "_") or "unknown"
     py_tag = f"py{platform.python_version()}"
-    out_file = out_dir / f"comparison_{device_tag}_{py_tag}_{timestamp}.json"
+    noise_tag = "_noise" if args.noise else ""
+    out_file = out_dir / f"comparison_{device_tag}_{py_tag}{noise_tag}_{timestamp}.json"
 
     # Convert samples to stats only (too large for JSON)
     save_analysis = {k: v for k, v in analysis.items() if k != "_comparisons"}

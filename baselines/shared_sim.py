@@ -7,6 +7,7 @@ implementations. Ensures identical simulation behaviour across frameworks.
 
 from __future__ import annotations
 
+import random
 import time
 from dataclasses import dataclass, field
 
@@ -21,6 +22,39 @@ from dataclasses import dataclass, field
 # from the benchmark harness so all four frameworks exercise the same path.
 # See docs/audits/2026-05-04-architecture-and-fairness-audit.md, finding #1.
 BENCHMARK_MODE: bool = False
+
+# Noise mode (revision experiment E5). When True, every *sensed* object
+# distance carries additive Gaussian noise (sigma below) and each actuation
+# completion (``emergency_retract`` / ``pick_complete``) blocks for a seeded
+# uniform delay — the two entry points all four baselines share, so the same
+# perturbation applies framework-independently. Deterministic mode stays the
+# fairness baseline (see the BENCHMARK_MODE note above); noise mode is run as
+# a second arm to demonstrate robustness under sensor noise and actuation
+# latency. Mirrored by ``examples.robot_arm.nodes`` (Arachnite arm) and
+# ``ArmState.java`` (Jason arm, -Darachnite.noise=true).
+NOISE_MODE: bool = False
+NOISE_SENSOR_SIGMA_M: float = 0.02
+NOISE_ACTUATION_DELAY_MS: tuple[float, float] = (1.0, 5.0)
+NOISE_SEED: int = 20260812
+_noise_rng: random.Random | None = None
+
+
+def _rng() -> random.Random:
+    global _noise_rng
+    if _noise_rng is None:
+        _noise_rng = random.Random(NOISE_SEED)
+    return _noise_rng
+
+
+def reset_noise_rng(offset: int = 0) -> None:
+    """Re-seed the noise stream to ``NOISE_SEED + offset``.
+
+    Call once per independent run with the run index as offset, so every
+    run draws a distinct but reproducible noise sequence (matching the
+    per-JVM seeding of the Jason arm).
+    """
+    global _noise_rng
+    _noise_rng = random.Random(NOISE_SEED + offset)
 
 
 @dataclass
@@ -63,6 +97,13 @@ class ArmState:
         else:
             elapsed = time.monotonic() - self.start_time
             self.object_distance = max(0.10, 1.5 - elapsed * 0.067)
+        if NOISE_MODE:
+            # Sensor noise applies to every reading, including the collision
+            # distance — a noisy proximity sensor near the safety threshold
+            # is precisely the robustness case experiment E5 exercises.
+            self.object_distance = max(
+                0.0, self.object_distance + _rng().gauss(0.0, NOISE_SENSOR_SIGMA_M)
+            )
         # Pick-start detection: object in grasp window, hand empty, and
         # the previous pick has been recorded (pick_start_ns < 0). The
         # 0.10–0.35 m window matches CheckObjectDetected and GraspInstinct.
@@ -74,7 +115,15 @@ class ArmState:
             self.pick_start_ns = time.monotonic_ns()
         return self.object_distance
 
+    @staticmethod
+    def _actuation_delay() -> None:
+        """Noise-mode actuation latency at the shared completion points."""
+        if NOISE_MODE:
+            lo, hi = NOISE_ACTUATION_DELAY_MS
+            time.sleep(_rng().uniform(lo, hi) / 1_000.0)
+
     def emergency_retract(self) -> None:
+        self._actuation_delay()
         self.joints = [0.0] * 6
         self.gripper = 0.0
         self.holding = False
@@ -85,6 +134,7 @@ class ArmState:
         self.pick_start_ns = -1
 
     def pick_complete(self) -> None:
+        self._actuation_delay()
         self.gripper = 0.0
         self.holding = False
         self.pick_count += 1

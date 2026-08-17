@@ -68,6 +68,8 @@ def run_benchmark(
     warmup: int = 1_000,
     inject_collision_at: int | None = None,
     timeout_s: float = 600.0,
+    noise: bool = False,
+    noise_seed: int | None = None,
 ) -> BenchmarkResult:
     """Run the Jason BDI baseline. Raises RuntimeError on misconfiguration."""
     from baselines.shared_sim import BenchmarkResult
@@ -86,6 +88,10 @@ def run_benchmark(
         cmd = [
             "java",
             "-Djava.awt.headless=true",
+            # E5 noise mode — read by ArmState.java (flag + per-run seed).
+            *(["-Darachnite.noise=true"] if noise else []),
+            *([f"-Darachnite.noise.seed={noise_seed}"]
+              if noise and noise_seed is not None else []),
             "-cp", classpath,
             "JasonBench",
             "--out", str(out_file),

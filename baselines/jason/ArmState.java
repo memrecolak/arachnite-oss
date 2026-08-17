@@ -8,8 +8,22 @@
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Random;
 
 public class ArmState {
+
+    // Noise mode (revision experiment E5) — mirrors baselines/shared_sim.py:
+    // Gaussian sensor noise on every sensed distance plus a seeded uniform
+    // actuation delay at the two shared completion points. Enabled with
+    // -Darachnite.noise=true; constants must match the Python side.
+    static final boolean NOISE = Boolean.getBoolean("arachnite.noise");
+    static final double NOISE_SENSOR_SIGMA_M = 0.02;
+    static final double NOISE_DELAY_MIN_MS = 1.0;
+    static final double NOISE_DELAY_MAX_MS = 5.0;
+    // Per-run seed passed by run_jason.py as NOISE_SEED + run index, so each
+    // independent run draws a distinct but reproducible noise sequence.
+    static final long NOISE_SEED = Long.getLong("arachnite.noise.seed", 20260812L);
+    private final Random noiseRng = new Random(NOISE_SEED);
 
     public double[] joints = new double[]{0, 0, 0, 0, 0, 0};
     public double gripper = 0.0;
@@ -48,6 +62,12 @@ public class ArmState {
         } else {
             objectDistance = 0.20;
         }
+        if (NOISE) {
+            // Sensor noise applies to every reading, including the collision
+            // distance — the noisy-threshold robustness case of E5.
+            objectDistance = Math.max(
+                0.0, objectDistance + noiseRng.nextGaussian() * NOISE_SENSOR_SIGMA_M);
+        }
         if (pickStartNanos < 0
                 && !holding
                 && objectDistance >= 0.10
@@ -57,7 +77,22 @@ public class ArmState {
         return objectDistance;
     }
 
+    /** Noise-mode actuation latency at the shared completion points. */
+    private void actuationDelay() {
+        if (!NOISE) {
+            return;
+        }
+        double ms = NOISE_DELAY_MIN_MS
+                + noiseRng.nextDouble() * (NOISE_DELAY_MAX_MS - NOISE_DELAY_MIN_MS);
+        try {
+            Thread.sleep((long) ms, (int) ((ms % 1.0) * 1_000_000));
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+    }
+
     public void emergencyRetract() {
+        actuationDelay();
         joints = new double[]{0, 0, 0, 0, 0, 0};
         gripper = 0.0;
         holding = false;
@@ -69,6 +104,7 @@ public class ArmState {
     }
 
     public void pickComplete() {
+        actuationDelay();
         gripper = 0.0;
         holding = false;
         pickCount++;
