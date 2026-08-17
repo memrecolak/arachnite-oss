@@ -434,29 +434,34 @@ def analyze(results: list[dict[str, Any]], n_runs: int) -> dict[str, Any]:
 
 # ── Lines of code analysis ──────────────────────────────────────────────────
 
+# Task-encoding files per framework, relative to the repo root. Single source
+# of truth shared with benchmarks/se_metrics.py (revision experiment E8).
+FRAMEWORK_FILES: dict[str, list[str]] = {
+    "Arachnite": [
+        "examples/robot_arm/nodes.py",
+        "examples/robot_arm/simulate.py",
+        "examples/robot_arm/manifest.yaml",
+    ],
+    "py_trees": [
+        "baselines/py_trees/robot_arm.py",
+    ],
+    "Jason": [
+        "baselines/jason/robot_arm.asl",
+        "baselines/jason/RobotArmEnv.java",
+    ],
+    "ROS 2 BT": [
+        "baselines/ros2/robot_arm_bt.py",
+    ],
+}
+
+
 def loc_analysis() -> dict[str, int]:
     """Count lines of code for each framework's implementation."""
     base = Path(__file__).parent.parent
-
-    frameworks = {
-        "Arachnite": count_loc([
-            str(base / "examples/robot_arm/nodes.py"),
-            str(base / "examples/robot_arm/simulate.py"),
-            str(base / "examples/robot_arm/manifest.yaml"),
-        ]),
-        "py_trees": count_loc([
-            str(base / "baselines/py_trees/robot_arm.py"),
-        ]),
-        "Jason": count_loc([
-            str(base / "baselines/jason/robot_arm.asl"),
-            str(base / "baselines/jason/RobotArmEnv.java"),
-        ]),
-        "ROS 2 BT": count_loc([
-            str(base / "baselines/ros2/robot_arm_bt.py"),
-        ]),
+    return {
+        name: count_loc([str(base / rel) for rel in rels])
+        for name, rels in FRAMEWORK_FILES.items()
     }
-
-    return frameworks
 
 
 def loc_table(loc: dict[str, int]) -> None:
