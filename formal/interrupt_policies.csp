@@ -1,0 +1,98 @@
+-- interrupt_policies.csp
+-- Machine-readable CSP_M encoding of Arachnite's four interrupt policies
+-- (paper section 4.5 / appendix), on the concrete five-step action of the
+-- harmonised benchmark: steps 1..3 form the mandatory (non-interruptible)
+-- block, each with a rollback callable; steps 4..5 are interruptible;
+-- step 5 is the only checkpoint.
+--
+-- Check with FDR4:   refines interrupt_policies.csp
+-- All assertions below are expected to PASS.
+
+N = 5
+STEPS = {1..N}
+
+channel step : STEPS
+channel roll : STEPS
+channel irq, ack, stop
+
+Interruptible(i) = i >= 4
+Checkpoint(i)    = i == 5
+HasRollback(i)   = i <= 3
+
+-- ALWAYS: a pending request is honoured at the first interruptible boundary.
+-- irq is offered at EVERY state (including inside the mandatory block) and
+-- merely sets the pending flag: requests are deferred, never refused.
+ALWAYS = A(<1..N>, false)
+A(is, p) =
+  if null(is) then stop -> SKIP
+  else if p and Interruptible(head(is)) then ack -> stop -> SKIP
+  else (step.head(is) -> A(tail(is), p)) [] (irq -> A(is, true))
+
+-- NEVER: irq is absorbed everywhere; ack is never emitted.
+NEVER = NV(<1..N>)
+NV(is) =
+  if null(is) then stop -> SKIP
+  else (step.head(is) -> NV(tail(is))) [] (irq -> NV(is))
+
+-- CHECKPOINT: honoured only at checkpoint steps.
+CHECKPOINT = C(<1..N>, false)
+C(is, p) =
+  if null(is) then stop -> SKIP
+  else if p and Checkpoint(head(is)) then ack -> stop -> SKIP
+  else (step.head(is) -> C(tail(is), p)) [] (irq -> C(is, true))
+
+-- ROLLBACK: as ALWAYS, but completed rollback-bearing steps are undone in
+-- reverse order before acknowledging.
+ROLLBACK = R(<1..N>, <>, false)
+R(is, done, p) =
+  if null(is) then stop -> SKIP
+  else if p and Interruptible(head(is)) then
+    UNDO(reverse_(done)) ; ack -> stop -> SKIP
+  else (step.head(is) -> R(tail(is), done ^ <head(is)>, p))
+       [] (irq -> R(is, done, true))
+
+UNDO(js) =
+  if null(js) then SKIP
+  else if HasRollback(head(js)) then roll.head(js) -> UNDO(tail(js))
+  else UNDO(tail(js))
+
+reverse_(<>) = <>
+reverse_(<x> ^ xs) = reverse_(xs) ^ <x>
+
+-- ---------------------------------------------------------------------------
+-- Specifications
+
+RUNALL = ([] x : Events @ x -> RUNALL) [] SKIP
+
+-- Deferred-interrupt property: ack can never occur before the mandatory
+-- block (steps 1..3) has completed, regardless of when irq arrives.
+DEFER = ([] x : diff(Events, {|ack|}) @ x ->
+           (if x == step.3 then RUNALL else DEFER))
+        [] SKIP
+
+assert DEFER [T= ALWAYS
+assert DEFER [T= CHECKPOINT
+assert DEFER [T= ROLLBACK
+assert DEFER [T= NEVER
+
+-- Rollback ordering: once undoing starts it is exactly roll.3, roll.2,
+-- roll.1, then ack (reverse completion order); traces without rollback
+-- events are unconstrained.
+ROLLORD = ([] x : diff(Events, {|roll|}) @ x -> ROLLORD)
+          [] (roll.3 -> roll.2 -> roll.1 -> ack -> stop -> SKIP)
+          [] SKIP
+
+assert ROLLORD [T= ROLLBACK
+
+-- Honour-boundary ordering. Raw trace inclusion CHECKPOINT [T= ALWAYS does
+-- NOT hold in the deferral model (with a request pending, CHECKPOINT executes
+-- interruptible non-checkpoint steps that ALWAYS never would); hiding the
+-- request event recovers the intended ordering over observable behaviour:
+assert ALWAYS \ {|irq|} [T= CHECKPOINT \ {|irq|}
+assert CHECKPOINT \ {|irq|} [T= NEVER \ {|irq|}
+
+-- Basic sanity.
+assert ALWAYS     :[deadlock free]
+assert NEVER      :[deadlock free]
+assert CHECKPOINT :[deadlock free]
+assert ROLLBACK   :[deadlock free]
