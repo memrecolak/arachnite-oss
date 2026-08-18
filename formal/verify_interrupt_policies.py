@@ -1,4 +1,4 @@
-"""Exhaustive state-space verification of the four interrupt-policy CSP
+r"""Exhaustive state-space verification of the four interrupt-policy CSP
 processes in ``interrupt_policies.csp`` (same five-step instance).
 
 For this finite model (< 100 states per policy) trace refinement is language
