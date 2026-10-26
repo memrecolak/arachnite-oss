@@ -16,8 +16,8 @@ Imagine a robot vacuum cleaner. It has these instincts:
 | `Bored` | Hasn't moved in a while | Drive somewhere new |
 
 What should happen if **all three fire at the same time?** The vacuum can't
-charge, vacuum, *and* drive somewhere new in the same instant. It has to pick
-one.
+charge, vacuum, *and* drive somewhere new in the same instant: all three need
+the same wheels. It has to pick one.
 
 Without the decision layer, the program would have to be one giant `if/elif`
 ladder full of "what if A and B and not C" rules. That gets messy fast.
@@ -30,7 +30,9 @@ winner.
 
 Each Proposal has a `priority` number. The higher, the more important. By
 default, the decision layer is **greedy** — it picks the proposal with the
-highest priority and runs it. The others are ignored for that tick.
+highest priority and runs it. The others that need the same hardware are
+ignored for that tick. (What "the same hardware" means is coming up in a
+moment.)
 
 Arachnite suggests these priority ranges (you saw them in the code):
 
@@ -71,6 +73,38 @@ reaches it, then `LowBatteryInstinct` stops firing, and the next tick
 
 That's the magic: **each instinct is selfish — it just shouts what it wants
 — and priorities sort it all out.** No tangled `if/else` ladder.
+
+## Telling Arachnite what the actions share
+
+How does Arachnite know that "go to the dock" and "vacuum" can't happen at
+the same time? You tell it. Every action can list the pieces of hardware it
+controls, called its **resources**:
+
+```python
+class GoToDock(BaseActionNode):
+    node_id = "GoToDock"
+    resources = frozenset({"wheels"})
+
+class Vacuum(BaseActionNode):
+    node_id = "Vacuum"
+    resources = frozenset({"wheels", "brush"})
+```
+
+(`frozenset({...})` is just Python's way of writing a fixed set of names.
+The names are up to you.)
+
+The rule is simple: **two actions that share a resource never run at the
+same time.** When proposals compete for the same resource, the highest
+priority gets it.
+
+Actions that share *nothing* don't compete at all. If the vacuum also had a
+`BlinkLight` action with `resources = frozenset({"led"})`, it could blink
+while driving to the dock. That's usually what you want: the decision layer
+only has to pick between actions that really get in each other's way.
+
+If an action lists no resources, Arachnite can't know what it touches, so it
+only avoids running *that same action* twice at once. Two different actions
+without resources can run side by side.
 
 ## Building a competing-instincts demo
 
@@ -142,6 +176,7 @@ class HotEmergency(BaseInstinctNode):
 
 class OpenWindow(BaseActionNode):
     node_id = "OpenWindow"
+    resources = frozenset({"climate"})  # both actions control the room climate
     async def execute(self, proposal) -> Result:
         print(">>> Window opened")
         return Result(action_id=self.node_id, success=True)
@@ -149,6 +184,7 @@ class OpenWindow(BaseActionNode):
 
 class TurnOnFan(BaseActionNode):
     node_id = "TurnOnFan"
+    resources = frozenset({"climate"})
     async def execute(self, proposal) -> Result:
         print(">>> Fan turned ON")
         return Result(action_id=self.node_id, success=True)
@@ -190,8 +226,14 @@ if __name__ == "__main__":
 
 When the temperature is 42 degrees, **both** `MildHeat` (30 < 42 ≤ 45) **and**
 `HotEmergency` (42 > 40) want to fire. But `HotEmergency` has priority 120
-and `MildHeat` has priority 30. The fan wins. You'll only see "Fan turned
+and `MildHeat` has priority 30. Both actions use the `"climate"` resource, so
+only one of them can have it. The fan wins. You'll only see "Fan turned
 ON".
+
+Try deleting the two `resources = ...` lines and run it again. Now the
+actions don't share anything, so Arachnite runs both: you'll see "Fan turned
+ON" *and* "Window opened" every tick. Declaring resources is how you tell
+Arachnite which proposals really compete.
 
 Now try changing `value=42.0` to `value=35.0`. Now only `MildHeat` fires
 (35 isn't > 40). You'll see "Window opened" instead.
@@ -229,6 +271,8 @@ win.
 - Each one returns a `Proposal` with a `priority`.
 - The decision layer picks a winner.
 - Higher priority = more important.
+- Actions declare the hardware they use with `resources`. Actions that
+  share a resource never run at the same time; the higher priority gets it.
 - Stick to the priority ranges (safety > goal > exploration) so your numbers
   stay meaningful.
 

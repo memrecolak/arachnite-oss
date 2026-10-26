@@ -16,7 +16,10 @@ adds. Arachnite ships with a complete benchmarking suite.
 
 ## Quick Start: Tick Latency
 
-The simplest benchmark measures how long one `tick()` call takes:
+The simplest benchmark measures how long one `tick()` call takes. A tick
+only *launches* the selected actions (they run as background tasks), so this
+is the framework's own per-tick cost; how long your actions take is not part
+of it:
 
 ```bash
 python benchmarks/tick_latency.py

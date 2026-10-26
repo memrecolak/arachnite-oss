@@ -22,10 +22,10 @@ ctx.tick: int                    # current tick number (0, 1, 2, ...)
 ctx.signals: list[Signal]        # this tick's signals (you've used this)
 ctx.history: deque[list[Signal]] # rolling window of past ticks' signals
 ctx.state: dict[str, Any]        # persistent key/value store
-ctx.last_result: Result | None   # the most recent action's result
-ctx.last_results: list[Result]   # all results from the last tick (concurrent dispatch)
+ctx.last_result: Result | None   # first of last_results (or None)
+ctx.last_results: list[Result]   # actions that finished since the previous tick, in completion order
 ctx.action_state: ActionExecutionState | None  # currently-running action info
-ctx.action_states: list[ActionExecutionState]  # all running actions
+ctx.action_states: list[ActionExecutionState]  # all running multi-step actions (step, interruptible, ...)
 ```
 
 ## Detecting trends with `ctx.history`
@@ -172,10 +172,12 @@ class RetryOnFailureInstinct(BaseInstinctNode):
         return None
 ```
 
-Notice that `last_result` is from the **previous** tick — never the current
-one. That's because the action runs *after* the instinct, in the same tick,
-so by the time your instinct runs, the result for this tick doesn't exist
-yet.
+Notice that `last_result` is never from the current tick. Actions are only
+*started* at the end of a tick and run in the background, so a result
+reaches the context at the start of the first tick after the action
+finished. For a quick action that's the next tick; for a long multi-step
+action it can be many ticks later. While it runs, you can watch its progress
+in `ctx.action_states`.
 
 ## A complete example
 

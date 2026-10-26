@@ -24,8 +24,8 @@ Each exercise has two files:
 |---|---|---|
 | 1 | [exercise_01_hello_agent.py](exercise_01_hello_agent.py) | Build the simplest agent: one sensor, one instinct, one action |
 | 2 | [exercise_02_two_sensors.py](exercise_02_two_sensors.py) | Combine readings from two sensors in one instinct |
-| 3 | [exercise_03_priority_battle.py](exercise_03_priority_battle.py) | Watch two instincts compete; pick the right priorities |
-| 4 | [exercise_04_safety_reflex.py](exercise_04_safety_reflex.py) | Add a reflex that overrides normal instincts |
+| 3 | [exercise_03_priority_battle.py](exercise_03_priority_battle.py) | Watch instincts compete for the same wheels; pick the right priorities |
+| 4 | [exercise_04_safety_reflex.py](exercise_04_safety_reflex.py) | Add a reflex that overrides normal instincts and cuts into a running action |
 
 Solutions live in [`solutions/`](solutions/).
 

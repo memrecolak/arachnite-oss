@@ -16,6 +16,12 @@ The story:
     - "OverheatReflex" — fires when temp > 260. Must instantly run
       "ShutdownPrinter" no matter what else is happening.
 
+  Printing a layer takes 1.5 seconds, so PrintLayer is often still running
+  when the next ticks happen (lesson 5). PrintLayer, WaitForWarmup and
+  ShutdownPrinter all drive the same print head, so they all declare
+  resources = frozenset({"hotend"}) (lesson 6). That part is already done
+  for you below.
+
 Your job:
   1. Make OverheatReflex inherit from BaseReflexInstinctNode (NOT
      BaseInstinctNode).
@@ -23,6 +29,13 @@ Your job:
   3. Implement evaluate() so it returns a Proposal when temp > 260.
   4. Run the agent. When the temperature randomly spikes, you should see
      "!!! SHUTDOWN !!!" instead of any normal action.
+  5. Look for a spike that lands while a layer is printing. You'll see
+       [print]   layer cut short by OverheatReflex, head parked
+       !!! SHUTDOWN !!! ...
+     The reflex did not wait for the layer to finish: it preempted
+     PrintLayer, PrintLayer's on_preempted() safe-stop ran, and only then
+     did ShutdownPrinter start. (The sensor is random: if you don't see it,
+     run the file again.)
 
 Look at lesson 7 if you need a refresher on reflexes.
 """
@@ -113,20 +126,34 @@ class OverheatReflex(...):     # TODO: pick the right base class
 
 class WaitForWarmup(BaseActionNode):
     node_id = "WaitForWarmup"
+    resources = frozenset({"hotend"})
+
     async def execute(self, proposal) -> Result:
         print(f"  [warm up] {proposal.rationale}")
         return Result(action_id=self.node_id, success=True)
 
 
 class PrintLayer(BaseActionNode):
+    """Printing a layer takes a while, so it spans several ticks."""
     node_id = "PrintLayer"
+    resources = frozenset({"hotend"})   # the print head this action drives
+
     async def execute(self, proposal) -> Result:
-        print(f"  [print]   {proposal.rationale}")
+        print(f"  [print]   layer started ({proposal.rationale})")
+        await asyncio.sleep(1.5)
+        print("  [print]   layer done")
         return Result(action_id=self.node_id, success=True)
+
+    async def on_preempted(self, proposal, preempted_by) -> None:
+        # Safe-stop: called when a reflex takes the hot end away mid-layer.
+        # Park the head where it is; don't try to "undo" the layer.
+        print(f"  [print]   layer cut short by {preempted_by.instinct_id}, head parked")
 
 
 class ShutdownPrinter(BaseActionNode):
     node_id = "ShutdownPrinter"
+    resources = frozenset({"hotend"})   # same hardware as PrintLayer
+
     async def execute(self, proposal) -> Result:
         print(f"  !!! SHUTDOWN !!! {proposal.rationale}")
         return Result(action_id=self.node_id, success=True)

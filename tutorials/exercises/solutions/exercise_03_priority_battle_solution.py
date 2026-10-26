@@ -66,14 +66,14 @@ class ExploreInstinct(BaseInstinctNode):
         return None
 
 
-class PlayMusic(BaseInstinctNode):
-    node_id = "PlayMusic"
-    priority = 10  # exploratory range — always loses
+class SpinForFun(BaseInstinctNode):
+    node_id = "SpinForFun"
+    priority = 10  # exploratory range — always loses the wheels
 
     async def evaluate(self, ctx) -> Proposal | None:
         return Proposal(
             instinct_id=self.node_id,
-            action_id="PlayMusicAction",
+            action_id="SpinInCircles",
             priority=self.priority,
             urgency=0.1,
         )
@@ -81,6 +81,7 @@ class PlayMusic(BaseInstinctNode):
 
 class DriveHomeAction(BaseActionNode):
     node_id = "DriveHome"
+    resources = frozenset({"wheels"})   # all three actions drive the wheels
     async def execute(self, proposal) -> Result:
         print("[CAR] Driving home...")
         return Result(action_id=self.node_id, success=True)
@@ -88,15 +89,17 @@ class DriveHomeAction(BaseActionNode):
 
 class ExploreAction(BaseActionNode):
     node_id = "Explore"
+    resources = frozenset({"wheels"})
     async def execute(self, proposal) -> Result:
         print("[CAR] Exploring!")
         return Result(action_id=self.node_id, success=True)
 
 
-class PlayMusicAction(BaseActionNode):
-    node_id = "PlayMusicAction"
+class SpinAction(BaseActionNode):
+    node_id = "SpinInCircles"
+    resources = frozenset({"wheels"})
     async def execute(self, proposal) -> Result:
-        print("[CAR] Playing music")
+        print("[CAR] Spinning in circles, wheee!")
         return Result(action_id=self.node_id, success=True)
 
 
@@ -112,10 +115,10 @@ async def main() -> None:
     sense_master.register(BatterySensor(bus=bus))
     instinct_master.register(ReturnToBase(bus=bus))
     instinct_master.register(ExploreInstinct(bus=bus))
-    instinct_master.register(PlayMusic(bus=bus))
+    instinct_master.register(SpinForFun(bus=bus))
     action_master.register(DriveHomeAction(bus=bus))
     action_master.register(ExploreAction(bus=bus))
-    action_master.register(PlayMusicAction(bus=bus))
+    action_master.register(SpinAction(bus=bus))
 
     rt = ArachniteRuntime(
         sense_master=sense_master,

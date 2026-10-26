@@ -13,8 +13,9 @@ When you deploy an agent on real hardware, you need to know:
 
 - **How much time does the framework itself use per tick?** This is time your
   node logic *can't* use. If you set `tick_rate_hz=10` (100 ms budget) and
-  the framework overhead is 2 ms, you have 98 ms left for your sense reads,
-  instinct evaluations, and actions.
+  the framework overhead is 2 ms, you have 98 ms left for your sense reads
+  and instinct evaluations. (Actions run in the background across ticks, so
+  a slow action doesn't stretch a tick, although it still shares the CPU.)
 - **How fast is the reflex path?** If a collision sensor fires, how many
   microseconds until the emergency stop action begins?
 - **How much memory does my agent use?** On a Jetson Nano with 4 GB RAM,
@@ -28,7 +29,7 @@ Arachnite provides six benchmarks, each measuring a different aspect:
 
 | Benchmark | What it measures | Unit |
 |-----------|-----------------|------|
-| **Tick latency** | Time for one `runtime.tick()` call | milliseconds |
+| **Tick latency** | Time for one `runtime.tick()` call (actions are only launched, not awaited) | milliseconds |
 | **Reflex latency** | Sensor read to action execute entry | microseconds |
 | **Memory footprint** | RSS (Resident Set Size) at steady state | megabytes |
 | **Node-count scalability** | Tick latency vs. number of nodes | milliseconds |
@@ -125,7 +126,7 @@ emergency action starting. This is the framework's safety response overhead:
 Sensor.read()         ContextNode.update()
     |                       |
     v                       v
-  t_sense ──> signal ──> context ──> evaluate_reflexes() ──> dispatch() ──> t_action
+  t_sense ──> signal ──> context ──> evaluate_reflexes() ──> launch_reflex() ──> t_action
                                                                               |
                                                                     T_reflex = t_action - t_sense
 ```

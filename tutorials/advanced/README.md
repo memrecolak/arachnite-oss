@@ -22,7 +22,7 @@ the source and experiment.
 
 | # | Lesson | What it covers |
 |---|---|---|
-| 1 | [Multi-Step Actions](01_multi_step_actions.md) | Long-running actions with steps, interruptions, and rollback |
+| 1 | [Multi-Step Actions](01_multi_step_actions.md) | Long-running actions with steps, interruptions, rollback, resources, and reflex preemption |
 | 2 | [Supervisors and Health](02_supervisors_and_health.md) | Auto-restart for crashed nodes, health monitoring |
 | 3 | [Smarter Context](03_smarter_context.md) | Using `ctx.history`, `ctx.state`, and `StateUpdateSignal` for memory and trends |
 | 4 | [Custom Decision Strategies](04_custom_decision_strategies.md) | Built-in strategies + writing your own |

@@ -39,9 +39,9 @@ Read the lessons in order. Each one builds on the last.
 | 2 | [The Big Idea: Sense → Think → Act](02_the_big_idea.md) | The basic loop every agent follows |
 | 3 | [Meet the Pieces](03_meet_the_pieces.md) | Signals, Proposals, Results, and the three node types |
 | 4 | [Your First Agent](04_your_first_agent.md) | Build and run a complete agent, line by line |
-| 5 | [The Tick Loop](05_the_tick_loop.md) | How the runtime brings everything to life |
-| 6 | [When Instincts Compete](06_priorities_and_decisions.md) | What happens when more than one instinct fires |
-| 7 | [Reflexes — Emergency Reactions](07_reflexes.md) | How to build safety responses that bypass thinking |
+| 5 | [The Tick Loop](05_the_tick_loop.md) | How the runtime brings everything to life, and why actions run in the background |
+| 6 | [When Instincts Compete](06_priorities_and_decisions.md) | What happens when more than one instinct fires, and how actions share hardware |
+| 7 | [Reflexes — Emergency Reactions](07_reflexes.md) | How to build safety responses that bypass thinking and cut into running actions |
 | 8 | [A Smart Lamp Project](08_smart_lamp_project.md) | Putting everything together in a small project |
 | 9 | [Benchmarking Your Agent](09_benchmarking.md) | How fast is your agent? Measuring and understanding performance |
 
@@ -60,7 +60,7 @@ something serious:
 
 | # | Lesson | What it covers |
 |---|---|---|
-| 1 | [Multi-Step Actions](advanced/01_multi_step_actions.md) | Long-running actions with steps, interruption, and rollback |
+| 1 | [Multi-Step Actions](advanced/01_multi_step_actions.md) | Long-running actions with steps, interruption, rollback, resources, and reflex preemption |
 | 2 | [Supervisors and Health](advanced/02_supervisors_and_health.md) | Auto-restart for crashed nodes |
 | 3 | [Smarter Context](advanced/03_smarter_context.md) | History, persistent state, and detecting trends |
 | 4 | [Custom Decision Strategies](advanced/04_custom_decision_strategies.md) | Going beyond `GreedyDecisionNode` |

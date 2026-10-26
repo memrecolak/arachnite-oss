@@ -220,7 +220,9 @@ A practical pattern is to combine both:
 2. An LLM instinct with **lower priority** for **judgement calls** the
    rules don't cover.
 
-The LLM only "wins" when no higher-priority rule fires. Best of both worlds.
+The LLM only "wins" when no higher-priority rule fires. (This holds for
+actions that compete for the same hardware, so declare `resources` on them;
+see beginner lesson 6.) Best of both worlds.
 
 ## Tips
 

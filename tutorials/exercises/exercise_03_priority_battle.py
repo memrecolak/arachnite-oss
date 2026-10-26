@@ -15,19 +15,28 @@ The story:
 These two instincts are NEVER both true at the same time, so there's no
 conflict. But to keep things interesting, we'll add a third instinct:
 
-  - "PlayMusic" — fires every tick, no matter what (priority should be low).
+  - "SpinForFun" — fires every tick, no matter what, and wants to run
+    "SpinInCircles" (priority should be low).
+
+All three actions drive the same wheels, so each one declares
+resources = frozenset({"wheels"}) (lesson 6). Actions that share a resource
+never run at the same time: the highest-priority proposal gets the wheels.
+That part is already done for you below.
 
 Your job:
   1. Fill in all three instincts (the conditions are described above).
   2. Set the priorities so that:
        - When the battery is low, the car goes home (highest priority of any
          normal action).
-       - When the battery is fine, the car explores AND we accept that music
-         is lower priority and never wins.
+       - When the battery is fine, the car explores AND we accept that
+         spinning is lower priority and never wins.
   3. Run the agent. Look at the printed output. Does it match what you expect?
+  4. Bonus: delete the resources line from SpinAction and run it again.
+     Now spinning doesn't need the wheels (as far as Arachnite knows), so
+     it no longer competes and runs every tick alongside the others.
 
 Hint: with the greedy decision strategy, the proposal with the highest
-priority wins. So PlayMusic should have the LOWEST priority.
+priority wins. So SpinForFun should have the LOWEST priority.
 """
 
 import asyncio
@@ -76,8 +85,8 @@ class ExploreInstinct(BaseInstinctNode):
         ...
 
 
-class PlayMusic(BaseInstinctNode):
-    node_id = "PlayMusic"
+class SpinForFun(BaseInstinctNode):
+    node_id = "SpinForFun"
     priority = ...   # TODO: pick a number (exploratory range = 1..49)
 
     async def evaluate(self, ctx) -> Proposal | None:
@@ -87,6 +96,7 @@ class PlayMusic(BaseInstinctNode):
 
 class DriveHomeAction(BaseActionNode):
     node_id = "DriveHome"
+    resources = frozenset({"wheels"})   # all three actions drive the wheels
     async def execute(self, proposal) -> Result:
         print("[CAR] Driving home...")
         return Result(action_id=self.node_id, success=True)
@@ -94,15 +104,17 @@ class DriveHomeAction(BaseActionNode):
 
 class ExploreAction(BaseActionNode):
     node_id = "Explore"
+    resources = frozenset({"wheels"})
     async def execute(self, proposal) -> Result:
         print("[CAR] Exploring!")
         return Result(action_id=self.node_id, success=True)
 
 
-class PlayMusicAction(BaseActionNode):
-    node_id = "PlayMusicAction"
+class SpinAction(BaseActionNode):
+    node_id = "SpinInCircles"
+    resources = frozenset({"wheels"})
     async def execute(self, proposal) -> Result:
-        print("[CAR] Playing music")
+        print("[CAR] Spinning in circles, wheee!")
         return Result(action_id=self.node_id, success=True)
 
 
@@ -118,10 +130,10 @@ async def main() -> None:
     sense_master.register(BatterySensor(bus=bus))
     instinct_master.register(ReturnToBase(bus=bus))
     instinct_master.register(ExploreInstinct(bus=bus))
-    instinct_master.register(PlayMusic(bus=bus))
+    instinct_master.register(SpinForFun(bus=bus))
     action_master.register(DriveHomeAction(bus=bus))
     action_master.register(ExploreAction(bus=bus))
-    action_master.register(PlayMusicAction(bus=bus))
+    action_master.register(SpinAction(bus=bus))
 
     rt = ArachniteRuntime(
         sense_master=sense_master,

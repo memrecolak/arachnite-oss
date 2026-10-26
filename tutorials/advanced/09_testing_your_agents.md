@@ -89,6 +89,7 @@ def make_context(signals: list[Signal]) -> Context:
         history=deque(),
         state={},
         last_result=None,
+        timestamp=time.monotonic(),
         last_results=[],
         action_state=None,
         action_states=[],
@@ -209,6 +210,7 @@ def make_context():
             history=deque(),
             state=state or {},
             last_result=None,
+            timestamp=time.monotonic(),
             last_results=[],
             action_state=None,
             action_states=[],
@@ -229,9 +231,16 @@ async def test_fires_on_hot(make_signal, make_context):
 Cleaner, less repetitive, and mistakes in the helpers get fixed in one
 place.
 
+Arachnite also ships ready-made versions of these helpers in
+`arachnite.testing`: `make_signal()`, `make_proposal()`, `make_result()`,
+`make_context()` and a `MockBus`. Wrap them in fixtures the same way if you
+don't want to write your own.
+
 > **This direct-drive style is not test-only.** Notice that the unit tests above
 > construct a node with a bare `SignalBus()` and call `read()` / `evaluate()` /
-> `dispatch()` directly — no `ArachniteRuntime`, no tick loop. That same pattern is a
+> `dispatch()` directly — no `ArachniteRuntime`, no tick loop. (`ActionMasterNode.dispatch()`
+> awaits the action and returns its `Result`; only the runtime runs actions in the
+> background.) That same pattern is a
 > legitimate **production** deployment shape for a single agent or a human-in-the-loop
 > app with a static priority order. You only need the full deliberative runtime when
 > ≥2 autonomous behaviors compete continuously on dynamic priority. See
@@ -286,7 +295,8 @@ async def test_hot_temperature_triggers_cooldown():
     )
 
     await rt.start()
-    await asyncio.sleep(0.5)  # ~5 ticks
+    await asyncio.sleep(0.5)            # ~5 ticks
+    assert await rt.wait_idle(timeout=2.0)  # let in-flight actions finish
     await rt.stop()
 
     assert cooldown.call_count > 0
@@ -296,6 +306,99 @@ async def test_hot_temperature_triggers_cooldown():
 time it's called. Patterns like this are how you assert on emergent
 behaviour without scraping logs.
 
+## Testing actions that run across ticks
+
+The runtime only *starts* actions; they run as background tasks while the
+ticks carry on (beginner lesson 5). So right after a tick, or after
+`asyncio.sleep(...)`, an action may still be running. Asserting at that
+moment makes a flaky test. Wait for the actions instead. Here `runtime` and
+`cooldown` are fixtures that build the agent from the previous section, with
+a cool-down action that takes a fraction of a second:
+
+```python
+@pytest.mark.asyncio
+async def test_one_tick_starts_cooldown(runtime, cooldown):
+    await runtime.tick()               # drive one tick by hand
+    assert cooldown.call_count == 0    # started, but not finished yet (it takes a while)
+
+    assert await runtime.wait_idle(timeout=2.0)
+    assert cooldown.call_count == 1
+```
+
+`wait_idle()` returns `True` once no action is running or waiting for its
+hardware, and `False` if the timeout runs out. The finished `Result`s reach
+`ctx.last_results` on the *next* tick, so call `runtime.tick()` once more if
+an instinct under test should react to them.
+
+To test how actions share hardware, you don't need a runtime at all. Drive
+an `ActionMasterNode` directly: `launch()` starts a deliberative action,
+`launch_reflex()` a reflex action, and `drain_completed()` hands you the
+Results:
+
+```python
+import asyncio
+import pytest
+
+from arachnite import (
+    ActionMasterNode, BaseActionNode, LaunchStatus, ReflexPreemption,
+    Result, SignalBus,
+)
+from arachnite.testing import make_proposal
+
+
+class SlowCoolDown(BaseActionNode):
+    node_id = "CoolDown"
+    resources = frozenset({"fan"})
+
+    def __init__(self, bus, **kwargs):
+        super().__init__(bus=bus, **kwargs)
+        self.safe_stops = 0
+
+    async def execute(self, proposal) -> Result:
+        await asyncio.sleep(0.3)           # takes a while
+        return Result(action_id=self.node_id, success=True)
+
+    async def on_preempted(self, proposal, preempted_by) -> None:
+        self.safe_stops += 1
+
+
+class FanStop(BaseActionNode):
+    node_id = "FanStop"
+    resources = frozenset({"fan"})
+
+    async def execute(self, proposal) -> Result:
+        return Result(action_id=self.node_id, success=True)
+
+
+@pytest.mark.asyncio
+async def test_reflex_preempts_slow_cooldown():
+    bus = SignalBus()
+    master = ActionMasterNode(bus=bus)
+    cooldown = SlowCoolDown(bus=bus)
+    master.register(cooldown)
+    master.register(FanStop(bus=bus))
+
+    master.launch(make_proposal("CoolDown", priority=80))
+    await asyncio.sleep(0)                 # let CoolDown start running
+
+    outcome = master.launch_reflex(
+        make_proposal("FanStop", priority=250), ReflexPreemption.PREEMPT,
+    )
+    assert outcome.status is LaunchStatus.ARMED   # waits for CoolDown's safe-stop
+
+    assert await master.wait_idle(timeout=1.0)
+    results = {r.action_id: r for r in master.drain_completed()}
+    assert results["CoolDown"].preempted
+    assert not results["CoolDown"].rolled_back
+    assert results["FanStop"].success
+    assert cooldown.safe_stops == 1        # its on_preempted() ran once
+```
+
+And the safe-stop itself is just an async method, so its own unit test is a
+one-liner: `await action.on_preempted(make_proposal("CoolDown"),
+make_proposal("FanStop", priority=250))`, then assert the hardware mock was
+told to hold.
+
 ## Tips
 
 1. **One assertion per test, where possible.** Easier to read, easier to
@@ -304,6 +407,8 @@ behaviour without scraping logs.
    value I gave it" is more readable than mocking `read()`.
 3. **Keep tests fast.** Set tick rates as high as possible (50–100 Hz),
    sleep as little as possible. Whole test suites should run in seconds.
+   Prefer `await runtime.wait_idle()` over a long `sleep()` when you are
+   waiting for actions to finish.
 4. **Test the unhappy path.** What happens when the sensor returns 0?
    `None`? A negative number? An exception? Each one is a test.
 5. **Don't test the framework.** Focus on *your* nodes. Trust that

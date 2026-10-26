@@ -90,7 +90,9 @@ agent can learn from what just happened.
 ## And repeat!
 
 After acting, the loop starts over. Sense again, think again, act again.
-Every fraction of a second.
+Every fraction of a second. The loop doesn't even wait for a slow action to
+finish: while the fan spins up, the agent keeps sensing and thinking (more
+on that in lesson 5).
 
 This means your agent is constantly aware of its surroundings and constantly
 ready to react. If the temperature drops back down, the "too hot" instinct

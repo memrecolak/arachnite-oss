@@ -26,11 +26,12 @@ TICK STARTS
 ├─ 1. Read all sensors at the same time.
 │     Collect every Signal they produce.
 │
-├─ 2. Update the context with those signals.
+├─ 2. Update the context with those signals, plus the Results of
+│     any actions that finished since the last tick.
 │     The context is the agent's short-term memory.
 │
 ├─ 3. Check the reflex instincts first.
-│     If a reflex fires, run its action immediately.
+│     If a reflex fires, start its action immediately.
 │     (More on reflexes in lesson 7.)
 │
 ├─ 4. Ask every normal instinct: "do you want to do something?"
@@ -39,11 +40,8 @@ TICK STARTS
 ├─ 5. Hand the proposals to the decision layer.
 │     The decision layer picks one (or a few) winners.
 │
-├─ 6. Run the chosen action(s).
-│     Each one returns a Result.
-│
-├─ 7. Feed the Results back into the context.
-│     The next tick's instincts can see what just happened.
+├─ 6. Start the chosen action(s).
+│     They run in the background. The tick does NOT wait for them.
 │
 └─ TICK ENDS — sleep until the next tick.
 ```
@@ -57,12 +55,43 @@ Once you understand the tick order, the framework stops feeling magical:
 
 - Your sensor `read()` is called in step 1.
 - Your instinct `evaluate()` is called in step 4.
-- Your action `execute()` is called in step 6.
-- Your instinct never sees a result during the *same* tick — only on the
-  *next* tick, because results aren't added to context until step 7.
+- Your action `execute()` is *started* in step 6, and keeps running in the
+  background for as long as it needs.
+- Your instinct never sees a result during the *same* tick. A Result shows
+  up in the context (step 2) on the first tick *after* the action finished.
 
 This last point is important. If your instinct wants to react to what just
-happened, it has to wait one tick.
+happened, it has to wait at least one tick.
+
+## Actions run in the background
+
+Step 6 says "start", not "run". That difference matters as soon as an action
+takes a while.
+
+Imagine an action that slowly ramps up a fan over 3 seconds, and a tick rate
+of 10 ticks per second. The runtime starts the action and moves on. While the
+fan ramps up, about 30 more ticks happen: sensors are still read, instincts
+are still asked, reflexes can still fire. The agent never goes "blind"
+while it is busy doing something.
+
+A few things follow from this:
+
+- **A running action is not started twice.** If your instinct keeps
+  proposing the same action every tick while it is still running, the
+  runtime simply lets the running one carry on.
+- **Results arrive later.** `ctx.last_results` holds the Results of the
+  actions that finished since the previous tick. For a long action that
+  might be many ticks after it was chosen.
+- **Two actions that use the same hardware don't run at the same time.**
+  You'll see how to tell Arachnite which hardware an action uses in
+  lesson 6.
+
+If you ever need to wait until every running action has finished (for
+example at the end of a short script, or in a test), there's a helper:
+
+```python
+await rt.wait_idle()   # returns once no action is running
+```
 
 ## Now, about that `async` keyword
 
@@ -117,15 +146,19 @@ async functions go with `await`. Eventually you'll meet `asyncio.gather`,
 
 ## What if a tick takes too long?
 
-Suppose you set `tick_rate_hz=10.0` (one tick every 100 ms), but your action
-takes 300 ms to finish. What happens?
+Suppose you set `tick_rate_hz=10.0` (one tick every 100 ms), but one of your
+sensors takes 300 ms to `read()`. What happens?
 
 The runtime will log a warning ("tick overrun") and run the next tick *late*.
 It doesn't skip ticks or crash. Your agent slows down, but it keeps working.
 
+Slow *actions* don't cause this, because the tick only starts them and
+doesn't wait (see above). What makes a tick long is slow work inside the
+tick itself: sensor `read()` and instinct `evaluate()`.
+
 This is good news — it means you don't have to worry about your code being
 "too slow" to start with. Build it, then if you see overrun warnings, look
-for ways to make your nodes faster.
+for ways to make your sensors and instincts faster.
 
 ## A peek under the hood
 
@@ -183,9 +216,9 @@ The key fields on `Result`:
 
 ### Step 2: React to failures on the next tick
 
-Remember from the tick diagram: results are fed into the context at step 7,
-and instincts see them on the **next** tick. So you can write an instinct
-that watches for failures and proposes a recovery action:
+Remember from the tick diagram: results are fed into the context at step 2,
+so instincts see them on the tick **after** the action finished. So you can
+write an instinct that watches for failures and proposes a recovery action:
 
 ```python
 class RetryOnFailure(BaseInstinctNode):
@@ -209,9 +242,9 @@ class RetryOnFailure(BaseInstinctNode):
         return None
 ```
 
-`ctx.last_result` holds the result from the previous tick. If there were
-multiple actions, `ctx.last_results` (plural) gives you a list of all of
-them.
+`ctx.last_result` holds the result of an action that finished since the
+previous tick. If several actions finished, `ctx.last_results` (plural)
+gives you a list of all of them, in the order they finished.
 
 ### Why not just raise exceptions?
 

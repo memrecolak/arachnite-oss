@@ -175,6 +175,7 @@ class OverheatReflex(BaseReflexInstinctNode):
 
 class LampOn(BaseActionNode):
     node_id = "LampOn"
+    resources = frozenset({"lamp"})  # all three actions switch the same lamp
 
     async def execute(self, proposal) -> Result:
         print(f"  [LAMP] ON  ({proposal.rationale})")
@@ -183,6 +184,7 @@ class LampOn(BaseActionNode):
 
 class LampOff(BaseActionNode):
     node_id = "LampOff"
+    resources = frozenset({"lamp"})
 
     async def execute(self, proposal) -> Result:
         print(f"  [LAMP] OFF ({proposal.rationale})")
@@ -191,6 +193,7 @@ class LampOff(BaseActionNode):
 
 class EmergencyShutdown(BaseActionNode):
     node_id = "EmergencyShutdown"
+    resources = frozenset({"lamp"})
 
     async def execute(self, proposal) -> Result:
         print(f"  !!! EMERGENCY SHUTDOWN !!! ({proposal.rationale})")
@@ -281,6 +284,11 @@ overrides everything else.
    - Within goal instincts, "turn on" (70) wins over "turn off" (60) if both
      somehow fired together. This happens to be a safe order — turning on
      accidentally is better than getting stuck off.
+   - This only works because all three actions declare
+     `resources = frozenset({"lamp"})`. They switch the same lamp, so they
+     never run at the same time, and the priority decides who gets the lamp
+     (lesson 6). If a lamp action were ever still running when the reflex
+     fires, the reflex would cut in first (lesson 7).
 
 3. **Adding new behaviour is trivial.** Want to also play a sound when the
    lamp turns on? Add a `PlaySound` action and call it from the same
@@ -314,6 +322,7 @@ You now know:
 - How the tick loop works and what happens during one tick
 - Why everything is async, and the rules for using `await`
 - How priorities and the decision layer pick winners
+- How actions run in the background and share hardware through `resources`
 - When and how to use reflexes for emergency reactions
 - How to combine all of these into a working project
 

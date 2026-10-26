@@ -213,6 +213,12 @@ purpose. The framework enforces this with a **co-location validator** —
 `manifest.validate()` will fail if you put a reflex on `edge-1` and its
 target action on `cloud-brain`.
 
+The validator checks reflex → action only. Put the **sensor that feeds the
+reflex** on the same `AgentNode` as well, so the danger signal never has to
+cross the network before the reflex sees it. This matters even more with the
+event-driven reflex lane (`reflex_mode="event"`), whose whole point is to
+react the moment the signal is published.
+
 Normal instincts have no such restriction. They can fire on one machine and
 target an action on another.
 
