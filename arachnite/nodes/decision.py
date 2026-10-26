@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import random
 from abc import abstractmethod
+from collections.abc import Callable
 
 from arachnite.bus import SignalBus
 from arachnite.config import NodeConfig
@@ -143,13 +144,21 @@ class DecisionMasterNode(BaseNode):
         log_sinks: list[BaseLogSink] | None = None,
         agent_node_id: str = "local",
         max_pending_ticks: int = 50,
+        max_handoff_ticks: int = 100,
     ) -> None:
         super().__init__(bus, config, log_sinks, agent_node_id)
         self._strategy: BaseDecisionNode = strategy or GreedyDecisionNode(bus=bus)
         self._pending: dict[str, Proposal] = {}
         self._pending_ages: dict[str, int] = {}
+        # Proposals that were selected but could not start because a running
+        # action still owned their action/resources (typically: they just
+        # triggered an interrupt and the owner is unwinding). Re-considered
+        # every tick until they start, are superseded, or age out.
+        self._handoff: dict[str, Proposal] = {}
+        self._handoff_ages: dict[str, int] = {}
         self._last_considered: list[Proposal] = []
         self.max_pending_ticks: int = max_pending_ticks
+        self.max_handoff_ticks: int = max_handoff_ticks
 
     def set_strategy(self, strategy: BaseDecisionNode) -> None:
         """Swap the decision strategy at runtime."""
@@ -168,6 +177,24 @@ class DecisionMasterNode(BaseNode):
         """Remove any pending proposal and age tracking for the given instinct"""
         self._pending.pop(instinct_id, None)
         self._pending_ages.pop(instinct_id, None)
+        self._handoff.pop(instinct_id, None)
+        self._handoff_ages.pop(instinct_id, None)
+
+    def park(self, proposal: Proposal) -> None:
+        """
+        Hold a selected proposal for hand-off: it could not start because a
+        running action still owns its action_id or resources. It is offered
+        to the strategy again on every tick until it starts, its instinct
+        makes a new proposal, or ``max_handoff_ticks`` pass.
+        """
+        if proposal.instinct_id not in self._handoff:
+            self._handoff_ages[proposal.instinct_id] = 0
+        self._handoff[proposal.instinct_id] = proposal
+
+    @property
+    def handoff_proposals(self) -> dict[str, Proposal]:
+        """Proposals parked for hand-off, keyed by instinct_id (read-only copy)."""
+        return dict(self._handoff)
 
     @property
     def pending_proposals(self) -> dict[str, Proposal]:
@@ -244,12 +271,26 @@ class DecisionMasterNode(BaseNode):
         running_proposals: dict[str, Proposal],
         running_interruptible: dict[str, bool],
         evaluated_instinct_ids: set[str] | None = None,
+        conflicts: Callable[[Proposal], set[str]] | None = None,
     ) -> tuple[list[Proposal], list[InterruptRequest]]:
         """
         Extended entry point for concurrent dispatch.
 
         Returns a list of proposals to dispatch and a list of interrupt
         requests for running actions that should be pre-empted.
+
+        A chosen proposal *conflicts* with the running actions named by
+        ``conflicts(proposal)`` — by default only a running action with the
+        same ``action_id``; the runtime passes
+        ``ActionMasterNode.conflicting_owners`` so shared resources count
+        too (ADR 0005). With no conflict it is dispatched. When every
+        conflicting owner is running, interruptible and of lower priority,
+        an ``InterruptRequest`` is issued to each owner
+        (``target_action_id``) and the proposal is returned for dispatch;
+        if it cannot start yet the runtime ``park()``s it for hand-off.
+        Otherwise — an owner inside a mandatory block, a reflex-owned action
+        (reported non-interruptible), or an owner of equal/higher priority —
+        it is held: not dispatched, kept only under the ``persist`` rules.
 
         Manages persistent proposals across ticks.  A ``Proposal`` with
         ``persist=True`` that is not dispatched is carried forward to
@@ -264,6 +305,10 @@ class DecisionMasterNode(BaseNode):
           keep their pending proposal.
         * Pending proposals exceeding ``max_pending_ticks`` are dropped.
 
+        Parked hand-off proposals are superseded only by a new proposal
+        (persist or not) from the same instinct, and dropped after
+        ``max_handoff_ticks``.
+
         Args:
             proposals: All proposals from this tick's instinct evaluation.
             running_proposals: Currently running proposals keyed by action_id.
@@ -271,7 +316,10 @@ class DecisionMasterNode(BaseNode):
             evaluated_instinct_ids: Instinct IDs that were actually evaluated
                 this tick (passed signal gate and throttle).  ``None`` disables
                 pending-clear logic (backward compat).
+            conflicts: Maps a proposal to the action_ids it conflicts with.
         """
+        new_instinct_ids = {p.instinct_id for p in proposals}
+
         # ── 1. Update pending: supersede with new persist=True proposals ──
         new_persist_ids: set[str] = set()
         for p in proposals:
@@ -280,12 +328,19 @@ class DecisionMasterNode(BaseNode):
                 self._pending[p.instinct_id] = p
                 self._pending_ages[p.instinct_id] = 0
 
-        # ── 2. Clear pending for evaluated instincts that didn't persist ──
+        # ── 2. Clear pending for evaluated instincts that didn't persist.
+        #       A parked hand-off proposal was already *selected* (it stopped
+        #       its owner), so only a fresh proposal from the same instinct
+        #       supersedes it — an instinct going quiet does not cancel it.
         if evaluated_instinct_ids is not None:
             for iid in evaluated_instinct_ids:
                 if iid not in new_persist_ids and iid in self._pending:
                     del self._pending[iid]
                     self._pending_ages.pop(iid, None)
+        for iid in list(self._handoff):
+            if iid in new_instinct_ids:
+                del self._handoff[iid]
+                self._handoff_ages.pop(iid, None)
 
         # ── 3. Age out stale entries ─────────────────────────────────────
         stale: list[str] = []
@@ -297,13 +352,21 @@ class DecisionMasterNode(BaseNode):
             del self._pending[iid]
             del self._pending_ages[iid]
             self.logger.debug("Dropped stale pending proposal", instinct_id=iid)
+        for iid in list(self._handoff_ages):
+            self._handoff_ages[iid] += 1
+            if self._handoff_ages[iid] > self.max_handoff_ticks:
+                del self._handoff[iid]
+                del self._handoff_ages[iid]
+                self.logger.info("Dropped stale hand-off proposal", instinct_id=iid)
 
-        # ── 4. Merge: new proposals + pending that weren't re-proposed ───
-        new_instinct_ids = {p.instinct_id for p in proposals}
+        # ── 4. Merge: new proposals + pending/hand-off not re-proposed ───
         merged = list(proposals)
         for iid, pending_p in self._pending.items():
             if iid not in new_instinct_ids:
                 merged.append(pending_p)
+        for iid, parked_p in self._handoff.items():
+            if iid not in new_instinct_ids and iid not in self._pending:
+                merged.append(parked_p)
 
         self._last_considered = list(merged)
 
@@ -311,42 +374,52 @@ class DecisionMasterNode(BaseNode):
         chosen = await self._strategy.decide_many(merged)
 
         interrupts: list[InterruptRequest] = []
+        to_dispatch: list[Proposal] = []
         for prop in chosen:
-            # Check if this proposal's action_id is already running
-            # with a lower priority and the running action is interruptible
-            running = running_proposals.get(prop.action_id)
-            if (
+            if conflicts is not None:
+                owners = conflicts(prop)
+            else:
+                owners = {prop.action_id} if prop.action_id in running_proposals else set()
+            if not owners:
+                to_dispatch.append(prop)
+                continue
+            # Interrupt only if every owner is a running, interruptible,
+            # lower-priority action; anything else holds the proposal.
+            owner_props = [running_proposals.get(o) for o in sorted(owners)]
+            can_interrupt = all(
                 running is not None
-                and running_interruptible.get(prop.action_id, False)
+                and running_interruptible.get(running.action_id, False)
                 and prop.priority > running.priority
-            ):
-                    interrupts.append(InterruptRequest(
-                        new_proposal           = prop,
-                        requesting_instinct_id = prop.instinct_id,
-                        reason                 = (
-                            f"Higher priority proposal (priority={prop.priority}) "
-                            f"arrived while '{running.action_id}' was running "
-                            f"(priority={running.priority})"
-                        ),
-                    ))
+                for running in owner_props
+            )
+            if not can_interrupt:
+                continue
+            for running in owner_props:
+                assert running is not None
+                interrupts.append(InterruptRequest(
+                    new_proposal           = prop,
+                    requesting_instinct_id = prop.instinct_id,
+                    reason                 = (
+                        f"Higher priority proposal (priority={prop.priority}) "
+                        f"arrived while '{running.action_id}' was running "
+                        f"(priority={running.priority})"
+                    ),
+                    target_action_id       = running.action_id,
+                ))
+            to_dispatch.append(prop)
 
-        # Filter out proposals whose action_id is running and NOT being interrupted
-        interrupted_ids = {ir.new_proposal.action_id for ir in interrupts}
-        to_dispatch = [
-            p for p in chosen
-            if p.action_id not in running_proposals or p.action_id in interrupted_ids
-        ]
-
-        # ── 6. Remove dispatched proposals from pending ──────────────────
+        # ── 6. Remove dispatched proposals from pending / hand-off ───────
         for p in to_dispatch:
             self._pending.pop(p.instinct_id, None)
             self._pending_ages.pop(p.instinct_id, None)
+            self._handoff.pop(p.instinct_id, None)
+            self._handoff_ages.pop(p.instinct_id, None)
 
         if to_dispatch:
             self.logger.debug(
                 "Multi-decision made",
                 dispatching=[p.action_id for p in to_dispatch],
-                interrupting=[ir.new_proposal.action_id for ir in interrupts],
+                interrupting=[ir.target_action_id for ir in interrupts],
                 total_proposals=len(proposals),
                 pending=len(self._pending),
             )

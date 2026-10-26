@@ -307,6 +307,90 @@ class TestOnNewProposalsMany:
         assert len(dispatched) == 0
 
 
+class TestResourceConflictsAndHandOff:
+    """ADR 0005: conflicts over shared resources and parked hand-off proposals."""
+
+    @pytest.mark.asyncio
+    async def test_interrupt_targets_the_resource_owner(self) -> None:
+        dm = DecisionMasterNode(bus=_bus())
+        owner = _proposal("Patrol", priority=40, instinct_id="Planner")
+        new_p = _proposal("Inspect", priority=90, instinct_id="Inspector")
+        dispatched, interrupts = await dm.on_new_proposals_many(
+            [new_p],
+            running_proposals={"Patrol": owner},
+            running_interruptible={"Patrol": True},
+            conflicts=lambda p: {"Patrol"} if p.action_id == "Inspect" else set(),
+        )
+        assert [ir.target_action_id for ir in interrupts] == ["Patrol"]
+        assert interrupts[0].new_proposal is new_p
+        assert dispatched == [new_p]
+
+    @pytest.mark.asyncio
+    async def test_conflict_with_non_interruptible_owner_is_held(self) -> None:
+        dm = DecisionMasterNode(bus=_bus())
+        owner = _proposal("Patrol", priority=40)
+        new_p = _proposal("Inspect", priority=90, instinct_id="Inspector")
+        dispatched, interrupts = await dm.on_new_proposals_many(
+            [new_p],
+            running_proposals={"Patrol": owner},
+            running_interruptible={"Patrol": False},   # mandatory block / reflex-owned
+            conflicts=lambda p: {"Patrol"},
+        )
+        assert dispatched == [] and interrupts == []
+
+    @pytest.mark.asyncio
+    async def test_conflict_with_unknown_claimant_is_held(self) -> None:
+        """An armed reflex's claim is not a running proposal: never interrupted."""
+        dm = DecisionMasterNode(bus=_bus())
+        new_p = _proposal("MoveArm", priority=150)
+        dispatched, interrupts = await dm.on_new_proposals_many(
+            [new_p], running_proposals={}, running_interruptible={},
+            conflicts=lambda p: {"Retract"},
+        )
+        assert dispatched == [] and interrupts == []
+
+    @pytest.mark.asyncio
+    async def test_parked_proposal_survives_a_quiet_instinct(self) -> None:
+        dm = DecisionMasterNode(bus=_bus())
+        parked = _proposal("Inspect", priority=90, instinct_id="Inspector")
+        dm.park(parked)
+        dispatched, _ = await dm.on_new_proposals_many(
+            [], running_proposals={}, running_interruptible={},
+            evaluated_instinct_ids={"Inspector"},     # evaluated, proposed nothing
+        )
+        assert dispatched == [parked]
+        assert dm.handoff_proposals == {}
+
+    @pytest.mark.asyncio
+    async def test_new_proposal_supersedes_parked_one(self) -> None:
+        dm = DecisionMasterNode(bus=_bus())
+        dm.park(_proposal("Inspect", priority=90, instinct_id="Inspector"))
+        fresh = _proposal("Wave", priority=70, instinct_id="Inspector")
+        dispatched, _ = await dm.on_new_proposals_many(
+            [fresh], running_proposals={}, running_interruptible={},
+        )
+        assert dispatched == [fresh]
+
+    @pytest.mark.asyncio
+    async def test_parked_proposal_ages_out(self) -> None:
+        dm = DecisionMasterNode(bus=_bus(), max_handoff_ticks=2)
+        dm.park(_proposal("Inspect", priority=90, instinct_id="Inspector"))
+        blocked = lambda p: {"Patrol"}  # noqa: E731 — owner never releases
+        for _ in range(3):
+            await dm.on_new_proposals_many(
+                [], running_proposals={}, running_interruptible={},
+                conflicts=blocked,
+            )
+        assert dm.handoff_proposals == {}
+
+    @pytest.mark.asyncio
+    async def test_clear_pending_drops_parked_proposal(self) -> None:
+        dm = DecisionMasterNode(bus=_bus())
+        dm.park(_proposal("Inspect", instinct_id="Inspector"))
+        dm.clear_pending("Inspector")
+        assert dm.handoff_proposals == {}
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # Pending proposal persistence tests
 # ══════════════════════════════════════════════════════════════════════════════

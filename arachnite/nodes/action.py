@@ -13,6 +13,7 @@ import time
 from abc import abstractmethod
 from collections.abc import Sequence
 from dataclasses import dataclass
+from enum import Enum
 from typing import Protocol, runtime_checkable
 
 from arachnite.bus import SignalBus
@@ -23,6 +24,7 @@ from arachnite.exceptions import (
     ActionVetoed,
     MandatoryBlockViolation,
     NodeRegistrationError,
+    ResourceConflictError,
     RollbackError,
     StepAbortError,
 )
@@ -33,6 +35,7 @@ from arachnite.models import (
     InterruptPolicy,
     InterruptRequest,
     Proposal,
+    ReflexPreemption,
     Result,
     StepResult,
 )
@@ -80,12 +83,66 @@ class BaseActionNode(BaseNode):
     - Always return a Result — never raise unless unrecoverable.
     - Set node_id to the value InstinctNodes use in Proposal.action_id.
     - Set timeout_s and max_retries to protect against hardware hangs.
+    - Declare ``resources`` — the actuators this action commands. At most one
+      running action owns a resource at any time (ADR 0005); undeclared
+      access is invisible to the framework.
+    - Override ``on_preempted()`` with a forward safe-stop ("brake, keep the
+      grip") if a reflex may take this action's resources mid-execution.
+      execute() must be cancellation-safe: preemption arrives as
+      ``asyncio.CancelledError`` at an ``await``.
 
     Spec reference: Section 5.7.
     """
 
     timeout_s:   float = 5.0
     max_retries: int   = 0
+
+    #: Actuators this action commands (e.g. ``frozenset({"arm", "gripper"})``).
+    resources: frozenset[str] = frozenset()
+
+    #: Upper bound on ``on_preempted()``. A safe-stop that overruns is
+    #: abandoned (logged) so a hung hook cannot hold a reflex back forever.
+    safe_stop_timeout_s: float = 1.0
+
+    async def on_preempted(self, proposal: Proposal, preempted_by: Proposal) -> None:
+        """
+        Safe-stop hook, called after a reflex (``preempted_by``) cancelled this
+        action mid-execution and before the reflex action starts. Bring the
+        actuators to a safe hold — do not undo work here: reversing a physical
+        operation during a hazard can itself be unsafe. Default: no-op.
+        """
+
+    async def _run_safe_stop(
+        self, proposal: Proposal, preempted_by: Proposal,
+    ) -> tuple[bool, BaseException | None]:
+        """
+        Run ``on_preempted()`` bounded by ``safe_stop_timeout_s``. A hook
+        that raises or overruns is logged and reported, never propagated —
+        the preempting reflex must not be held back by a broken safe-stop.
+        Returns ``(rolled_back, error)``.
+        """
+        error: BaseException | None = None
+        try:
+            await asyncio.wait_for(
+                self.on_preempted(proposal, preempted_by),
+                timeout=self.safe_stop_timeout_s,
+            )
+        except asyncio.TimeoutError:
+            self.logger.error(
+                "Safe-stop hook timed out",
+                timeout_s=self.safe_stop_timeout_s,
+            )
+            error = ActionTimeoutError(
+                self.node_id, "on_preempted", self.safe_stop_timeout_s,
+            )
+        except Exception as exc:  # noqa: BLE001
+            self.logger.error(
+                "Safe-stop hook raised",
+                error=str(exc),
+                error_type=type(exc).__name__,
+            )
+            error = exc
+        return False, error
 
     @abstractmethod
     async def execute(self, proposal: Proposal) -> Result:
@@ -127,12 +184,43 @@ class MultiStepActionNode(BaseActionNode):
 
     interrupt_policy: InterruptPolicy = InterruptPolicy.ALWAYS
 
+    #: Run the rollback walk after ``on_preempted()`` when a reflex preempts
+    #: this action. Off by default: undoing work during a hazard can itself
+    #: be unsafe (ADR 0005).
+    rollback_on_preempt: bool = False
+
     def __init__(self, *args: object, **kwargs: object) -> None:
         super().__init__(*args, **kwargs)  # type: ignore[arg-type]
         self._interrupt_requested: bool = False
         self._interrupt_request: InterruptRequest | None = None
         self._current_step: ActionStep | None = None
         self._completed_steps: list[StepResult] = []
+        # Set by a WAIT_FOR_BLOCK reflex while a mandatory block runs: stop
+        # at the first boundary after the block, regardless of policy.
+        self._reflex_preempt_by: Proposal | None = None
+        # True when ActionMasterNode has already reset the run state at
+        # reservation, so an interrupt requested before execute() starts
+        # is kept rather than wiped by execute()'s own reset.
+        self._run_prepared: bool = False
+
+    def _prepare_run(self) -> None:
+        """Reset per-run state at reservation time (called by ActionMasterNode)."""
+        self._interrupt_requested = False
+        self._interrupt_request   = None
+        self._reflex_preempt_by   = None
+        self._completed_steps     = []
+        self._current_step        = None
+        self._run_prepared        = True
+
+    def request_reflex_preempt(self, by: Proposal) -> None:
+        """Ask to be preempted at the first step boundary after the current block."""
+        self._reflex_preempt_by = by
+
+    def _clear_run_state(self) -> None:
+        """Drop per-run state after a cancelled run so nothing looks in-flight."""
+        self._current_step      = None
+        self._reflex_preempt_by = None
+        self._run_prepared      = False
 
     @abstractmethod
     def steps(self) -> list[ActionStep]:
@@ -273,18 +361,20 @@ class MultiStepActionNode(BaseActionNode):
     def execution_state(self) -> ActionExecutionState:
         """Return a snapshot of current execution progress for the Context."""
         completed_names = [sr.step_name for sr in self._completed_steps]
-        # Compute mandatory block remaining time
+        # Remaining worst-case time of the mandatory block the action is in
+        # now: the current step and the non-interruptible steps contiguous
+        # with it. Zero outside a block (later blocks are not counted).
         all_steps    = self.steps()
         current_idx  = next(
             (i for i, s in enumerate(all_steps)
              if self._current_step and s.name == self._current_step.name),
             len(all_steps),
         )
-        remaining_mandatory = sum(
-            (s.timeout_s or self.timeout_s)
-            for s in all_steps[current_idx:]
-            if not s.interruptible
-        )
+        remaining_mandatory = 0.0
+        for s in all_steps[current_idx:]:
+            if s.interruptible:
+                break
+            remaining_mandatory += s.timeout_s or self.timeout_s
         return ActionExecutionState(
             action_id                   = self.node_id,
             current_step                = self._current_step.name if self._current_step else None,
@@ -295,9 +385,15 @@ class MultiStepActionNode(BaseActionNode):
 
     async def execute(self, proposal: Proposal) -> Result:
         """Orchestrates step execution with interrupt and rollback handling."""
-        self._interrupt_requested = False
-        self._interrupt_request   = None
-        self._completed_steps     = []
+        if not self._run_prepared:
+            # Runtime-less call: reset here. Under ActionMasterNode the reset
+            # already happened at reservation, and an interrupt that arrived
+            # since then must survive.
+            self._interrupt_requested = False
+            self._interrupt_request   = None
+            self._reflex_preempt_by   = None
+            self._completed_steps     = []
+        self._run_prepared = False
 
         all_steps  = self.steps()
         start_time = time.monotonic()
@@ -305,6 +401,14 @@ class MultiStepActionNode(BaseActionNode):
         for i, step in enumerate(all_steps):
             self._current_step = step
             pending = all_steps[i + 1:]
+
+            # A WAIT_FOR_BLOCK reflex is waiting: the first interruptible
+            # boundary after the block hands the resources over, whatever
+            # the interrupt policy (policies govern deliberation, not reflexes).
+            if self._reflex_preempt_by is not None and step.interruptible:
+                return await self._handle_reflex_preempt(
+                    proposal, self._reflex_preempt_by, start_time,
+                )
 
             # Check interrupt request before starting this step
             if self._interrupt_requested and step.interruptible:
@@ -455,6 +559,47 @@ class MultiStepActionNode(BaseActionNode):
             rolled_back     = rolled_back,
         )
 
+    async def _run_safe_stop(
+        self, proposal: Proposal, preempted_by: Proposal,
+    ) -> tuple[bool, BaseException | None]:
+        """Safe-stop hook, then the rollback walk if ``rollback_on_preempt``."""
+        rolled_back, error = await super()._run_safe_stop(proposal, preempted_by)
+        if self.rollback_on_preempt:
+            try:
+                await self._rollback_completed(self._completed_steps.copy())
+                rolled_back = True
+            except RollbackError as exc:
+                error = error or exc
+        return rolled_back, error
+
+    async def _handle_reflex_preempt(
+        self,
+        proposal: Proposal,
+        preempted_by: Proposal,
+        start_time: float,
+    ) -> Result:
+        """Hand the resources to a waiting reflex at a step boundary."""
+        stopped_at = self._current_step.name if self._current_step else None
+        self.logger.info(
+            "Action preempted by reflex at step boundary",
+            stopped_at=stopped_at,
+            reflex=preempted_by.instinct_id,
+        )
+        rolled_back, error = await self._run_safe_stop(proposal, preempted_by)
+        self._current_step      = None
+        self._reflex_preempt_by = None
+        return Result(
+            action_id       = self.node_id,
+            success         = False,
+            error           = error,
+            duration_s      = time.monotonic() - start_time,
+            interrupted     = True,
+            preempted       = True,
+            stopped_at_step = stopped_at,
+            step_results    = self._completed_steps.copy(),
+            rolled_back     = rolled_back,
+        )
+
     async def _handle_abort(
         self,
         proposal: Proposal,
@@ -490,14 +635,57 @@ class MultiStepActionNode(BaseActionNode):
 # ActionMasterNode
 # ══════════════════════════════════════════════════════════════════════════════
 
+class LaunchStatus(Enum):
+    """Outcome of ``ActionMasterNode.launch()`` / ``launch_reflex()`` (ADR 0005)."""
+    LAUNCHED  = "launched"   # execute() started as a tracked task
+    BLOCKED   = "blocked"    # conflicts with a running owner; not started
+    ARMED     = "armed"      # reflex waits for its owners to release
+    DEDUPED   = "deduped"    # reflex is already being handled
+    VETOED    = "vetoed"     # an ActionGuard denied the proposal
+    NOT_FOUND = "not_found"  # no ActionNode registered under that action_id
+
+
+@dataclass(frozen=True, slots=True)
+class LaunchOutcome:
+    """What ``launch()`` / ``launch_reflex()`` did with a proposal."""
+
+    status:    LaunchStatus
+    action_id: str
+    #: Running (or armed) action_ids the proposal conflicted with.
+    owners:    frozenset[str] = frozenset()
+
+
+# Stand-in "preempting" proposal handed to on_preempted() when a run is
+# cancelled by shutdown or emergency_stop rather than by a reflex.
+_SHUTDOWN_PROPOSAL = Proposal(
+    instinct_id = "shutdown",
+    action_id   = "__shutdown__",
+    priority    = 9999,
+    urgency     = 1.0,
+    rationale   = "Runtime shutdown cancelled the action",
+)
+
+
 class ActionMasterNode(FaultReportingMixin, BaseNode):
     """
     Routes Proposals to the correct ActionNode, enforces timeouts and
-    retries, and manages interrupt requests for running actions.
+    retries, arbitrates actuator resources, and manages interrupts.
 
-    Supports concurrent dispatch: different ActionNodes can execute in
-    parallel via ``dispatch_many()``.  The same ActionNode cannot run
-    twice concurrently — duplicate ``action_id`` proposals are filtered.
+    Two dispatch styles (ADR 0005):
+
+    - ``launch()`` / ``launch_reflex()`` — used by ArachniteRuntime. All
+      checks and the reservation happen synchronously, ``execute()`` runs as
+      a tracked task, and the call returns at once. Finished Results are
+      collected with ``drain_completed()``; ``wait_idle()`` waits for them.
+    - ``dispatch()`` / ``dispatch_many()`` — await the Result (runtime-less
+      use, ADR 0001).
+
+    An action conflicts with a running one when they share an ``action_id``
+    or a declared resource; at most one running action owns a resource at
+    any time (actuator exclusivity). A deliberative launch that conflicts is
+    BLOCKED. A reflex that conflicts is armed and its owners are preempted
+    according to the reflex's ``ReflexPreemption`` mode; the reflex starts the
+    moment the owners have run their safe-stop and released.
 
     Spec reference: Section 5.7, 17.6.
     """
@@ -511,11 +699,28 @@ class ActionMasterNode(FaultReportingMixin, BaseNode):
         log_sinks: list[BaseLogSink] | None = None,
         agent_node_id: str = "local",
         guards: list[ActionGuard] | None = None,
+        strict_resources: bool = False,
     ) -> None:
         super().__init__(bus, config, log_sinks, agent_node_id)
+        self.strict_resources = strict_resources
         self._nodes: dict[str, BaseActionNode] = {}
         self._running_nodes: dict[str, BaseActionNode] = {}
         self._running_proposals: dict[str, Proposal] = {}
+        # action_id -> "reflex" | "decision" | "direct"
+        self._origins: dict[str, str] = {}
+        # resource -> action_id currently owning it
+        self._owners: dict[str, str] = {}
+        # resource -> armed reflex action_id waiting for it (blocks deliberation)
+        self._claims: dict[str, str] = {}
+        # reflex action_id -> its proposal, waiting for owners to release
+        self._armed: dict[str, Proposal] = {}
+        # running action_id -> reflex proposal that preempted it
+        self._preempted_by: dict[str, Proposal] = {}
+        self._tasks: dict[str, asyncio.Task[Result]] = {}
+        self._buffered: set[asyncio.Task[Result]] = set()
+        self._completed: list[Result] = []
+        self._idle = asyncio.Event()
+        self._idle.set()
         self._guards: list[ActionGuard] = []
         for guard in guards or ():
             self.register_guard(guard)
@@ -523,6 +728,16 @@ class ActionMasterNode(FaultReportingMixin, BaseNode):
     def register(self, node: BaseActionNode) -> None:
         if node.node_id in self._nodes:
             raise NodeRegistrationError(node.node_id, self.node_id)
+        if self.strict_resources and not node.resources:
+            raise NodeRegistrationError(
+                node.node_id,
+                self.node_id,
+                reason=(
+                    f"Action '{node.node_id}' declares no resources; "
+                    "strict_resources requires every action to name the "
+                    "actuators it commands."
+                ),
+            )
         self._nodes[node.node_id] = node
         self.logger.debug("Registered action node", action_node_id=node.node_id)
 
@@ -530,15 +745,15 @@ class ActionMasterNode(FaultReportingMixin, BaseNode):
         """
         Install a synchronous, bounded, no-I/O pre-dispatch veto.
 
-        Guards run in registration order inside ``_dispatch_one``, BEFORE the
-        action executes and OUTSIDE the retry loop. The first deny wins
-        (remaining guards are skipped) and the action's ``execute()`` is never
-        called. A guard that raises FAILS CLOSED (treated as a deny) — unlike
-        ``InstinctMasterNode.set_pre_evaluate_gate``, which fails open, because
-        this is a safety layer.
+        Guards run in registration order BEFORE the action executes and
+        OUTSIDE the retry loop. The first deny wins (remaining guards are
+        skipped) and the action's ``execute()`` is never called. A guard that
+        raises FAILS CLOSED (treated as a deny) — unlike
+        ``InstinctMasterNode.set_pre_evaluate_gate``, which fails open,
+        because this is a safety layer.
 
-        Reflex/safety proposals (``priority >= REFLEX_PRIORITY_FLOOR``) bypass
-        all guards to preserve the framework's reflex-always-fires guarantee.
+        Reflex-arc dispatches (``origin="reflex"``) bypass all guards to
+        preserve the framework's reflex-always-fires guarantee.
         """
         if inspect.iscoroutinefunction(guard):
             raise TypeError(
@@ -571,6 +786,18 @@ class ActionMasterNode(FaultReportingMixin, BaseNode):
     def running_action_ids(self) -> set[str]:
         """Return the set of action_ids currently executing."""
         return set(self._running_nodes)
+
+    def origin_of(self, action_id: str) -> str | None:
+        """Dispatch path of a running action: 'reflex', 'decision' or 'direct'."""
+        return self._origins.get(action_id)
+
+    def armed_reflexes(self) -> dict[str, Proposal]:
+        """Reflex proposals waiting for their owners to release, by action_id."""
+        return dict(self._armed)
+
+    def resource_owners(self) -> dict[str, str]:
+        """Current resource -> owning action_id map (a snapshot)."""
+        return dict(self._owners)
 
     # ── Backward-compat singular accessors ───────────────────────────────
 
@@ -618,19 +845,30 @@ class ActionMasterNode(FaultReportingMixin, BaseNode):
             return node._current_step
         return None
 
+    def remaining_mandatory_s(self) -> float:
+        """Longest remaining mandatory-block time across running actions."""
+        remaining = 0.0
+        for node in self._running_nodes.values():
+            if isinstance(node, MultiStepActionNode):
+                remaining = max(
+                    remaining, node.execution_state().mandatory_block_remaining_s,
+                )
+        return remaining
+
     async def request_interrupt(
         self,
         request: InterruptRequest,
         action_id: str | None = None,
     ) -> None:
         """
-        Signal a running action to stop at its next safe point.
-        If ``action_id`` is None, targets the highest-priority running action.
+        Signal a running action to stop at its next safe point (deliberative
+        interrupt). If ``action_id`` is None, targets
+        ``request.target_action_id`` or else the highest-priority running
+        action. Raises ``MandatoryBlockViolation`` inside a mandatory block —
+        deliberation never cuts into one.
         """
-        if action_id is not None:
-            node = self._running_nodes.get(action_id)
-        else:
-            node = self.current_action()
+        target = action_id or request.target_action_id
+        node = self._running_nodes.get(target) if target is not None else self.current_action()
         if node is None:
             return
         if not self.is_interruptible(node.node_id):
@@ -642,10 +880,21 @@ class ActionMasterNode(FaultReportingMixin, BaseNode):
         if isinstance(node, MultiStepActionNode):
             node.request_interrupt(request)
 
+    def interrupt_all(self, request: InterruptRequest) -> None:
+        """
+        Deliver ``request`` to every running multi-step action, bypassing the
+        mandatory-block gate: the flag is held until the block ends. Used by
+        graceful shutdown so ROLLBACK actions stop at a boundary and unwind.
+        """
+        for node in self._running_nodes.values():
+            if isinstance(node, MultiStepActionNode):
+                node.request_interrupt(request)
+
     async def setup(self) -> None:
         await asyncio.gather(*(n.setup() for n in self._nodes.values()))
 
     async def teardown(self) -> None:
+        await self.cancel_all(timeout=self.safe_stop_budget_s())
         await asyncio.gather(*(n.cancel_background_tasks() for n in self._nodes.values()))
         await asyncio.gather(*(n.teardown() for n in self._nodes.values()))
 
@@ -661,15 +910,373 @@ class ActionMasterNode(FaultReportingMixin, BaseNode):
     async def notify_tick_end(self, tick: int, duration_s: float) -> None:
         await asyncio.gather(*(n.on_tick_end(tick, duration_s) for n in self._nodes.values()))
 
-    # ── Single dispatch (backward compat) ────────────────────────────────
+    # ── Conflicts ────────────────────────────────────────────────────────
+
+    def _resources_of(self, action_id: str) -> frozenset[str]:
+        node = self._nodes.get(action_id)
+        return node.resources if node is not None else frozenset()
+
+    def _running_conflicts(self, action_id: str) -> set[str]:
+        """Running action_ids sharing ``action_id`` or one of its resources."""
+        owners: set[str] = set()
+        if action_id in self._running_nodes:
+            owners.add(action_id)
+        for resource in self._resources_of(action_id):
+            owner = self._owners.get(resource)
+            if owner is not None:
+                owners.add(owner)
+        return owners
+
+    def _claim_conflicts(self, action_id: str) -> set[str]:
+        """Armed reflexes (other than ``action_id``) claiming its resources."""
+        claimants: set[str] = set()
+        for resource in self._resources_of(action_id):
+            claimant = self._claims.get(resource)
+            if claimant is not None and claimant != action_id:
+                claimants.add(claimant)
+        if action_id in self._armed:
+            claimants.add(action_id)
+        return claimants
+
+    def conflicting_owners(self, proposal: Proposal) -> set[str]:
+        """
+        Action_ids a proposal conflicts with: running owners of its
+        action_id or resources, and armed reflexes that claimed them.
+        Empty means it can start now.
+        """
+        return (
+            self._running_conflicts(proposal.action_id)
+            | self._claim_conflicts(proposal.action_id)
+        )
+
+    # ── Launch (non-blocking, used by the runtime) ───────────────────────
+
+    def launch(self, proposal: Proposal, *, origin: str = "decision") -> LaunchOutcome:
+        """
+        Start ``proposal``'s action as a tracked task and return immediately.
+
+        Synchronous all the way to ``create_task``: lookup, conflict check,
+        guards and resource reservation cannot interleave with another
+        launch. The Result arrives later via ``drain_completed()``; a guard
+        veto is buffered there at once.
+        """
+        action_id = proposal.action_id
+        node = self._nodes.get(action_id)
+        if node is None:
+            return LaunchOutcome(LaunchStatus.NOT_FOUND, action_id)
+
+        owners = self.conflicting_owners(proposal)
+        if owners:
+            return LaunchOutcome(LaunchStatus.BLOCKED, action_id, frozenset(owners))
+
+        if self._guards and not self._bypasses_guards(proposal, origin):
+            verdict = self._run_guards(proposal)
+            if not verdict.allow:
+                self.logger.info(
+                    "Action vetoed by guard",
+                    action_id=action_id,
+                    reason=verdict.reason,
+                )
+                self._completed.append(Result(
+                    action_id=action_id,
+                    success=False,
+                    error=ActionVetoed(action_id, verdict.reason),
+                ))
+                return LaunchOutcome(LaunchStatus.VETOED, action_id)
+
+        self._start(node, proposal, origin, buffer=True)
+        return LaunchOutcome(LaunchStatus.LAUNCHED, action_id)
+
+    def launch_reflex(
+        self,
+        proposal: Proposal,
+        preemption: ReflexPreemption = ReflexPreemption.PREEMPT,
+    ) -> LaunchOutcome:
+        """
+        Launch a reflex action, taking its resources from running owners.
+
+        - No conflict: start now.
+        - Already running or armed as a reflex: de-duplicated.
+        - Conflict: the reflex is armed and claims its resources (no
+          deliberative launch may take them meanwhile). Each deliberative
+          owner is preempted — cancelled now (PREEMPT, or WAIT_FOR_BLOCK
+          outside a mandatory block), or at the first boundary after its
+          mandatory block (WAIT_FOR_BLOCK inside one). A running reflex is
+          never preempted; the new reflex waits for it. The armed reflex
+          starts as soon as every owner has finished its safe-stop and
+          released (see ``_admit_armed``).
+        """
+        action_id = proposal.action_id
+        node = self._nodes.get(action_id)
+        if node is None:
+            return LaunchOutcome(LaunchStatus.NOT_FOUND, action_id)
+        if action_id in self._armed or self._origins.get(action_id) == "reflex":
+            return LaunchOutcome(LaunchStatus.DEDUPED, action_id)
+
+        owners = self._running_conflicts(action_id)
+        claimants = self._claim_conflicts(action_id)
+        if not owners and not claimants:
+            self._start(node, proposal, "reflex", buffer=True)
+            return LaunchOutcome(LaunchStatus.LAUNCHED, action_id)
+
+        self._armed[action_id] = proposal
+        for resource in node.resources:
+            self._claims.setdefault(resource, action_id)
+        self._idle.clear()
+
+        for owner_id in owners:
+            if self._origins.get(owner_id) == "reflex":
+                continue  # a reflex is never preempted; wait for it
+            owner = self._running_nodes[owner_id]
+            in_block = (
+                isinstance(owner, MultiStepActionNode) and not owner.is_interruptible()
+            )
+            if preemption is ReflexPreemption.WAIT_FOR_BLOCK and in_block:
+                assert isinstance(owner, MultiStepActionNode)
+                owner.request_reflex_preempt(proposal)
+                self.logger.info(
+                    "Reflex armed; owner preempted after its mandatory block",
+                    action_id=action_id,
+                    owner=owner_id,
+                )
+            else:
+                self._preempt(owner_id, proposal)
+
+        return LaunchOutcome(
+            LaunchStatus.ARMED, action_id, frozenset(owners | claimants),
+        )
+
+    def _preempt(self, owner_id: str, by: Proposal) -> None:
+        """Cancel a running owner on behalf of reflex ``by`` (once)."""
+        if owner_id in self._preempted_by:
+            return
+        task = self._tasks.get(owner_id)
+        if task is None or task.done():
+            return
+        self._preempted_by[owner_id] = by
+        self.logger.info(
+            "Preempting action for reflex",
+            action_id=owner_id,
+            reflex_action=by.action_id,
+            reflex=by.instinct_id,
+        )
+        task.cancel()
+
+    def _admit_armed(self) -> None:
+        """Start every armed reflex whose owners have all released."""
+        for action_id, proposal in sorted(
+            self._armed.items(), key=lambda kv: kv[1].priority, reverse=True,
+        ):
+            if self._running_conflicts(action_id):
+                continue
+            del self._armed[action_id]
+            for resource, claimant in list(self._claims.items()):
+                if claimant == action_id:
+                    del self._claims[resource]
+            node = self._nodes.get(action_id)
+            if node is None:
+                continue
+            self._start(node, proposal, "reflex", buffer=True)
+
+    # ── Task lifecycle ───────────────────────────────────────────────────
+
+    def _start(
+        self,
+        node: BaseActionNode,
+        proposal: Proposal,
+        origin: str,
+        *,
+        buffer: bool,
+    ) -> asyncio.Task[Result]:
+        """Reserve ``node`` and its resources, then start execute() as a task."""
+        action_id = node.node_id
+        self._running_nodes[action_id] = node
+        self._running_proposals[action_id] = proposal
+        self._origins[action_id] = origin
+        for resource in node.resources:
+            self._owners[resource] = action_id
+        if isinstance(node, MultiStepActionNode):
+            node._prepare_run()
+        self._idle.clear()
+
+        self.logger.info(
+            "Dispatching action",
+            action_id=action_id,
+            priority=proposal.priority,
+            origin=origin,
+        )
+        task = asyncio.get_running_loop().create_task(
+            self._run(node, proposal), name=f"action:{action_id}",
+        )
+        self._tasks[action_id] = task
+        if buffer:
+            self._buffered.add(task)
+        task.add_done_callback(self._on_task_done)
+        return task
+
+    async def _run(self, node: BaseActionNode, proposal: Proposal) -> Result:
+        """Task body: execute with retries; on cancellation run the safe-stop."""
+        action_id = node.node_id
+        start = time.monotonic()
+        try:
+            try:
+                result = await self._execute_with_retry(node, proposal)
+            except asyncio.CancelledError:
+                by = self._preempted_by.get(action_id)
+                preempted = by is not None
+                rolled_back, error = await node._run_safe_stop(
+                    proposal, by if by is not None else _SHUTDOWN_PROPOSAL,
+                )
+                stopped_at: str | None = None
+                step_results: list[StepResult] = []
+                if isinstance(node, MultiStepActionNode):
+                    if node._current_step is not None:
+                        stopped_at = node._current_step.name
+                    step_results = node._completed_steps.copy()
+                    node._clear_run_state()
+                if not preempted:
+                    self.logger.info(
+                        "Action cancelled; safe-stop complete",
+                        action_id=action_id,
+                        stopped_at=stopped_at,
+                    )
+                    raise  # shutdown / external cancel: safe-stop done, propagate
+                current = asyncio.current_task()
+                if current is not None and hasattr(current, "uncancel"):
+                    current.uncancel()  # Python 3.11+: the cancel was consumed
+                result = Result(
+                    action_id       = action_id,
+                    success         = False,
+                    error           = error,
+                    interrupted     = True,
+                    preempted       = True,
+                    stopped_at_step = stopped_at,
+                    step_results    = step_results,
+                    rolled_back     = rolled_back,
+                )
+            result = Result(
+                action_id       = result.action_id,
+                success         = result.success,
+                output          = result.output,
+                error           = result.error,
+                duration_s      = time.monotonic() - start,
+                interrupted     = result.interrupted,
+                stopped_at_step = result.stopped_at_step,
+                step_results    = result.step_results,
+                rolled_back     = result.rolled_back,
+                preempted       = result.preempted,
+            )
+        finally:
+            self._release(action_id)
+
+        self.logger.info(
+            "Action complete",
+            action_id=action_id,
+            success=result.success,
+            preempted=result.preempted,
+            duration_ms=round(result.duration_s * 1000, 2),
+        )
+        return result
+
+    def _release(self, action_id: str) -> None:
+        """Free the action's reservation and resources, then admit armed reflexes."""
+        self._running_nodes.pop(action_id, None)
+        self._running_proposals.pop(action_id, None)
+        self._origins.pop(action_id, None)
+        self._preempted_by.pop(action_id, None)
+        self._tasks.pop(action_id, None)
+        for resource, owner in list(self._owners.items()):
+            if owner == action_id:
+                del self._owners[resource]
+        self._admit_armed()
+
+    def _on_task_done(self, task: asyncio.Task[Result]) -> None:
+        """Buffer a launched task's Result and signal idleness."""
+        buffered = task in self._buffered
+        self._buffered.discard(task)
+        if buffered and not task.cancelled():
+            exc = task.exception()
+            if exc is not None:
+                self.logger.error(
+                    "Action task failed",
+                    error=str(exc),
+                    error_type=type(exc).__name__,
+                )
+            else:
+                self._completed.append(task.result())
+        if not self._running_nodes and not self._armed:
+            self._idle.set()
+
+    def drain_completed(self) -> list[Result]:
+        """Return (and clear) the Results of launched actions finished so far."""
+        completed, self._completed = self._completed, []
+        return completed
+
+    async def wait_idle(self, timeout: float | None = None) -> bool:
+        """
+        Wait until no action is running or armed. Returns False on timeout.
+        Results of the finished launches are then available from
+        ``drain_completed()``.
+        """
+        if not self._running_nodes and not self._armed:
+            return True
+        try:
+            await asyncio.wait_for(self._idle.wait(), timeout=timeout)
+        except asyncio.TimeoutError:
+            return False
+        return True
+
+    async def wait_until_interruptible(self, timeout: float) -> bool:
+        """Wait until no running action is inside a mandatory block."""
+        deadline = time.monotonic() + timeout
+        while not self.is_interruptible():
+            if time.monotonic() >= deadline:
+                return False
+            await asyncio.sleep(0.005)
+        return True
+
+    async def cancel(self, action_id: str, timeout: float | None = None) -> None:
+        """Cancel one running action (safe-stop runs) and wait for it."""
+        self._armed.pop(action_id, None)
+        for resource, claimant in list(self._claims.items()):
+            if claimant == action_id:
+                del self._claims[resource]
+        task = self._tasks.get(action_id)
+        if task is None or task.done():
+            return
+        task.cancel()
+        await asyncio.wait({task}, timeout=timeout)
+
+    async def cancel_all(self, timeout: float | None = None) -> None:
+        """
+        Cancel every running action — each runs its safe-stop, no rollback —
+        and drop armed reflexes. Used by shutdown and emergency_stop.
+        """
+        self._armed.clear()
+        self._claims.clear()
+        tasks = [t for t in self._tasks.values() if not t.done()]
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.wait(tasks, timeout=timeout)
+        if not self._running_nodes:
+            self._idle.set()
+
+    def safe_stop_budget_s(self) -> float:
+        """Time to allow cancelled actions to finish their safe-stop."""
+        budgets = [n.safe_stop_timeout_s for n in self._running_nodes.values()]
+        return max(budgets, default=0.0) + 0.5
+
+    # ── Single dispatch (awaiting; runtime-less use) ─────────────────────
 
     async def dispatch(
         self, proposal: Proposal, *, origin: str | None = None,
     ) -> Result:
         """
         Route a single Proposal to its ActionNode by matching
-        ``proposal.action_id``.  For concurrent dispatch of multiple
-        proposals, use ``dispatch_many()``.
+        ``proposal.action_id`` and await its Result.  For concurrent dispatch
+        of multiple proposals, use ``dispatch_many()``; the runtime uses the
+        non-blocking ``launch()`` instead.
 
         ``origin`` names the dispatch path: ``"reflex"`` for the reflex arc,
         ``"decision"`` for the deliberative path. Guards are bypassed only for
@@ -724,74 +1331,45 @@ class ActionMasterNode(FaultReportingMixin, BaseNode):
         self, proposal: Proposal, origin: str | None = None,
     ) -> Result:
         """Execute a single proposal with retry logic and running-state tracking."""
-        node = self._nodes.get(proposal.action_id)
+        action_id = proposal.action_id
+        node = self._nodes.get(action_id)
         if node is None:
-            raise ActionNotFoundError(proposal.action_id)
+            raise ActionNotFoundError(action_id)
 
-        # Atomic check-and-set: skip if already running
-        if proposal.action_id in self._running_nodes:
+        # Atomic check-and-set (no await until the reservation in _start):
+        # skip if the action, or one of its resources, is already taken.
+        owners = self.conflicting_owners(proposal)
+        if owners:
             self.logger.debug(
-                "Action already running, skipping",
-                action_id=proposal.action_id,
+                "Action conflicts with a running action, skipping",
+                action_id=action_id,
+                owners=sorted(owners),
             )
-            return Result(
-                action_id=proposal.action_id,
-                success=False,
-                error=RuntimeError("action already running"),
+            error: BaseException = (
+                RuntimeError("action already running")
+                if action_id in owners
+                else ResourceConflictError(action_id, sorted(owners))
             )
-        self._running_nodes[proposal.action_id] = node
-        self._running_proposals[proposal.action_id] = proposal
+            return Result(action_id=action_id, success=False, error=error)
 
         # Pre-dispatch guards — deterministic veto BEFORE execution and outside
         # the retry loop. Reflex-arc dispatches bypass guards (always fire).
         if self._guards and not self._bypasses_guards(proposal, origin):
             verdict = self._run_guards(proposal)
             if not verdict.allow:
-                self._running_nodes.pop(proposal.action_id, None)
-                self._running_proposals.pop(proposal.action_id, None)
                 self.logger.info(
                     "Action vetoed by guard",
-                    action_id=proposal.action_id,
+                    action_id=action_id,
                     reason=verdict.reason,
                 )
                 return Result(
-                    action_id=proposal.action_id,
+                    action_id=action_id,
                     success=False,
-                    error=ActionVetoed(proposal.action_id, verdict.reason),
+                    error=ActionVetoed(action_id, verdict.reason),
                 )
 
-        start = time.monotonic()
-
-        self.logger.info(
-            "Dispatching action",
-            action_id=proposal.action_id,
-            priority=proposal.priority,
-        )
-
-        try:
-            result = await self._execute_with_retry(node, proposal)
-            result = Result(
-                action_id       = result.action_id,
-                success         = result.success,
-                output          = result.output,
-                error           = result.error,
-                duration_s      = time.monotonic() - start,
-                interrupted     = result.interrupted,
-                stopped_at_step = result.stopped_at_step,
-                step_results    = result.step_results,
-                rolled_back     = result.rolled_back,
-            )
-        finally:
-            self._running_nodes.pop(proposal.action_id, None)
-            self._running_proposals.pop(proposal.action_id, None)
-
-        self.logger.info(
-            "Action complete",
-            action_id=proposal.action_id,
-            success=result.success,
-            duration_ms=round(result.duration_s * 1000, 2),
-        )
-        return result
+        task = self._start(node, proposal, origin or "direct", buffer=False)
+        return await task
 
     def _run_guards(self, proposal: Proposal) -> GuardVerdict:
         """Consult guards in order. First deny wins; a raising guard fails closed."""
@@ -838,8 +1416,7 @@ class ActionMasterNode(FaultReportingMixin, BaseNode):
                 # Spec contract: execute() must always return a Result, never
                 # raise. If a user node violates that contract,
                 # log loudly and convert to a failed Result rather than letting
-                # the exception escape gather() and crash the tick. Mirrors
-                # InstinctMasterNode.evaluate_all's defensive pattern.
+                # the exception escape the task and lose the Result.
                 self.logger.error(
                     "Action execute() raised",
                     action_id=node.node_id,

@@ -592,37 +592,43 @@ class TestReflexNormalMerge:
 
     @pytest.mark.asyncio
     async def test_merged_results_ordered_reflex_before_normal(self) -> None:
-        """After one tick where both fire, _last_results has reflex first."""
+        """Results of a tick where both fire surface next tick, reflex first.
+
+        Actions run as tasks (ADR 0005): the reflex action is launched (and
+        started) before the deliberative one, so it completes first and
+        leads ``ctx.last_results`` on the following tick.
+        """
         rt, reflex_action, normal_action = self._build_merge_runtime()
         await rt.start()
         await rt.pause()  # prevent background loop from running extra ticks
+        await rt.wait_idle(1.0)
         reflex_action.calls.clear()
         normal_action.calls.clear()
 
         await rt.tick()
+        assert await rt.wait_idle(1.0)
 
-        # Both actions must have been called at least once
-        assert len(reflex_action.calls) >= 1
-        assert len(normal_action.calls) >= 1
+        # Both actions must have been called once
+        assert len(reflex_action.calls) == 1
+        assert len(normal_action.calls) == 1
 
-        # Merged list: exactly 2 results, reflex first
-        assert len(rt._last_results) == 2
-        assert rt._last_results[0].action_id == "EmergencyStop"
-        assert rt._last_results[1].action_id == "CoolDownAction"
-        assert rt._last_results[0].success is True
-        assert rt._last_results[1].success is True
+        await rt.tick()  # previous tick's results land in this tick's context
+        results = rt.context.snapshot().last_results
+        assert [r.action_id for r in results] == ["EmergencyStop", "CoolDownAction"]
+        assert all(r.success for r in results)
 
-        # _last_result is the first (reflex) result
-        assert rt._last_result is not None
-        assert rt._last_result.action_id == "EmergencyStop"
+        # last_result is the first (reflex) result
+        last = rt.context.snapshot().last_result
+        assert last is not None
+        assert last.action_id == "EmergencyStop"
 
         await rt.stop()
 
     @pytest.mark.asyncio
     async def test_merge_is_consistent_across_multiple_ticks(self) -> None:
-        """The reflex-first merge must be consistent across successive
-        ticks. On each tick where both instincts fire, _last_results
-        must contain both results in reflex-before-normal order."""
+        """The reflex-first order must be consistent across successive
+        ticks. Each tick's context carries both results of the previous
+        tick in reflex-before-normal order."""
         bus = SignalBus()
         context = ContextNode(history_length=5)
 
@@ -658,24 +664,22 @@ class TestReflexNormalMerge:
         )
         await rt.start()
         await rt.pause()  # prevent background loop from running extra ticks
+        await rt.wait_idle(1.0)
         reflex_action.calls.clear()
         normal_action.calls.clear()
 
+        await rt.tick()
+        assert await rt.wait_idle(1.0)
         for tick_num in range(1, 4):
             await rt.tick()
+            results = rt.context.snapshot().last_results
+            assert [r.action_id for r in results] == [
+                "EmergencyStop", "CoolDownAction",
+            ], f"tick {tick_num}: expected reflex result first, then normal"
+            assert await rt.wait_idle(1.0)
 
-            assert len(rt._last_results) == 2, (
-                f"tick {tick_num}: expected 2 merged results"
-            )
-            assert rt._last_results[0].action_id == "EmergencyStop", (
-                f"tick {tick_num}: reflex result must be first"
-            )
-            assert rt._last_results[1].action_id == "CoolDownAction", (
-                f"tick {tick_num}: normal result must be second"
-            )
-
-        # Each action was called once per tick (3 explicit ticks)
-        assert len(reflex_action.calls) == 3
-        assert len(normal_action.calls) == 3
+        # Each action was called once per tick (4 explicit ticks)
+        assert len(reflex_action.calls) == 4
+        assert len(normal_action.calls) == 4
 
         await rt.stop()

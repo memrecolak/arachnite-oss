@@ -16,7 +16,6 @@ from typing import Protocol, runtime_checkable
 from arachnite.bus import SignalBus
 from arachnite.context import ContextNode
 from arachnite.exceptions import (
-    ActionNotFoundError,
     MandatoryBlockViolation,
     ReflexConflictError,
 )
@@ -26,17 +25,21 @@ from arachnite.models import (
     ActionExecutionState,
     Context,
     DecisionEvent,
-    InterruptRequest,
     Permission,
     Proposal,
+    ReflexPreemption,
     Result,
     ShutdownPhase,
     Signal,
 )
-from arachnite.nodes.action import ActionMasterNode, BaseActionNode
+from arachnite.nodes.action import ActionMasterNode, BaseActionNode, LaunchStatus
 from arachnite.nodes.base import BaseNode
 from arachnite.nodes.decision import DecisionMasterNode
-from arachnite.nodes.instinct import BaseInstinctNode, InstinctMasterNode
+from arachnite.nodes.instinct import (
+    BaseInstinctNode,
+    BaseReflexInstinctNode,
+    InstinctMasterNode,
+)
 from arachnite.nodes.sense import BaseSenseNode, SenseMasterNode
 from arachnite.shutdown import ShutdownCoordinator
 from arachnite.supervisor import NodeSupervisor
@@ -370,39 +373,20 @@ class ArachniteRuntime:
     async def emergency_stop(self) -> None:
         """
         Immediate shutdown — skips phases 1-3, abandons mandatory blocks.
+
+        Stops the tick loop, then cancels every running action: each one's
+        ``on_preempted()`` safe-stop hook runs (bounded), no rollback. This is
+        a shutdown path; cutting into a mandatory block to *respond* to a
+        hazard is the job of a PREEMPT reflex (ADR 0005).
         Spec reference: Section 15.3.
         """
         self._running = False
         self._stop_event.set()
-        # Force-interrupt all running actions
-        emergency = Proposal(
-            instinct_id="emergency_stop",
-            action_id="__emergency__",
-            priority=9999,
-            urgency=1.0,
-            rationale="Emergency stop triggered",
-        )
-        req = InterruptRequest(
-            new_proposal=emergency,
-            requesting_instinct_id="emergency_stop",
-            reason="emergency_stop() called",
-        )
         self._logger.info("Emergency stop initiated")
-        for node in self._action_master.current_actions().values():
-            try:
-                if hasattr(node, "request_interrupt"):
-                    node.request_interrupt(req)
-                    self._logger.info(
-                        "Emergency interrupt delivered",
-                        action_id=node.node_id,
-                    )
-            except Exception:  # noqa: BLE001
-                pass
-        # Cancel and await the tick loop BEFORE tearing masters down, so an
-        # in-flight tick cannot race node teardown (use-after-teardown). Unlike
-        # the graceful path (ShutdownCoordinator phase 3) there is no grace wait —
-        # emergency means stop now. Skipped when called from within the loop
-        # itself (self-cancel would deadlock).
+        # Cancel and await the tick loop BEFORE stopping actions and tearing
+        # masters down, so no tick can launch anything new or race node
+        # teardown. Skipped when called from within the loop itself
+        # (self-cancel would deadlock).
         loop_task = self._loop_task
         if (
             loop_task is not None
@@ -413,6 +397,9 @@ class ArachniteRuntime:
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await loop_task
             self._loop_task = None
+        await self._action_master.cancel_all(
+            timeout=self._action_master.safe_stop_budget_s(),
+        )
         await asyncio.gather(
             self._sense_master.teardown(),
             self._instinct_master.teardown(),
@@ -525,6 +512,9 @@ class ArachniteRuntime:
         """
         node = self._action_master.get_node(node_id)
         if node is not None:
+            await self._action_master.cancel(
+                node_id, timeout=node.safe_stop_timeout_s + 0.5,
+            )
             with contextlib.suppress(Exception):
                 await node.teardown()
         self._action_master.unregister(node_id)
@@ -602,6 +592,71 @@ class ArachniteRuntime:
         if self._sense_master.returned_this_tick(signal):
             return
         self._state_update_buffer.append(signal)
+
+    # ── Reflex arbitration ────────────────────────────────────────────────────
+
+    def _tick_reflex_nodes(self) -> list[BaseReflexInstinctNode]:
+        """Reflex nodes evaluated by the tick's reflex stage."""
+        return list(self._instinct_master.reflex_nodes)
+
+    async def _launch_reflexes(self, reflex_proposals: list[Proposal]) -> None:
+        """
+        Launch reflex proposals (priority order) through the action master's
+        arbitration, then yield once so a started reflex action enters
+        ``execute()`` now rather than after the rest of the tick.
+        """
+        started = False
+        for rp in reflex_proposals:
+            # Emit a framework-level "Reflex fired" event so safety auditors
+            # can reconstruct every reflex-arc activation from the log stream
+            # alone (spec §13.3). This is INFO-level and low-volume because
+            # reflex activations are rare by design.
+            self._logger.info(
+                "Reflex fired",
+                instinct_id=rp.instinct_id,
+                action_id=rp.action_id,
+                priority=rp.priority,
+                urgency=rp.urgency,
+            )
+            node = self._instinct_master.get_node(rp.instinct_id)
+            preemption = (
+                node.preemption
+                if isinstance(node, BaseReflexInstinctNode)
+                else ReflexPreemption.PREEMPT
+            )
+            outcome = self._action_master.launch_reflex(rp, preemption)
+            if outcome.status is LaunchStatus.NOT_FOUND:
+                self._logger.warning(
+                    "Reflex dispatch skipped: action not found",
+                    action_id=rp.action_id,
+                    instinct_id=rp.instinct_id,
+                )
+            elif outcome.status is LaunchStatus.ARMED:
+                started = True
+                self._logger.info(
+                    "Reflex armed; taking resources from running action(s)",
+                    action_id=rp.action_id,
+                    owners=sorted(outcome.owners),
+                    preemption=preemption.value,
+                )
+            elif outcome.status is LaunchStatus.LAUNCHED:
+                started = True
+            else:
+                self._logger.debug(
+                    "Reflex already being handled",
+                    action_id=rp.action_id,
+                    instinct_id=rp.instinct_id,
+                )
+        if started:
+            await asyncio.sleep(0)
+
+    async def wait_idle(self, timeout: float | None = None) -> bool:
+        """
+        Wait until no action is running or waiting for resources (actions run
+        as tasks across ticks). Returns False on timeout. Their Results reach
+        ``ctx.last_results`` on the next tick.
+        """
+        return await self._action_master.wait_idle(timeout)
 
     # ── Tick loop ─────────────────────────────────────────────────────────────
 
@@ -696,6 +751,13 @@ class ArachniteRuntime:
         buffered_state_updates = self._state_update_buffer
         self._state_update_buffer = []
 
+        # Results of actions that finished since the previous tick's context
+        # (actions run as tasks across ticks — ADR 0005). Completion order.
+        completed = self._action_master.drain_completed()
+        if completed:
+            self._last_results = completed
+            self._last_result = completed[0]
+
         # 1. Sense
         signals = await self._sense_master.read_all()
 
@@ -728,11 +790,11 @@ class ArachniteRuntime:
             results=self._last_results,
         )
 
-        # Prior-tick results have now been snapshotted into ``ctx`` and are
-        # observable by instincts via ``ctx.last_results`` / ``ctx.last_result``
-        # for the duration of this tick.  Clear the runtime-side slots so this
-        # tick's reflex/normal dispatch writes (below) cannot accumulate with
-        # older values — gives ``last_results`` precisely one tick of lifetime.
+        # Results that completed since the previous tick have now been
+        # snapshotted into ``ctx`` and are observable by instincts via
+        # ``ctx.last_results`` / ``ctx.last_result`` for the duration of this
+        # tick.  Clear the runtime-side slots — gives ``last_results``
+        # precisely one tick of lifetime.
         self._last_results = []
         self._last_result = None
 
@@ -753,11 +815,13 @@ class ArachniteRuntime:
             self._emit_stage(instrumenter, "context", now - stage_start)
             stage_start = now
 
-        # 3. Reflex pass — bypass decision, stays sequential (safety-critical).
-        #    Per ADR 0002 this stage charges evaluate + dispatch together.
-        reflex_results: list[Result] = []
+        # 3. Reflex pass — bypass decision. Reflex actions are launched, not
+        #    awaited, and take their resources from running owners per the
+        #    reflex's preemption mode (ADR 0005). Charged to `reflex`.
         try:
-            reflex_proposals = await self._instinct_master.evaluate_reflexes(ctx)
+            reflex_proposals = await self._instinct_master.evaluate_reflexes(
+                ctx, nodes=self._tick_reflex_nodes(),
+            )
         except ReflexConflictError as exc:
             # reflex_conflict='raise' flags an ambiguous reflex configuration,
             # but aborting the tick would also suppress every reflex and the
@@ -769,39 +833,7 @@ class ArachniteRuntime:
                 instinct_ids=exc.node_ids,
             )
             reflex_proposals = list(exc.proposals)
-        for rp in reflex_proposals:
-            # Emit a framework-level "Reflex fired" event so safety auditors
-            # can reconstruct every reflex-arc activation from the log stream
-            # alone (spec §13.3). This is INFO-level and low-volume because
-            # reflex activations are rare by design.
-            self._logger.info(
-                "Reflex fired",
-                instinct_id=rp.instinct_id,
-                action_id=rp.action_id,
-                priority=rp.priority,
-                urgency=rp.urgency,
-            )
-            try:
-                result = await self._action_master.dispatch(rp, origin="reflex")
-            except ActionNotFoundError:
-                self._logger.warning(
-                    "Reflex dispatch skipped: action not found",
-                    action_id=rp.action_id,
-                    instinct_id=rp.instinct_id,
-                )
-                continue
-            if not result.success and not result.interrupted:
-                self._logger.warning(
-                    "Reflex action did not succeed",
-                    action_id=rp.action_id,
-                    instinct_id=rp.instinct_id,
-                    error=str(result.error),
-                )
-            reflex_results.append(result)
-
-        if reflex_results:
-            self._last_results = reflex_results
-            self._last_result = reflex_results[0]
+        await self._launch_reflexes(reflex_proposals)
 
         if instrumenter is not None:
             now = time.monotonic()
@@ -818,8 +850,12 @@ class ArachniteRuntime:
 
         # 5. Decide — build interruptibility map, resolve proposals, notify
         #    rejected, and issue interrupts (all charged to `decide`).
+        # A reflex-owned action is never interruptible by deliberation.
         running_interruptible = {
-            aid: self._action_master.is_interruptible(aid)
+            aid: (
+                self._action_master.origin_of(aid) != "reflex"
+                and self._action_master.is_interruptible(aid)
+            )
             for aid in self._action_master.running_action_ids()
         }
 
@@ -828,6 +864,7 @@ class ArachniteRuntime:
             running_proposals=self._action_master.current_proposals(),
             running_interruptible=running_interruptible,
             evaluated_instinct_ids=self._instinct_master.last_evaluated_ids,
+            conflicts=self._action_master.conflicting_owners,
         )
 
         # Notify rejected instincts (includes carried-forward pending proposals)
@@ -839,20 +876,21 @@ class ArachniteRuntime:
 
         # Issue interrupts
         for interrupt_req in interrupts:
+            target = interrupt_req.target_action_id or interrupt_req.new_proposal.action_id
             try:
                 await self._action_master.request_interrupt(
-                    interrupt_req, action_id=interrupt_req.new_proposal.action_id,
+                    interrupt_req, action_id=target,
                 )
             except MandatoryBlockViolation as exc:
                 self._logger.warning(
                     "Interrupt blocked by mandatory step",
-                    action_id=interrupt_req.new_proposal.action_id,
+                    action_id=target,
                     detail=str(exc),
                 )
             except Exception as exc:  # noqa: BLE001
                 self._logger.error(
                     "Interrupt request failed",
-                    action_id=interrupt_req.new_proposal.action_id,
+                    action_id=target,
                     error=str(exc),
                 )
 
@@ -884,16 +922,25 @@ class ArachniteRuntime:
             self._emit_stage(instrumenter, "decide", now - stage_start)
             stage_start = now
 
-        # 6. Act — dispatch selected proposals concurrently, then tick-end hooks
-        if to_dispatch:
-            results = await self._action_master.dispatch_many(
-                to_dispatch, origin="decision",
-            )
-            self._last_results = reflex_results + results
-            # dispatch_many returns [] when every proposal was filtered (all their
-            # action_ids are already running); combined with an empty reflex_results
-            # that would IndexError on [0]. Fall back to None (the tick's default).
-            self._last_result = self._last_results[0] if self._last_results else None
+        # 6. Act — launch the selected proposals as tasks (not awaited: the
+        #    next tick runs while they execute). A proposal whose action or
+        #    resources are still owned — e.g. it just interrupted the owner,
+        #    which is unwinding — is parked for hand-off and retried.
+        best: dict[str, Proposal] = {}
+        for p in to_dispatch:
+            existing = best.get(p.action_id)
+            if existing is None or p.priority > existing.priority:
+                best[p.action_id] = p
+        for p in best.values():
+            outcome = self._action_master.launch(p, origin="decision")
+            if outcome.status is LaunchStatus.BLOCKED:
+                self._decision_master.park(p)
+            elif outcome.status is LaunchStatus.NOT_FOUND:
+                self._logger.warning(
+                    "Dispatch skipped: action not found",
+                    action_id=p.action_id,
+                    instinct_id=p.instinct_id,
+                )
 
         # 7. Tick-end hooks on all leaf nodes (charged to `act` per ADR 0002)
         tick_duration = time.monotonic() - tick_start

@@ -182,6 +182,24 @@ class InterruptPolicy(Enum):
     ROLLBACK   = "rollback"    # stop + undo completed non-interruptible steps
 
 
+class ReflexPreemption(Enum):
+    """
+    What a reflex does when its target action needs a resource (actuator)
+    that a running action owns. Declared per reflex node. See ADR 0005.
+
+    PREEMPT
+        Take the resource now: the owner is cancelled at its current await
+        — even inside a mandatory block — its ``on_preempted()`` safe-stop
+        hook runs, and only then does the reflex action start.
+    WAIT_FOR_BLOCK
+        Respect mandatory blocks: if the owner is inside one, the reflex is
+        armed and the owner is preempted at the first step boundary after
+        the block. Outside a block it behaves like PREEMPT.
+    """
+    PREEMPT        = "preempt"
+    WAIT_FOR_BLOCK = "wait_for_block"
+
+
 @dataclass(slots=True)
 class ActionStep:
     """
@@ -207,6 +225,10 @@ class InterruptRequest:
     requesting_instinct_id: str
     reason:                 str = ""
     timestamp:              float = field(default_factory=time.monotonic)
+    #: The running action to stop. None means the proposal's own action_id
+    #: (same-action re-proposal). Set when the conflict is over a shared
+    #: resource held by a *different* action (ADR 0005).
+    target_action_id:       str | None = None
 
 
 @dataclass(slots=True)

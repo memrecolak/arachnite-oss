@@ -20,7 +20,7 @@ from arachnite.bus import SignalBus
 from arachnite.config import NodeConfig
 from arachnite.exceptions import NodeRegistrationError, ReflexConflictError
 from arachnite.logging import BaseLogSink
-from arachnite.models import Context, Proposal
+from arachnite.models import Context, Proposal, ReflexPreemption
 from arachnite.nodes.base import BaseNode, FaultReportingMixin
 
 
@@ -101,12 +101,20 @@ class BaseReflexInstinctNode(BaseInstinctNode):
     - No LLM calls, no blocking I/O.
     - Use priority ≥ 200 to distinguish from normal instincts.
     - Set reflex: bool = True (already set by this class).
+    - Set ``preemption`` to choose what happens when the target action needs a
+      resource a running action owns (ADR 0005): PREEMPT (default) cuts in
+      even inside a mandatory block via the owner's safe-stop hook;
+      WAIT_FOR_BLOCK lets a running mandatory block finish first.
+    - Set ``trigger_on_signals`` to have the event-driven reflex lane
+      evaluate this reflex the moment a matching signal arrives
+      (``ArachniteRuntime(reflex_mode="event")``).
 
     Spec reference: Section 5.5.
     """
 
     reflex: bool = True
     priority: int = 200
+    preemption: ReflexPreemption = ReflexPreemption.PREEMPT
 
 
 class InstinctMasterNode(FaultReportingMixin, BaseNode):

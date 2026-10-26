@@ -77,6 +77,21 @@ class ActionNotFoundError(ArachniteError):
         self.action_id = action_id
 
 
+class ResourceConflictError(ArachniteError):
+    """
+    A proposal's action needs a resource (actuator) that a running action
+    owns. At most one running action owns a resource at any time (ADR 0005).
+    """
+
+    def __init__(self, action_id: str, owners: list[str]) -> None:
+        super().__init__(
+            f"Action '{action_id}' conflicts with running action(s) {owners} "
+            "over a shared resource."
+        )
+        self.action_id = action_id
+        self.owners    = owners
+
+
 class ActionVetoed(ArachniteError):
     """
     An ActionGuard denied a proposal before dispatch.

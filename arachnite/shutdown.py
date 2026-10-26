@@ -79,18 +79,16 @@ class ShutdownCoordinator:
             with contextlib.suppress(Exception):
                 await self._on_shutdown_action()
 
-        # Phase 2: Drain reflexes — any in-flight reflex evaluation completes;
-        # no new ticks start because _running is False.
+        # Phase 2: Drain reflexes — the in-flight tick (and its reflex stage)
+        # finishes; no new ticks start because _running is False. Actions run
+        # as tasks outside the tick (ADR 0005), so this wait is one tick long.
         self._phase = ShutdownPhase.DRAIN_REFLEXES
-
-        # Phase 3: Complete mandatory block — wait for the loop task to finish
-        # naturally up to the computed timeout.
-        self._phase = ShutdownPhase.COMPLETE_MANDATORY
         loop_task = runtime._loop_task
         if loop_task is not None and not loop_task.done():
-            timeout = self._mandatory_timeout(runtime)
             try:
-                await asyncio.wait_for(asyncio.shield(loop_task), timeout=timeout)
+                await asyncio.wait_for(
+                    asyncio.shield(loop_task), timeout=self._teardown_timeout_s,
+                )
             except asyncio.TimeoutError:
                 # ``asyncio.TimeoutError`` is aliased to the builtin
                 # ``TimeoutError`` only on Python >= 3.11; catch the asyncio
@@ -100,11 +98,14 @@ class ShutdownCoordinator:
                     await loop_task
             runtime._loop_task = None
 
-        # Phase 4: Interrupt all remaining actions — send a shutdown interrupt
-        # to every running action so they exit cleanly (ROLLBACK policy runs).
-        self._phase = ShutdownPhase.INTERRUPT_ACTION
-        running = runtime._action_master.current_actions()
-        if running:
+        # Phase 3: Complete mandatory block — deliver the shutdown interrupt
+        # now (it is held while a block runs) and let every running action
+        # leave its mandatory block, up to the computed timeout. Each action
+        # then stops at the first boundary after its block — no new step
+        # starts once shutdown has begun.
+        self._phase = ShutdownPhase.COMPLETE_MANDATORY
+        action_master = runtime._action_master
+        if action_master.running_action_ids():
             shutdown_proposal = Proposal(
                 instinct_id = "shutdown",
                 action_id   = "__shutdown__",
@@ -112,14 +113,21 @@ class ShutdownCoordinator:
                 urgency     = 1.0,
                 rationale   = "Graceful shutdown",
             )
-            req = InterruptRequest(
+            action_master.interrupt_all(InterruptRequest(
                 new_proposal           = shutdown_proposal,
                 requesting_instinct_id = "shutdown",
                 reason                 = "stop() called",
-            )
-            for action_id in running:
-                with contextlib.suppress(Exception):
-                    await runtime._action_master.request_interrupt(req, action_id=action_id)
+            ))
+            await action_master.wait_until_interruptible(self._mandatory_timeout(runtime))
+
+        # Phase 4: Interrupt remaining actions — wait for the interrupted
+        # actions to exit cleanly (ROLLBACK actions unwind), then cancel what
+        # is left (single-step actions, NEVER policy) with its safe-stop.
+        self._phase = ShutdownPhase.INTERRUPT_ACTION
+        if action_master.running_action_ids() and not await action_master.wait_idle(
+            timeout=self._teardown_timeout_s,
+        ):
+            await action_master.cancel_all(timeout=action_master.safe_stop_budget_s())
 
         # Phase 5: Stop supervisors — cancel restart tasks, then mark nodes STOPPED.
         self._phase = ShutdownPhase.STOP_SUPERVISORS

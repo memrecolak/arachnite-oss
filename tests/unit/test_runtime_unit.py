@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import time
 from unittest.mock import AsyncMock
 
@@ -150,6 +151,40 @@ class _IdleMultiStep(MultiStepActionNode):
         self, step: ActionStep, proposal: Proposal, completed: list[StepResult]
     ) -> StepResult:
         return StepResult(step_name=step.name, success=True)
+
+
+class _SafeStopMultiStep(MultiStepActionNode):
+    """Long mandatory step; records safe-stop calls and rollbacks."""
+    node_id          = "_SafeStopMultiStep"
+    interrupt_policy = InterruptPolicy.ROLLBACK
+    timeout_s        = 10.0
+
+    def __init__(self, *args: object, **kwargs: object) -> None:
+        super().__init__(*args, **kwargs)
+        self.in_block = False
+        self.safe_stops: list[str] = []
+        self.rolled_back = False
+
+    async def _undo(self) -> None:
+        self.rolled_back = True
+
+    def steps(self) -> list[ActionStep]:
+        return [
+            ActionStep("prep",  interruptible=False, rollback=self._undo),
+            ActionStep("block", interruptible=False),
+            ActionStep("tail",  interruptible=True),
+        ]
+
+    async def execute_step(
+        self, step: ActionStep, proposal: Proposal, completed: list[StepResult]
+    ) -> StepResult:
+        if step.name == "block":
+            self.in_block = True
+            await asyncio.sleep(5.0)
+        return StepResult(step_name=step.name, success=True)
+
+    async def on_preempted(self, proposal: Proposal, preempted_by: Proposal) -> None:
+        self.safe_stops.append(preempted_by.instinct_id)
 
 
 class TestTickActionState:
@@ -766,45 +801,80 @@ class _ReflexB(BaseInstinctNode):
     node_id = "_ReflexB"
     priority = 200
     reflex = True
+    target = "RecordingAction"
 
     async def evaluate(self, ctx: object) -> Proposal | None:
-        return Proposal(instinct_id=self.node_id, action_id="RecordingAction",
+        return Proposal(instinct_id=self.node_id, action_id=self.target,
                         priority=self.priority, urgency=1.0)
+
+
+class _RecordingActionB(RecordingAction):
+    node_id = "RecordingActionB"
+
+
+def _two_reflex_runtime(
+    second_target: str,
+) -> tuple[ArachniteRuntime, RecordingAction, RecordingAction]:
+    bus = SignalBus()
+    sm  = SenseMasterNode(bus=bus)
+    im  = InstinctMasterNode(bus=bus)
+    dm  = DecisionMasterNode(bus=bus, strategy=GreedyDecisionNode(bus=bus))
+    am  = ActionMasterNode(bus=bus)
+
+    sm.register(ConstantSenseNode(bus=bus))
+    im.register(_ReflexA(bus=bus))
+    reflex_b = _ReflexB(bus=bus)
+    reflex_b.target = second_target
+    im.register(reflex_b)
+    action = RecordingAction(bus=bus)
+    action_b = _RecordingActionB(bus=bus)
+    am.register(action)
+    am.register(action_b)
+
+    rt = ArachniteRuntime(
+        sense_master=sm, context=ContextNode(),
+        instinct_master=im, decision_master=dm,
+        action_master=am, bus=bus, tick_rate_hz=1000.0,
+    )
+    return rt, action, action_b
 
 
 class TestReflexResultAccumulation:
     @pytest.mark.asyncio
     async def test_multiple_reflex_results_all_preserved(self) -> None:
         """All reflex results must be accumulated, not overwritten (#7)"""
-        bus = SignalBus()
-        sm  = SenseMasterNode(bus=bus)
-        im  = InstinctMasterNode(bus=bus)
-        dm  = DecisionMasterNode(bus=bus, strategy=GreedyDecisionNode(bus=bus))
-        am  = ActionMasterNode(bus=bus)
-
-        sm.register(ConstantSenseNode(bus=bus))
-        im.register(_ReflexA(bus=bus))
-        im.register(_ReflexB(bus=bus))
-        action = RecordingAction(bus=bus)
-        am.register(action)
-
-        rt = ArachniteRuntime(
-            sense_master=sm, context=ContextNode(),
-            instinct_master=im, decision_master=dm,
-            action_master=am, bus=bus, tick_rate_hz=1000.0,
-        )
+        rt, action, action_b = _two_reflex_runtime("RecordingActionB")
         await rt.start()
         await rt.pause()  # stop the background loop racing the manual tick
+        await rt.wait_idle(1.0)
         action.calls.clear()  # clear any calls from background loop
+        action_b.calls.clear()
         # Stay paused — ``rt.tick()`` is a testing shim that bypasses
         # ``_paused`` by design (see ``ArachniteRuntime.tick`` docstring).
-        # Resuming here would let the background loop reset ``_last_results``
-        # mid-assertion (line 519 of runtime.py).
         await rt.tick()
+        assert await rt.wait_idle(1.0)
 
-        # Both reflexes fired → both results in _last_results
-        assert len(action.calls) >= 2
-        assert len(rt._last_results) >= 2
+        # Both reflexes fired → both results reach the next tick's context
+        assert len(action.calls) == 1
+        assert len(action_b.calls) == 1
+        await rt.tick()
+        results = rt.context.snapshot().last_results
+        assert {r.action_id for r in results} == {"RecordingAction", "RecordingActionB"}
+        await rt.stop()
+
+    @pytest.mark.asyncio
+    async def test_reflexes_sharing_a_target_run_it_once(self) -> None:
+        """A reflex whose action is already running as a reflex is de-duplicated."""
+        rt, action, _ = _two_reflex_runtime("RecordingAction")
+        await rt.start()
+        await rt.pause()
+        await rt.wait_idle(1.0)
+        action.calls.clear()
+
+        await rt.tick()
+        assert await rt.wait_idle(1.0)
+
+        assert len(action.calls) == 1
         await rt.stop()
 
 
@@ -1032,16 +1102,24 @@ class TestStaleResultsCleared:
         await rt.pause()
         action.calls.clear()
 
-        # Tick 1: instinct fires, action dispatched — results populated
+        # Tick 1: instinct fires, action launched
         await rt.tick()
+        assert await rt.wait_idle(1.0)
         assert len(action.calls) == 1, "tick 1 should dispatch exactly one action"
-        assert len(rt._last_results) == 1
-        assert rt._last_result is not None
 
-        # Tick 2: instinct returns None — no proposals, no dispatch
+        # Tick 2: tick 1's result is in context; instinct returns None
         await rt.tick()
-        assert rt._last_results == [], "_last_results must be empty after idle tick"
-        assert rt._last_result is None, "_last_result must be None after idle tick"
+        snap = rt.context.snapshot()
+        assert len(snap.last_results) == 1
+        assert snap.last_result is not None
+
+        # Tick 3: nothing completed since tick 2 — results must not linger
+        await rt.tick()
+        snap = rt.context.snapshot()
+        assert snap.last_results == [], "last_results must be empty after idle tick"
+        assert snap.last_result is None, "last_result must be None after idle tick"
+        assert rt._last_results == []
+        assert rt._last_result is None
         await rt.stop()
 
 
@@ -1219,35 +1297,27 @@ class TestEmergencyStopLogEvents:
         assert "Emergency stop initiated" in messages
 
     @pytest.mark.asyncio
-    async def test_emergency_stop_emits_interrupt_delivered_per_node(self) -> None:
-        from arachnite.logging import BaseLogSink, LogEvent, LogLevel
+    async def test_emergency_stop_safe_stops_running_action(self) -> None:
+        """emergency_stop() cancels a running action mid-step — even inside a
+        mandatory block — after running its safe-stop hook, never rollback."""
+        import asyncio
 
-        captured: list[LogEvent] = []
-
-        class CaptureSink(BaseLogSink):
-            async def emit(self, event: LogEvent) -> None:
-                captured.append(event)
-
-        sink = CaptureSink(level=LogLevel.DEBUG)
         rt, am, _ = _build_rt()
-        rt._logger._sinks = [sink]
+        node = _SafeStopMultiStep(bus=rt.bus)
+        am.register(node)
         await rt.start()
-
-        # Place a MultiStepActionNode (which has request_interrupt) in current_actions
-        node = _IdleMultiStep(bus=rt.bus)
-        am._running_nodes[node.node_id] = node
-        am._running_proposals[node.node_id] = Proposal(
-            instinct_id="test", action_id=node.node_id, priority=100, urgency=0.5,
+        am.launch(
+            Proposal(instinct_id="test", action_id=node.node_id, priority=100, urgency=0.5),
         )
+        for _ in range(20):
+            if node.in_block:
+                break
+            await asyncio.sleep(0.01)
+        assert node.in_block
 
         await rt.emergency_stop()
 
-        import asyncio
-        await asyncio.sleep(0)
-
-        delivered = [
-            ev for ev in captured
-            if ev.message == "Emergency interrupt delivered"
-        ]
-        assert len(delivered) >= 1
-        assert delivered[0].data["action_id"] == "_IdleMultiStep"
+        assert node.safe_stops == ["shutdown"]
+        assert node.rolled_back is False
+        assert am.running_action_ids() == set()
+        assert node._current_step is None

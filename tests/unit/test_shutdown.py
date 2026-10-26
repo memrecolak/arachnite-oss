@@ -3,14 +3,20 @@
 from __future__ import annotations
 
 import asyncio
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import MagicMock
 
 import pytest
 
 from arachnite import ShutdownCoordinator, SignalBus
 from arachnite.context import ContextNode
-from arachnite.models import InterruptRequest, ShutdownPhase
-from arachnite.nodes.action import ActionMasterNode
+from arachnite.models import (
+    ActionStep,
+    InterruptPolicy,
+    Proposal,
+    ShutdownPhase,
+    StepResult,
+)
+from arachnite.nodes.action import ActionMasterNode, MultiStepActionNode
 from arachnite.nodes.decision import DecisionMasterNode, GreedyDecisionNode
 from arachnite.nodes.instinct import InstinctMasterNode
 from arachnite.nodes.sense import SenseMasterNode
@@ -169,35 +175,85 @@ class TestShutdownTeardownTimeout:
 
 # ── Interrupt-action phase (lines 104-119) ────────────────────────────────────
 
+class _ShutdownProbe(MultiStepActionNode):
+    """Five short steps: a two-step mandatory block, then interruptible ones."""
+    node_id = "_ShutdownProbe"
+    timeout_s = 10.0
+
+    def __init__(self, *args: object, **kwargs: object) -> None:
+        super().__init__(*args, **kwargs)
+        self.executed: list[str] = []
+        self.undone: list[str] = []
+        self.safe_stops = 0
+
+    def _undo(self, name: str):  # type: ignore[no-untyped-def]
+        async def _rollback() -> None:
+            self.undone.append(name)
+        return _rollback
+
+    def steps(self) -> list[ActionStep]:
+        return [
+            ActionStep("lower", interruptible=False, rollback=self._undo("lower")),
+            ActionStep("close", interruptible=False, rollback=self._undo("close")),
+            ActionStep("raise", interruptible=True),
+            ActionStep("move",  interruptible=True),
+            ActionStep("drop",  interruptible=True),
+        ]
+
+    async def execute_step(
+        self, step: ActionStep, proposal: Proposal, completed: list[StepResult]
+    ) -> StepResult:
+        self.executed.append(step.name)
+        await asyncio.sleep(0.05)
+        return StepResult(step_name=step.name, success=True)
+
+    async def on_preempted(self, proposal: Proposal, preempted_by: Proposal) -> None:
+        self.safe_stops += 1
+
+
+def _launch_probe(rt: ArachniteRuntime, probe: MultiStepActionNode) -> None:
+    rt._action_master.register(probe)
+    rt._action_master.launch(Proposal(
+        instinct_id="test", action_id=probe.node_id, priority=50, urgency=0.5,
+    ))
+
+
 class TestShutdownInterruptAction:
     @pytest.mark.asyncio
-    async def test_interrupt_sent_when_action_is_running(self) -> None:
+    async def test_running_rollback_action_completes_block_then_unwinds(self) -> None:
+        """Phase 3 lets the mandatory block finish; phase 4's interrupt stops
+        the action at the next boundary and its ROLLBACK actually runs."""
         sc = ShutdownCoordinator()
         rt = _make_runtime(shutdown_coordinator=sc)
-
-        mock_action = MagicMock()
-        rt._action_master.current_actions = MagicMock(return_value={"Act": mock_action})  # type: ignore[method-assign]
-        rt._action_master.request_interrupt = AsyncMock()  # type: ignore[method-assign]
+        probe = _ShutdownProbe(bus=rt.bus)
+        probe.interrupt_policy = InterruptPolicy.ROLLBACK
+        _launch_probe(rt, probe)
+        await asyncio.sleep(0.01)           # inside "lower" (mandatory)
 
         await sc.execute(rt)
 
-        rt._action_master.request_interrupt.assert_called_once()
-        call_arg = rt._action_master.request_interrupt.call_args[0][0]
-        assert isinstance(call_arg, InterruptRequest)
-        assert call_arg.reason == "stop() called"
+        assert probe.executed == ["lower", "close"]   # block completed, no more
+        assert probe.undone == ["close", "lower"]     # reverse-order rollback ran
+        assert probe.safe_stops == 0
+        assert rt._action_master.running_action_ids() == set()
         assert sc.completed
 
     @pytest.mark.asyncio
-    async def test_interrupt_exception_does_not_abort_shutdown(self) -> None:
-        sc = ShutdownCoordinator()
+    async def test_action_ignoring_interrupts_is_cancelled_with_safe_stop(self) -> None:
+        """A NEVER-policy action outliving the grace period is cancelled; its
+        safe-stop hook runs and shutdown still completes."""
+        sc = ShutdownCoordinator(teardown_timeout_s=0.1)
         rt = _make_runtime(shutdown_coordinator=sc)
+        probe = _ShutdownProbe(bus=rt.bus)
+        probe.interrupt_policy = InterruptPolicy.NEVER
+        _launch_probe(rt, probe)
+        await asyncio.sleep(0.01)
 
-        rt._action_master.current_actions = MagicMock(return_value={"Act": MagicMock()})  # type: ignore[method-assign]
-        rt._action_master.request_interrupt = AsyncMock(  # type: ignore[method-assign]
-            side_effect=RuntimeError("interrupt failed")
-        )
+        await sc.execute(rt)
 
-        await sc.execute(rt)   # must not propagate
+        assert probe.safe_stops == 1
+        assert probe.undone == []
+        assert rt._action_master.running_action_ids() == set()
         assert sc.completed
 
 

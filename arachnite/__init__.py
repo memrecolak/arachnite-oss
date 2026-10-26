@@ -28,6 +28,7 @@ from arachnite.exceptions import (
     DependencyValidationError,
     PathTraversalError,
     PermissionValidationError,
+    ResourceConflictError,
     UnsafeCodecError,
 )
 from arachnite.framework_config import (
@@ -67,6 +68,7 @@ from arachnite.models import (
     NodeState,
     Permission,
     Proposal,
+    ReflexPreemption,
     RemoteNodeState,
     RestartPolicy,
     Result,
@@ -81,6 +83,8 @@ from arachnite.nodes.action import (
     ActionMasterNode,
     BaseActionNode,
     GuardVerdict,
+    LaunchOutcome,
+    LaunchStatus,
     MultiStepActionNode,
 )
 from arachnite.nodes.active_inference import ActiveInferenceDecisionNode
@@ -141,6 +145,7 @@ __all__ = [
     "StepResult",
     "InterruptPolicy",
     "InterruptRequest",
+    "ReflexPreemption",
     "ActionExecutionState",
     "MergePolicy",
     "NodeFaultSignal",
@@ -172,6 +177,7 @@ __all__ = [
     "DependencyValidationError",
     "PathTraversalError",
     "PermissionValidationError",
+    "ResourceConflictError",
     "UnsafeCodecError",
     # Web dashboard
     "SignalDashboard",
@@ -223,6 +229,8 @@ __all__ = [
     "ActionMasterNode",
     "ActionGuard",
     "GuardVerdict",
+    "LaunchOutcome",
+    "LaunchStatus",
     # Testing helpers
     "make_signal",
     "make_proposal",
