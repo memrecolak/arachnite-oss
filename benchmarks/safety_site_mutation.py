@@ -200,6 +200,7 @@ SITES: tuple[Site, ...] = (
                     "ActionMasterNode._redirect_handoffs",
                     "ActionMasterNode.cancel",
                     "ActionMasterNode.close",
+                    "ActionMasterNode._drop_armed",
                 ),
             ),
         ),

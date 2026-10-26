@@ -44,6 +44,16 @@ def _bus() -> SignalBus:
     return SignalBus()
 
 
+async def _settle(node: LLMInstinctNode) -> None:
+    """
+    Wait for the node's in-flight background LLM call. Leaving a
+    ``patch.dict(sys.modules, ...)`` block while that thread still runs lets
+    it import the real ``anthropic`` package later, during another test.
+    """
+    if node._pending is not None:
+        await node._pending
+
+
 def _tool_use_block(name: str, inp: dict[str, Any]) -> SimpleNamespace:
     return SimpleNamespace(type="tool_use", name=name, input=inp)
 
@@ -100,6 +110,7 @@ class TestLLMInstinctNodeProposal:
             await node.evaluate(_ctx())
             await asyncio.sleep(0.05)
             result = await node.evaluate(_ctx())
+            await _settle(node)
 
         assert result is not None
         assert result.action_id == "CoolDownAction"
@@ -118,6 +129,7 @@ class TestLLMInstinctNodeProposal:
             await node.evaluate(_ctx())
             await asyncio.sleep(0.05)
             result = await node.evaluate(_ctx())
+            await _settle(node)
 
         assert result is None
 
@@ -135,6 +147,7 @@ class TestLLMInstinctNodeProposal:
             await node.evaluate(_ctx())
             await asyncio.sleep(0.05)
             result = await node.evaluate(_ctx())
+            await _settle(node)
 
         assert result is None
 
@@ -148,6 +161,7 @@ class TestLLMInstinctNodeProposal:
             await node.evaluate(_ctx())
             await asyncio.sleep(0.05)
             result = await node.evaluate(_ctx())
+            await _settle(node)
 
         assert result is None
 
@@ -160,7 +174,7 @@ class TestLLMInstinctNodeProposal:
         mock_mod.Anthropic = MagicMock(return_value=broken)  # type: ignore[attr-defined]
         with patch.dict(sys.modules, {"anthropic": mock_mod}):
             result = await node.evaluate(_ctx())
-            await asyncio.sleep(0.05)
+            await _settle(node)
 
         assert result is None   # no exception raised, cached stays None
 

@@ -21,7 +21,7 @@ from arachnite.config import NodeConfig
 from arachnite.exceptions import NodeRegistrationError, ReflexConflictError
 from arachnite.logging import BaseLogSink
 from arachnite.models import Context, Proposal, ReflexPreemption
-from arachnite.nodes.base import BaseNode, FaultReportingMixin
+from arachnite.nodes.base import BaseNode, FaultReportingMixin, gather_settled
 
 
 class BaseInstinctNode(BaseNode):
@@ -210,8 +210,8 @@ class InstinctMasterNode(FaultReportingMixin, BaseNode):
 
     async def teardown(self) -> None:
         all_nodes = [*self._normal_nodes.values(), *self._reflex_nodes.values()]
-        await asyncio.gather(*(n.cancel_background_tasks() for n in all_nodes))
-        await asyncio.gather(*(n.teardown() for n in all_nodes))
+        await gather_settled(*(n.cancel_background_tasks() for n in all_nodes))
+        await gather_settled(*(n.teardown() for n in all_nodes))
 
     async def on_pause(self) -> None:
         all_nodes = [*self._normal_nodes.values(), *self._reflex_nodes.values()]

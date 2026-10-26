@@ -10,15 +10,19 @@ import pytest
 
 from arachnite import SignalBus
 from arachnite.exceptions import (
+    ActionNotFoundError,
     ActionTimeoutError,
     NodeRegistrationError,
     ResourceConflictError,
     RollbackError,
 )
+from arachnite.logging import BaseLogSink
 from arachnite.models import (
     ActionStep,
     InterruptPolicy,
     InterruptRequest,
+    LogEvent,
+    LogLevel,
     Proposal,
     ReflexPreemption,
     Result,
@@ -1340,3 +1344,258 @@ class TestSecondReviewRegressions:
         assert [(r.action_id, r.interrupted) for r in am2.drain_completed()] == [
             ("Direct", True),
         ]
+
+
+# ── Third review round (docs/audits 2026-10-26, action findings X1–X11) ───────
+
+class _SignalledBrake(Gated):
+    """Gated action whose safe-stop ends by setting ``brake_done``."""
+
+    def __init__(self, bus: SignalBus, node_id: str, resources: set[str]) -> None:
+        super().__init__(bus, node_id, resources)
+        self.brake_done = asyncio.Event()
+        self.brakes: list[str] = []
+
+    async def on_preempted(self, proposal: Proposal, preempted_by: Proposal) -> None:
+        self.brakes.append(preempted_by.action_id)
+        await asyncio.sleep(0.01)
+        self.brake_done.set()
+
+
+class _CaptureSink(BaseLogSink):
+    def __init__(self) -> None:
+        super().__init__(LogLevel.DEBUG)
+        self.messages: list[str] = []
+
+    async def emit(self, event: LogEvent) -> None:
+        self.messages.append(event.message)
+
+
+class TestThirdReviewRegressions:
+    @pytest.mark.parametrize("how", ["cancel", "cancel_all"])
+    @pytest.mark.parametrize("path", ["launch", "dispatch"])
+    @pytest.mark.asyncio
+    async def test_cancel_landing_as_the_safe_stop_ends_keeps_the_result(
+        self, how: str, path: str,
+    ) -> None:
+        """X1: a master cancel in the turn a safe-stop finishes still yields the Result"""
+        am = ActionMasterNode(bus=SignalBus())
+        owner = _SignalledBrake(am.bus, "A", {"arm"})
+        am.register(owner)
+        _gated(am, "R", {"arm"}, hold=False)
+
+        async def cancel_at_brake_end() -> None:
+            await owner.brake_done.wait()
+            await (am.cancel("A") if how == "cancel" else am.cancel_all())
+
+        killer = asyncio.ensure_future(cancel_at_brake_end())
+        if path == "launch":
+            am.launch(_p("A"))
+            await owner.started.wait()
+            am.launch_reflex(_p("R", 250))
+            await asyncio.wait_for(killer, 2.0)
+            assert await am.wait_idle(2.0)
+            result = _results_by_id(am)["A"]
+        else:
+            caller = asyncio.ensure_future(am.dispatch(_p("A")))
+            await owner.started.wait()
+            am.launch_reflex(_p("R", 250))
+            await asyncio.wait_for(killer, 2.0)
+            result = await caller
+        assert result.interrupted is True and result.preempted is True
+        assert owner.brakes == ["R"]
+
+    @pytest.mark.asyncio
+    async def test_preempt_landing_as_the_hand_off_safe_stop_ends(self) -> None:
+        """X1: a PREEMPT reflex in the turn a hand-off safe-stop ends keeps the owner's Result"""
+        am = ActionMasterNode(bus=SignalBus())
+
+        class Owner(MultiStepActionNode):
+            node_id = "O"
+            resources = frozenset({"arm"})
+            timeout_s = 10.0
+
+            def __init__(self, bus: SignalBus) -> None:
+                super().__init__(bus)
+                self.in_block = asyncio.Event()
+                self.go = asyncio.Event()
+                self.brake_done = asyncio.Event()
+
+            def steps(self) -> list[ActionStep]:
+                return [ActionStep("a"), ActionStep("blk", interruptible=False),
+                        ActionStep("c")]
+
+            async def execute_step(
+                self, step: ActionStep, proposal: Proposal, completed: list[StepResult],
+            ) -> StepResult:
+                if step.name == "blk":
+                    self.in_block.set()
+                    await self.go.wait()
+                return StepResult(step_name=step.name, success=True)
+
+            async def on_preempted(self, proposal: Proposal, preempted_by: Proposal) -> None:
+                await asyncio.sleep(0.01)
+                self.brake_done.set()
+
+        owner = Owner(am.bus)
+        am.register(owner)
+        _gated(am, "W", {"arm"}, hold=False)
+        _gated(am, "PR", {"arm"}, hold=False)
+        am.launch(_p("O"))
+        await owner.in_block.wait()
+        am.launch_reflex(_p("W", 220), ReflexPreemption.WAIT_FOR_BLOCK)
+
+        async def preempt_at_brake_end() -> None:
+            await owner.brake_done.wait()
+            am.launch_reflex(_p("PR", 250))
+
+        second = asyncio.ensure_future(preempt_at_brake_end())
+        owner.go.set()
+        await second
+        assert await am.wait_idle(2.0)
+        assert _results_by_id(am)["O"].preempted is True
+
+    @pytest.mark.asyncio
+    async def test_preempt_reaches_an_action_that_swallowed_the_cancel(self) -> None:
+        """X3: an execute() that turns the cancel into a Result still gets its safe-stop"""
+
+        class Swallower(BaseActionNode):
+            node_id = "Swallower"
+            resources = frozenset({"arm"})
+
+            def __init__(self, bus: SignalBus) -> None:
+                super().__init__(bus)
+                self.started = asyncio.Event()
+                self.brakes = 0
+
+            async def execute(self, proposal: Proposal) -> Result:
+                self.started.set()
+                try:
+                    await asyncio.sleep(5.0)
+                except asyncio.CancelledError:
+                    return Result(action_id=self.node_id, success=False)
+                return Result(action_id=self.node_id, success=True)
+
+            async def on_preempted(self, proposal: Proposal, preempted_by: Proposal) -> None:
+                self.brakes += 1
+
+        am = ActionMasterNode(bus=SignalBus())
+        node = Swallower(am.bus)
+        am.register(node)
+        _gated(am, "R", {"arm"}, hold=False)
+        am.launch(_p("Swallower"))
+        await node.started.wait()
+        am.launch_reflex(_p("R", 250))
+        assert await am.wait_idle(2.0)
+        assert node.brakes == 1
+        assert _results_by_id(am)["Swallower"].preempted is True
+
+    @pytest.mark.asyncio
+    async def test_step_timeout_holds_when_the_step_swallows_its_cancel(self) -> None:
+        """X4: a step whose inner wait_for swallows the timer's cancel is still cut on time"""
+
+        class Stepper(MultiStepActionNode):
+            node_id = "S"
+            resources = frozenset({"arm"})
+            timeout_s = 10.0
+
+            def steps(self) -> list[ActionStep]:
+                return [ActionStep("s1", timeout_s=0.1)]
+
+            async def execute_step(
+                self, step: ActionStep, proposal: Proposal, completed: list[StepResult],
+            ) -> StepResult:
+                loop = asyncio.get_running_loop()
+                ack: asyncio.Future[str] = loop.create_future()
+                loop.call_at(loop.time() + 0.1, ack.set_result, "ack")
+                await asyncio.wait_for(ack, 5.0)
+                await asyncio.sleep(1.0)
+                return StepResult(step_name=step.name, success=True)
+
+        am = ActionMasterNode(bus=SignalBus())
+        am.register(Stepper(am.bus))
+        started = time.perf_counter()
+        result = await am.dispatch(_p("S"))
+        assert time.perf_counter() - started < 0.5
+        assert result.success is False
+
+    @pytest.mark.asyncio
+    async def test_twice_cancelled_dispatch_caller_raises_after_the_stop(self) -> None:
+        """X7: a dispatch() caller cancelled twice raises only once the action has released"""
+        am = ActionMasterNode(bus=SignalBus())
+        owner = _Braking(am.bus, "A", {"arm"}, [], stop_s=0.1)
+        owner.safe_stop_timeout_s = 1.0
+        am.register(owner)
+        caller = asyncio.ensure_future(am.dispatch(_p("A")))
+        await owner.started.wait()
+        caller.cancel()
+        await asyncio.sleep(0.02)                       # the safe-stop is running
+        caller.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await caller
+        assert am.running_action_ids() == set()
+        assert "A brake end" in owner.events
+
+    @pytest.mark.asyncio
+    async def test_no_false_safe_stop_error_is_logged(self) -> None:
+        """X8: a normal preemption logs no 'Safe-stop hook ended with CancelledError'"""
+        sink = _CaptureSink()
+        am = ActionMasterNode(bus=SignalBus(), log_sinks=[sink])
+        owner = _gated(am, "A", {"arm"})
+        _gated(am, "R", {"arm"}, hold=False)
+        am.launch(_p("A"))
+        await owner.started.wait()
+        am.launch_reflex(_p("R", 250))
+        assert await am.wait_idle(2.0)
+        await asyncio.sleep(0.01)
+        assert "Action complete" in sink.messages
+        assert "Safe-stop hook ended with CancelledError" not in sink.messages
+
+    @pytest.mark.asyncio
+    async def test_wait_idle_returns_with_the_result_buffered(self) -> None:
+        """X9: once wait_idle() returns, drain_completed() has the finished Result"""
+        finishing = asyncio.Event()
+
+        class Fin(BaseActionNode):
+            node_id = "F"
+            resources = frozenset({"arm"})
+
+            async def execute(self, proposal: Proposal) -> Result:
+                await asyncio.sleep(0.01)
+                finishing.set()          # wakes the waiter between release and buffering
+                return Result(action_id=self.node_id, success=True)
+
+        am = ActionMasterNode(bus=SignalBus())
+        am.register(Fin(am.bus))
+        am.launch(_p("F"))
+        await finishing.wait()
+        assert await am.wait_idle(1.0)
+        assert [r.action_id for r in am.drain_completed()] == ["F"]
+
+    @pytest.mark.asyncio
+    async def test_close_drops_armed_reflexes(self) -> None:
+        """X10: close() alone drops armed reflexes: idle again, no stale claim after setup()"""
+        am = ActionMasterNode(bus=SignalBus())
+        owner = _gated(am, "Owner", {"arm"})
+        _gated(am, "R", {"arm"}, hold=False)
+        _gated(am, "M", {"arm"}, hold=False)
+        am.launch_reflex(_p("Owner", 250))
+        await owner.started.wait()
+        assert am.launch_reflex(_p("R", 240)).status is LaunchStatus.ARMED
+        am.close()
+        assert am.armed_reflexes() == {}
+        owner.release.set()
+        assert await am.wait_idle(1.0)
+        await am.setup()
+        assert am.launch(_p("M")).status is LaunchStatus.LAUNCHED
+        assert await am.wait_idle(1.0)
+
+    @pytest.mark.asyncio
+    async def test_dispatch_many_with_an_unknown_action_starts_nothing(self) -> None:
+        """X11: dispatch_many() raising for an unknown action leaves no sibling running"""
+        am = ActionMasterNode(bus=SignalBus())
+        _gated(am, "A", {"arm"})
+        with pytest.raises(ActionNotFoundError):
+            await am.dispatch_many([_p("A"), _p("Nope")])
+        assert am.running_action_ids() == set()
+        assert am.resource_owners() == {}

@@ -455,3 +455,312 @@ class TestPauseAndLoop:
         await asyncio.sleep(0.1)
         assert rt.tick_count > before
         await rt.stop()
+
+
+# ── Third review round (docs/audits 2026-10-26, runtime findings T1–T12) ──────
+
+class _SlowSetupSense(BaseSenseNode):
+    """Sense node whose setup() takes 0.2 s (hardware bring-up)."""
+    node_id = "SlowSetup"
+    signal_kind = "x"
+    poll_interval_s = 0.0
+
+    def __init__(self, bus: SignalBus, log: list[str]) -> None:
+        super().__init__(bus)
+        self.log = log
+        self.setting_up = asyncio.Event()
+
+    async def setup(self) -> None:
+        self.setting_up.set()
+        await asyncio.sleep(0.2)
+        self.log.append("setup done")
+
+    async def read(self) -> Signal | None:
+        self.log.append("read")
+        return None
+
+    async def teardown(self) -> None:
+        self.log.append("teardown SlowSetup")
+
+
+class TestThirdReviewRuntime:
+    @pytest.mark.parametrize("how", ["stop", "emergency_stop"])
+    @pytest.mark.asyncio
+    async def test_stop_during_start_aborts_the_start(self, how: str) -> None:
+        """T1: a stop or emergency stop while start() sets up is not lost"""
+        log: list[str] = []
+        bus = SignalBus()
+        sense = _SlowSetupSense(bus, log)
+        rt = _build(bus, sense=[sense])
+        starting = asyncio.ensure_future(rt.start())
+        await sense.setting_up.wait()
+        await (rt.stop() if how == "stop" else rt.emergency_stop())
+        await starting
+        await asyncio.sleep(0.05)
+        assert not rt.is_running
+        assert "read" not in log
+        assert "teardown SlowSetup" in log
+
+    @pytest.mark.asyncio
+    async def test_concurrent_starts_set_up_once(self) -> None:
+        """T9: a second start() during the first waits for it; masters are set up once"""
+        log: list[str] = []
+        bus = SignalBus()
+        rt = _build(bus, sense=[_SlowSetupSense(bus, log)])
+        await asyncio.gather(rt.start(), rt.start())
+        assert log.count("setup done") == 1
+        await rt.stop()
+
+    @pytest.mark.asyncio
+    async def test_stop_inside_a_tick_launches_nothing_more(self) -> None:
+        """T2: after stop() from a tick, that tick launches no deliberative action"""
+        log: list[str] = []
+        bus = SignalBus()
+        goal = _Propose(bus, "Goal", "Fresh")
+        rt = _build(bus, instincts=[goal], actions=[_Work(bus, "Fresh", log, run_s=0.2)])
+        goal.runtime = rt
+        goal.hook_tick = 1
+        goal.hook = rt.stop
+        await rt.start()
+        await asyncio.wait_for(rt.wait(), 5.0)
+        assert "execute Fresh" not in log
+
+    @pytest.mark.asyncio
+    async def test_emergency_stop_cancels_pending_restarts(self) -> None:
+        """T3: no supervisor restart tears a node down and sets it up again after an e-stop"""
+        log: list[str] = []
+        bus = SignalBus()
+
+        class Flaky(BaseSenseNode):
+            node_id = "Flaky"
+            signal_kind = "x"
+            poll_interval_s = 0.0
+            failed = False
+
+            async def setup(self) -> None:
+                log.append("setup Flaky")
+
+            async def teardown(self) -> None:
+                log.append("teardown Flaky")
+
+            async def read(self) -> Signal | None:
+                if not self.failed:
+                    self.failed = True
+                    raise RuntimeError("sensor glitch")
+                return None
+
+        rt = _build(bus, sense=[Flaky(bus)])
+        for sup in rt._supervisors:
+            sup._restart_delay = 0.2
+        await rt.start()
+        await asyncio.sleep(0.1)                       # fault seen, restart pending
+        await rt.emergency_stop()
+        log.append("emergency_stop returned")
+        await asyncio.sleep(0.4)
+        assert log[log.index("emergency_stop returned") + 1:] == []
+        assert log.count("teardown Flaky") == 1
+
+    @pytest.mark.parametrize(
+        "case", ["on_shutdown_action", "supervisor_subscriber", "teardown"],
+    )
+    @pytest.mark.asyncio
+    async def test_stop_called_by_the_shutdown_itself_returns(self, case: str) -> None:
+        """T4: a stop called from code the shutdown runs does not wait for itself"""
+        from arachnite.shutdown import ShutdownCoordinator
+
+        bus = SignalBus()
+        box: list[ArachniteRuntime] = []
+
+        class StopOnTeardown(BaseSenseNode):
+            node_id = "StopOnTeardown"
+            signal_kind = "x"
+
+            async def read(self) -> Signal | None:
+                return None
+
+            async def teardown(self) -> None:
+                await box[0].emergency_stop()
+
+        async def safe_position() -> None:
+            await box[0].stop()
+
+        async def on_supervisor(signal: Signal) -> None:
+            await box[0].stop()
+
+        if case == "on_shutdown_action":
+            rt = _build(bus, shutdown_coordinator=ShutdownCoordinator(
+                on_shutdown_action=safe_position,
+            ))
+            call = rt.stop
+        elif case == "supervisor_subscriber":
+            bus.subscribe("supervisor", on_supervisor)
+            rt = _build(bus, sense=[_Hazard(bus, [])])
+            call = rt.stop
+        else:
+            rt = _build(bus, sense=[StopOnTeardown(bus)])
+            call = rt.emergency_stop
+        box.append(rt)
+        await rt.start()
+        await asyncio.sleep(0.05)
+        await asyncio.wait_for(call(), 3.0)
+        assert not rt.is_running
+
+    @pytest.mark.asyncio
+    async def test_emergency_stop_from_a_safe_stop_hook_returns(self) -> None:
+        """T4/X2: emergency_stop() from on_preempted() returns at once; the hook completes"""
+        log: list[str] = []
+        bus = SignalBus()
+        box: list[ArachniteRuntime] = []
+
+        class Owner(_Work):
+            async def on_preempted(self, proposal: Proposal, preempted_by: Proposal) -> None:
+                self.log.append("hook start")
+                await box[0].emergency_stop()
+                self.log.append("brake engaged")
+
+        rt = _build(bus, actions=[
+            Owner(bus, "Work", log),
+            _Work(bus, "Retract", log, run_s=0.05),
+        ])
+        box.append(rt)
+        await rt.start()
+        # Launched from this task, not a tick: nothing but the action run
+        # itself can mark the hook as "inside".
+        rt._action_master.launch(Proposal(
+            instinct_id="Goal", action_id="Work", priority=60, urgency=0.5,
+        ))
+        await _until(lambda: "execute Work" in log)
+        started = time.perf_counter()
+        rt._action_master.launch_reflex(Proposal(
+            instinct_id="Reflex", action_id="Retract", priority=250, urgency=1.0,
+        ))
+        await asyncio.wait_for(rt.wait(), 3.0)
+        assert time.perf_counter() - started < 1.0
+        assert "brake engaged" in log
+
+    @pytest.mark.asyncio
+    async def test_a_raising_teardown_does_not_cut_the_others(self) -> None:
+        """T5: one node's raising teardown is reported after every other teardown finished"""
+        log: list[str] = []
+        bus = SignalBus()
+
+        class Bad(BaseSenseNode):
+            node_id = "Bad"
+            signal_kind = "x"
+
+            async def read(self) -> Signal | None:
+                return None
+
+            async def teardown(self) -> None:
+                raise RuntimeError("driver fault")
+
+        class SlowArm(_Work):
+            async def teardown(self) -> None:
+                await asyncio.sleep(0.1)
+                self.log.append("teardown Arm done")
+
+        rt = _build(bus, sense=[Bad(bus)], actions=[SlowArm(bus, "Arm", log)])
+        await rt.start()
+        with pytest.raises(RuntimeError):
+            await rt.emergency_stop()
+        assert "teardown Arm done" in log
+
+    @pytest.mark.asyncio
+    async def test_unregistered_action_is_not_relaunched(self) -> None:
+        """T6: no tick relaunches an action while unregister_action_live() removes it"""
+        log: list[str] = []
+        bus = SignalBus()
+
+        class ParkingWork(_Work):
+            async def teardown(self) -> None:
+                await asyncio.sleep(0.2)                 # e.g. parking a motor driver
+                self.log.append("teardown Work done")
+
+        goal = _Propose(bus, "Goal", "Work")
+        rt = _build(bus, instincts=[goal], actions=[ParkingWork(bus, "Work", log)])
+        await rt.start()
+        await _until(lambda: "execute Work" in log)
+        await rt.unregister_action_live("Work")
+        await asyncio.sleep(0.1)
+        assert log.count("execute Work") == 1
+        assert rt._action_master.running_action_ids() == set()
+        await rt.stop()
+
+    @pytest.mark.asyncio
+    async def test_resume_during_pause_leaves_nodes_resumed(self) -> None:
+        """T7: a resume() while pause() waits for the tick wins; no node stays in on_pause"""
+        bus = SignalBus()
+
+        class Hooked(_Hazard):
+            low_power = False
+
+            async def on_pause(self) -> None:
+                self.low_power = True
+
+            async def on_resume(self) -> None:
+                self.low_power = False
+
+        goal = _Propose(bus, "Goal", "Work")
+        goal.delay_s = 0.2                                # a long tick to wait for
+        sensor = Hooked(bus, [])
+        rt = _build(bus, sense=[sensor], instincts=[goal],
+                    actions=[_Work(bus, "Work", [], run_s=0.2)])
+        await rt.start()
+        await asyncio.sleep(0.05)                         # the loop is inside a tick
+        pausing = asyncio.ensure_future(rt.pause())
+        await asyncio.sleep(0.01)
+        await rt.resume()
+        await pausing
+        assert not rt.is_paused
+        assert sensor.low_power is False
+        await rt.stop()
+
+    @pytest.mark.asyncio
+    async def test_live_registered_node_is_set_up_before_use(self) -> None:
+        """T8: a node registered live is not read or launched before its setup() finished"""
+        log: list[str] = []
+        bus = SignalBus()
+        rt = _build(bus)
+        await rt.start()
+        await rt.register_sense_live(_SlowSetupSense(bus, log))
+        await asyncio.sleep(0.05)
+        assert log.index("setup done") < log.index("read")
+        await rt.stop()
+
+    @pytest.mark.asyncio
+    async def test_lane_evaluation_across_a_restart_launches_nothing(self) -> None:
+        """T11: an evaluation in flight across stop()+start() does not launch in the new run"""
+        log: list[str] = []
+        bus = SignalBus()
+        sensor = _Hazard(bus, log)
+
+        class SlowReflex(_HazardReflex):
+            async def evaluate(self, ctx: Context) -> Proposal | None:
+                await asyncio.sleep(0.04)
+                return await super().evaluate(ctx)
+
+        rt = _build(bus, sense=[sensor], instincts=[SlowReflex(bus, "Retract")],
+                    actions=[_Work(bus, "Retract", log, run_s=0.1)],
+                    reflex_mode="event", reflex_eval_timeout_s=0.2)
+        await rt.start()
+        push = asyncio.ensure_future(sensor.push(_sig("Hazard", "hazard", 1.0)))
+        await asyncio.sleep(0.005)
+        await rt.emergency_stop()
+        await rt.start()
+        await push
+        await asyncio.sleep(0.15)
+        await rt.stop()
+        assert "execute Retract" not in log
+
+    @pytest.mark.asyncio
+    async def test_restart_is_not_paused(self) -> None:
+        """T12: a runtime stopped while paused starts unpaused and ticks"""
+        rt, _ = _work_runtime([], run_s=0.1)
+        await rt.start()
+        await rt.pause()
+        await rt.stop()
+        await rt.start()
+        before = rt.tick_count
+        await asyncio.sleep(0.1)
+        assert not rt.is_paused and rt.tick_count > before
+        await rt.stop()

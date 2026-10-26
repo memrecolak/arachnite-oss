@@ -141,15 +141,11 @@ class ShutdownCoordinator:
         # class from the builtin ``TimeoutError`` on Python 3.10 (aliased only on
         # 3.11+). Suppress the asyncio one — same reasoning as the Phase 3 handler
         # above — so a teardown that overruns the grace period doesn't escape stop().
+        # A raising master teardown is logged and re-raised only after the
+        # others have finished (``_teardown_masters``).
         with contextlib.suppress(asyncio.TimeoutError):
             await asyncio.wait_for(
-                asyncio.gather(
-                    runtime._sense_master.teardown(),
-                    runtime._instinct_master.teardown(),
-                    runtime._decision_master.teardown(),
-                    runtime._action_master.teardown(),
-                ),
-                timeout=self._teardown_timeout_s,
+                runtime._teardown_masters(), timeout=self._teardown_timeout_s,
             )
 
         # Phase 7: Disconnect transport (no-op for LocalTransport; distributed

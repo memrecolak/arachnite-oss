@@ -19,6 +19,19 @@ from arachnite.config import NodeConfig
 from arachnite.logging import BaseLogSink, StructuredLogger
 from arachnite.models import Permission
 
+
+async def gather_settled(*aws: Awaitable[Any]) -> None:
+    """
+    Await every awaitable to completion, then raise the first exception any
+    of them raised. Unlike ``asyncio.gather`` it never returns early on a
+    failure, so one node's raising teardown cannot leave its siblings'
+    teardowns running unawaited.
+    """
+    outcomes = await asyncio.gather(*aws, return_exceptions=True)
+    for outcome in outcomes:
+        if isinstance(outcome, BaseException):
+            raise outcome
+
 #: Signature of the runtime-supplied fault sink: ``(node_id, error) -> None``.
 #: Wired to a :class:`~arachnite.supervisor.NodeSupervisor`'s ``on_fault``.
 FaultHandler = Callable[[str, BaseException], Awaitable[None]]

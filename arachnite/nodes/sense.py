@@ -18,16 +18,21 @@ from arachnite.config import NodeConfig
 from arachnite.exceptions import NodeRegistrationError, SignalBusError
 from arachnite.logging import BaseLogSink
 from arachnite.models import MergePolicy, Signal, StateUpdateSignal
-from arachnite.nodes.base import BaseNode, FaultReportingMixin
+from arachnite.nodes.base import BaseNode, FaultReportingMixin, gather_settled
 
 # Pushed signals kept per node for the next tick's deliberation. The lane
 # stays live while the runtime is paused, when no tick drains them.
 MAX_PENDING_PUSHES = 256
 
-# Slack on the poll throttle: a tick that comes back a clock tick early
-# (15.6 ms on Windows) must not skip a sensor whose interval equals the
-# tick period.
+# The poll throttle measures read spacing with the high-resolution
+# perf_counter. Its slack covers asyncio timers waking up to one
+# event-loop clock resolution early (the monotonic clock: 15.6 ms on Windows
+# before Python 3.13, ~1 ns on Linux), so a sensor whose interval equals the
+# tick period is never skipped ...
 _POLL_SLACK_S = time.get_clock_info("monotonic").resolution + 0.001
+# ... but never more than this share of the interval, so a coarse clock
+# cannot switch the throttle off for short intervals.
+_POLL_SLACK_SHARE = 0.25
 
 
 class BaseSenseNode(BaseNode):
@@ -187,8 +192,8 @@ class SenseMasterNode(FaultReportingMixin, BaseNode):
         await asyncio.gather(*(n.setup() for n in self._nodes.values()))
 
     async def teardown(self) -> None:
-        await asyncio.gather(*(n.cancel_background_tasks() for n in self._nodes.values()))
-        await asyncio.gather(*(n.teardown() for n in self._nodes.values()))
+        await gather_settled(*(n.cancel_background_tasks() for n in self._nodes.values()))
+        await gather_settled(*(n.teardown() for n in self._nodes.values()))
 
     async def on_pause(self) -> None:
         await asyncio.gather(*(n.on_pause() for n in self._nodes.values()))
@@ -231,8 +236,9 @@ class SenseMasterNode(FaultReportingMixin, BaseNode):
             # spaced between tick starts; measuring from the end of the
             # previous read skipped every other tick when the poll
             # interval equals the tick period.
-            started = time.monotonic()
-            if started - node._last_read_time < node.poll_interval_s - _POLL_SLACK_S:
+            started = time.perf_counter()
+            slack = min(_POLL_SLACK_S, _POLL_SLACK_SHARE * node.poll_interval_s)
+            if started - node._last_read_time < node.poll_interval_s - slack:
                 return None
             node._last_read_time = started
             try:

@@ -883,7 +883,9 @@ class ToFSense(BaseSenseNode):
   The shutdown runs in its own task: `await rt.wait()` returns when it has *finished*
   (safe-stops done, nodes torn down). A second call waits; one during `stop()` takes
   it over. Called from inside the tick or a running action, `stop()` /
-  `emergency_stop()` return once the shutdown has started.
+  `emergency_stop()` return once the shutdown has started; so do calls from the
+  shutdown's own code (a node's `teardown()`, `on_shutdown_action`) and from an
+  `on_preempted()` safe-stop. A stop during `start()` aborts the start.
   Then the nodes tear down. This is a *shutdown* path, not a hazard response: to cut
   into a mandatory block and keep the agent running, use a PREEMPT reflex.
 
