@@ -7,9 +7,17 @@ PASS is a proof for the modelled instance, not a sampled test. The CSP_M file
 remains the canonical encoding for FDR users; this script removes the
 licensing dependency.
 
+Stop points (v0.13, ADR 0005): a pending request is honoured at a step
+boundary that is not strictly inside a mandatory block -- the boundary
+before an interruptible step, or the boundary *before* a block (so a request
+pending as the block is about to start stops the action there instead of
+running the block only to undo it).  Boundaries between two mandatory steps
+are never stop points.
+
 Checks (mirroring the FDR assertions):
   1. deadlock freedom of ALWAYS / NEVER / CHECKPOINT / ROLLBACK
-  2. DEFER  [T=  each policy   (no ack before the mandatory block completes)
+  2. BLOCKATOMIC [T= each policy (once the mandatory block has begun, no ack
+     until it completes)
   3. ROLLORD [T= ROLLBACK      (undo is exactly roll3, roll2, roll1, ack)
   4. hiding irq: NEVER\irq [T-within] CHECKPOINT\irq [T-within] ALWAYS\irq
 
@@ -25,6 +33,11 @@ TERM = "tick"  # successful-termination pseudo-event
 
 def interruptible(i: int) -> bool:
     return i >= 4
+
+
+def stop_point(i: int) -> bool:
+    """Boundary before step i is not strictly inside a mandatory block."""
+    return interruptible(i) or i == 1 or interruptible(i - 1)
 
 
 def checkpoint(i: int) -> bool:
@@ -96,7 +109,7 @@ def succ_rollback(state):
     if idx > N:
         yield ("stop", ("post", (), "done2"))  # done2 -> stopped path below
         return
-    if pending and interruptible(idx):
+    if pending and stop_point(idx):
         queue = tuple(j for j in reversed(done) if has_rollback(j))
         yield from succ_rollback(("undo", queue, "x"))
         return
@@ -112,7 +125,7 @@ def succ_rollback_fixed(state):
         if idx > N:
             yield ("stop", ("stopped",))
             return
-        if pending and interruptible(idx):
+        if pending and stop_point(idx):
             queue = tuple(j for j in reversed(done) if has_rollback(j))
             if queue:
                 yield (f"roll{queue[0]}", ("undo", queue[1:]))
@@ -151,12 +164,15 @@ def build_lts(init, succ):
 
 # ── Specs as deterministic automata ─────────────────────────────────────────
 
-def defer_spec(state, event):
-    """DEFER: no ack before step3. States: 'pre' -> 'post'."""
+def blockatomic_spec(state, event):
+    """BLOCKATOMIC: once step1 (block start) occurred, no ack until step3.
+    States: 'pre' -> 'in' -> 'post'."""
     if state == "pre":
+        return "in" if event == "step1" else "pre"
+    if state == "in":
         if event == "ack":
             return None
-        return "post" if event == "step3" else "pre"
+        return "post" if event == "step3" else "in"
     return "post"
 
 
@@ -205,7 +221,6 @@ def check_deadlock_free(name, trans):
 
 def check_trace_inclusion(name, big_trans, big_init, small_trans, small_init):
     """traces(small) subset-of traces(big): determinized big as spec."""
-    from functools import lru_cache
 
     def big_step(states, event):
         nxt = set()
@@ -238,8 +253,9 @@ def main() -> None:
     never_init = (1, "exec")
     roll_init = ("exec", 1, (), False)
 
-    always = build_lts(always_init, lambda s: succ_guarded(s, interruptible))
-    ckpt = build_lts(ckpt_init, lambda s: succ_guarded(s, checkpoint))
+    always = build_lts(always_init, lambda s: succ_guarded(s, stop_point))
+    ckpt = build_lts(ckpt_init,
+                     lambda s: succ_guarded(s, lambda i: checkpoint(i) and stop_point(i)))
     never = build_lts(never_init, succ_never)
     roll = build_lts(roll_init, succ_rollback_fixed)
 
@@ -249,12 +265,19 @@ def main() -> None:
                      ("CHECKPOINT", ckpt), ("ROLLBACK", roll)):
         ok &= check_deadlock_free(name, tr)
 
-    print("Deferred-interrupt property (DEFER [T= P):")
+    print("Block atomicity (BLOCKATOMIC [T= P):")
     for name, tr, init in (("ALWAYS", always, always_init),
                            ("CHECKPOINT", ckpt, ckpt_init),
                            ("NEVER", never, never_init),
                            ("ROLLBACK", roll, roll_init)):
-        ok &= check_refinement(f"DEFER<={name}", init, tr, defer_spec, "pre")
+        ok &= check_refinement(f"BLOCKATOMIC<={name}", init, tr,
+                               blockatomic_spec, "pre")
+
+    print("Block-entry stop point (ALWAYS can ack before step1):")
+    entry_ack = any(e == "ack" for e, _ in always.get((1, True, "exec"), []))
+    print(f"  {'PASS' if entry_ack else 'FAIL'} irq pending before the block "
+          f"is honoured at its entry")
+    ok &= entry_ack
 
     print("Rollback ordering (ROLLORD [T= ROLLBACK):")
     ok &= check_refinement("ROLLORD<=ROLLBACK", roll_init, roll,
@@ -265,7 +288,6 @@ def main() -> None:
     def hide_irq(trans):
         """Turn irq edges into epsilon: fold each irq-successor's behaviour
         into the source state (epsilon closure at build time)."""
-        import copy
         closed = {}
         def closure(s, seen=None):
             seen = seen or set()

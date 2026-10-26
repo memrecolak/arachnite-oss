@@ -1,194 +1,282 @@
 -- runtime_composition.csp
--- CSP_M encoding of the interrupt policies COMPOSED with the runtime:
--- the ActionMasterNode interrupt gate, mid-step observation points
--- (steps refined into begin/end pairs), the emergency-stop path, and the
--- tick loop's reflex-arbitration stage. Companion to
--- interrupt_policies.csp (which encodes the four policy processes in
--- isolation); model derived from v0.12.2 source:
---   MultiStepActionNode.execute / check_interrupt / on_interrupted
---   ActionMasterNode.request_interrupt (MandatoryBlockViolation gate)
---   ArachniteRuntime.emergency_stop (direct flag set, bypasses the gate)
---   ArachniteRuntime._tick stage 3 (reflex dispatch precedes decide)
+-- CSP_M encoding of the interrupt policies COMPOSED with the runtime
+-- (v0.13 semantics, ADR 0005): the ActionMasterNode interrupt gate,
+-- mid-step observation points (steps refined into begin/end pairs), the
+-- graceful-stop and emergency-stop paths, non-blocking action tasks, one
+-- actuator resource shared by the deliberative action and a reflex action,
+-- and reflex arbitration (PREEMPT / WAIT_FOR_BLOCK, rollback_on_preempt).
+-- Companion to interrupt_policies.csp (the four policy processes in
+-- isolation).  Model derived from the v0.13 source:
+--   MultiStepActionNode.execute / check_interrupt / on_interrupted /
+--     _run_safe_stop / _handle_reflex_preempt
+--   ActionMasterNode.request_interrupt (MandatoryBlockViolation gate),
+--     interrupt_all, launch, launch_reflex, _preempt, _admit_armed
+--   ArachniteRuntime.emergency_stop, ArachniteRuntime.tick
 --
--- The assertions below mirror, one-to-one, the exhaustive state-space
--- checks of verify_runtime_composition.py, which is the licence-free
--- proof instrument for this model (FDR's licence server has been
--- unreachable; the file is provided for readers with a working FDR).
+-- The assertions mirror the exhaustive state-space checks of
+-- verify_runtime_composition.py, which is the licence-free proof
+-- instrument for this model (it also sweeps every step layout with N <= 6
+-- and is validated by mutation_check_composition.py).  This file is the
+-- canonical encoding for readers with a working FDR4.
 --
 -- Five-step harmonised instance: steps 1..3 mandatory with rollback,
--- steps 4..5 interruptible, step 5 the only checkpoint. The Python
--- checker additionally sweeps every layout with N <= 6.
+-- steps 4..5 interruptible, step 5 the only checkpoint.
 
 N = 5
 STEPS = {1..N}
 
-channel begin, end_, roll : STEPS
-channel bail : STEPS
-channel reqA, reqR, reqD, estop        -- gate outcomes + emergency path
-channel dispatch, ack, stop
-channel sense, reflex_fire, no_reflex, reflex_dispatch,
-        instinct_eval, decide_done, act_done, t_loop
+channel begin, end_, roll, proll, bail : STEPS
+channel reqA, reqR, reqD, sreq, estop      -- gate outcomes, stop(), emergency
+channel dispatch, ack, stop, cancel, safe_stop, halt
+channel sense, reflex_fire, no_reflex, instinct_eval, decide_done, act_done, t_loop
+channel rlaunch_f, rlaunch_c, rlaunch_dedup, r_begin, r_end
 
 Interruptible(i) = i >= 4
 Checkpoint(i)    = i == 5
 HasRollback(i)   = i <= 3
+StopPoint(i)     = Interruptible(i) or i == 1 or Interruptible(i - 1)
 
 datatype PolicyT = ALWAYSP | NEVERP | CHECKPOINTP | ROLLBACKP
+datatype ModeT   = PREEMPTM | WAITM
 
 Honours(p, i) =
+  StopPoint(i) and
+  (p == ALWAYSP or p == ROLLBACKP or (p == CHECKPOINTP and Checkpoint(i)))
+
+Bails(p, i) =
   Interruptible(i) and
   (p == ALWAYSP or p == ROLLBACKP or (p == CHECKPOINTP and Checkpoint(i)))
 
--- ── Composed action node + master gate ─────────────────────────────────
--- The gate resolves an environment request by the current step exactly as
--- ActionMasterNode.request_interrupt does: refuse (reqR) while the
--- current step is mandatory, forward (reqA -> pending flag) otherwise,
--- drop (reqD) when the node is not running. estop always sets the flag.
-
-NODE(p) = reqD -> NODE(p) [] estop -> NODE(p)
-          [] dispatch -> EXEC(p, <1..N>, <>, false)
-
--- EXEC: at the boundary before step head(is); pending flag pnd
-EXEC(p, is, done, pnd) =
-  if null(is) then
-    (reqD -> EXEC(p, is, done, pnd)
-     [] estop -> EXEC(p, is, done, true)
-     [] stop -> DONE)
-  else
-    (GATE(p, is, done, pnd, head(is))
-     [] estop -> EXEC(p, is, done, true)
-     [] (if pnd and Honours(p, head(is)) then
-           (if p == ROLLBACKP then UNDO(rollq(done)) else SKIP)
-           ; ack -> stop -> DONE
-         else
-           begin.head(is) -> INSTEP(p, is, done, pnd)))
-
--- INSTEP: inside step head(is); end_ completes it; a cooperative bail is
--- offered only when check_interrupt() would return True
-INSTEP(p, is, done, pnd) =
-  GATE(p, is, done, pnd, head(is))
-  [] estop -> INSTEP(p, is, done, true)
-  [] end_.head(is) -> EXEC(p, tail(is), done ^ <head(is)>, pnd)
-  [] (pnd and Honours(p, head(is))) &
-       bail.head(is) ->
-         ((if p == ROLLBACKP then UNDO(rollq(done)) else SKIP)
-          ; ack -> stop -> DONE)
-
-GATE(p, is, done, pnd, cur) =
-  if Interruptible(cur)
-  then reqA -> (if null(is) then STOPBRANCH(p, is, done)
-                else GRES(p, is, done, true))
-  else reqR -> GRES(p, is, done, pnd)
-
--- resolution re-enters the state the request arrived in (boundary form;
--- the in-step form is analogous and elided for brevity -- the Python
--- checker models both exactly)
-GRES(p, is, done, pnd) = EXEC(p, is, done, pnd)
-STOPBRANCH(p, is, done) = EXEC(p, is, done, true)
-
-DONE = estop -> DONE [] SKIP
-
-rollq(done) = <j | j <- reverse_(done), (not Interruptible(j)) and HasRollback(j)>
-UNDO(<>) = SKIP
-UNDO(<j> ^ js) = roll.j -> UNDO(js)
 reverse_(<>) = <>
 reverse_(<x> ^ xs) = reverse_(xs) ^ <x>
+rollq(done) = <j | j <- reverse_(done), (not Interruptible(j)) and HasRollback(j)>
+preq(rb, done) = if rb then rollq(done) else <>
 
--- ── Tick loop with reflex arbitration (runtime._tick stages 1-6) ───────
+-- ── The deliberative action (node + gate + stop paths + preemption) ────
+-- rlaunch_c is a conflicting reflex launch: its effect on the owner is
+-- launch_reflex's (cancel now, or wait for the block under WAIT_FOR_BLOCK);
+-- rlaunch_f / r_begin are only possible while the owner holds nothing.
+
+IDLE(p, m, rb) =
+     estop -> ESTOP
+  [] reqD -> IDLE(p, m, rb)
+  [] dispatch -> EXEC(p, m, rb, <1..N>, <>, false, false)
+  [] rlaunch_f -> IDLE(p, m, rb)
+  [] rlaunch_dedup -> IDLE(p, m, rb)
+  [] r_begin -> IDLE(p, m, rb)
+
+ESTOP = safe_stop -> halt -> SKIP          -- emergency: safe-stop, no rollback
+
+-- boundary before head(is) (or the end of the sequence)
+EXEC(p, m, rb, is, done, pnd, rp) =
+  if null(is) then
+       estop -> ESTOP
+    [] reqD -> EXEC(p, m, rb, is, done, pnd, rp)
+    [] rlaunch_dedup -> EXEC(p, m, rb, is, done, pnd, rp)
+    [] rlaunch_c -> PRE(p, m, rb, preq(rb, done))
+    [] stop -> IDLE(p, m, rb)
+  else
+    let cur = head(is) within
+       ENV(p, m, rb, is, done, pnd, rp, false)
+    [] (if rp and StopPoint(cur) then
+          cancel -> PRE(p, m, rb, preq(rb, done))
+        else if pnd and Honours(p, cur) then
+          (if p == ROLLBACKP then UNDO(p, m, rb, rollq(done)) else ack -> ACKED(p, m, rb))
+        else
+          begin.cur -> INSTEP(p, m, rb, is, done, pnd, rp))
+
+-- inside step head(is)
+INSTEP(p, m, rb, is, done, pnd, rp) =
+  let cur = head(is) within
+     ENV(p, m, rb, is, done, pnd, rp, true)
+  [] end_.cur -> EXEC(p, m, rb, tail(is), done ^ <cur>, pnd, rp)
+  [] (pnd and Bails(p, cur)) &
+       bail.cur -> (if p == ROLLBACKP then UNDO(p, m, rb, rollq(done))
+                    else BAILED(p, m, rb))
+
+-- environment events offered while the action runs a step or sits at a
+-- boundary: the gate, the graceful-stop request, emergency stop, and the
+-- effect of a reflex launch
+ENV(p, m, rb, is, done, pnd, rp, ins) =
+  let cur = head(is)
+      BACK(np, nrp) = if ins then INSTEP(p, m, rb, is, done, np, nrp)
+                      else EXEC(p, m, rb, is, done, np, nrp)
+  within
+     (if Interruptible(cur) then reqA -> BACK(true, rp) else reqR -> BACK(pnd, rp))
+  [] sreq -> BACK(true, rp)
+  [] estop -> ESTOP
+  [] rlaunch_dedup -> BACK(pnd, rp)
+  [] rlaunch_c ->
+       (if m == WAITM and not Interruptible(cur) then BACK(pnd, true)
+        else PRE(p, m, rb, preq(rb, done)))
+
+-- deliberative rollback walk (cancelled by a preemption: safe-stop only)
+UNDO(p, m, rb, q) =
+     estop -> ESTOP
+  [] rlaunch_dedup -> UNDO(p, m, rb, q)
+  [] rlaunch_c -> PRE(p, m, rb, <>)
+  [] (if null(q) then ack -> ACKED(p, m, rb)
+      else roll.head(q) -> UNDO(p, m, rb, tail(q)))
+
+BAILED(p, m, rb) =
+     estop -> ESTOP [] rlaunch_dedup -> BAILED(p, m, rb)
+  [] rlaunch_c -> BAILED(p, m, rb) [] ack -> ACKED(p, m, rb)
+
+ACKED(p, m, rb) =
+     estop -> ESTOP [] rlaunch_dedup -> ACKED(p, m, rb)
+  [] rlaunch_c -> ACKED(p, m, rb) [] stop -> IDLE(p, m, rb)
+
+-- preempted: safe-stop, rollback walk only with rollback_on_preempt, release
+PRE(p, m, rb, q) =
+     estop -> ESTOP [] rlaunch_dedup -> PRE(p, m, rb, q)
+  [] safe_stop -> PREROLL(p, m, rb, q)
+PREROLL(p, m, rb, q) =
+     estop -> ESTOP [] rlaunch_dedup -> PREROLL(p, m, rb, q)
+  [] (if null(q) then stop -> IDLE(p, m, rb)
+      else proll.head(q) -> PREROLL(p, m, rb, tail(q)))
+
+OWNER(p, m, rb) = IDLE(p, m, rb)
+
+-- ── Reflex action (its own task) and the tick loop ─────────────────────
+-- An armed reflex claims the resource: no deliberative dispatch until it
+-- has run.
+R_IDLE  = rlaunch_f -> R_ARMED [] rlaunch_c -> R_ARMED [] dispatch -> R_IDLE
+R_ARMED = rlaunch_dedup -> R_ARMED [] r_begin -> R_RUN
+R_RUN   = rlaunch_dedup -> R_RUN [] r_end -> R_IDLE
+
 TICK = sense ->
-       ((reflex_fire -> reflex_dispatch -> INSTINCT)
+       ((reflex_fire -> (rlaunch_f -> INSTINCT [] rlaunch_c -> INSTINCT
+                         [] rlaunch_dedup -> INSTINCT))
         [] (no_reflex -> INSTINCT))
 INSTINCT = instinct_eval -> DECIDE
--- the decision layer may issue an interrupt through the gate; every gate
--- outcome (accepted, refused-and-caught, dropped) lets the tick proceed
-DECIDE = decide_done -> ACT
-         [] reqA -> ACT [] reqR -> ACT [] reqD -> ACT
+DECIDE = decide_done -> ACT [] reqA -> ACT [] reqR -> ACT [] reqD -> ACT
 ACT = act_done -> t_loop -> TICK
 
-SYNCSET = {| reqA, reqR, reqD |}
-SYSTEM(p) = NODE(p) [| SYNCSET |] TICK
+LAUNCH = {| rlaunch_f, rlaunch_c, rlaunch_dedup |}
+GATE   = {| reqA, reqR, reqD |}
 
--- ── Specifications (mirroring checks 2, 4, 5, 6, 9, 11 of the checker) ─
+-- The runtime keeps running in the composition (emergency stop is checked
+-- on the action alone): estop is in the synchronisation set but offered by
+-- neither TICK nor the reflex, so it is blocked here.
+SYSTEM(p, m, rb) =
+  (TICK [| LAUNCH |] (R_IDLE))
+    [| union(union(GATE, LAUNCH), {| dispatch, r_begin, estop |}) |]
+  OWNER(p, m, rb)
+
+-- ── Specifications ─────────────────────────────────────────────────────
 RUNALL = ([] x : Events @ x -> RUNALL) [] SKIP
 
--- 4. mandatory-step atomicity: no ack/roll/bail strictly inside a
---    mandatory begin/end pair
+-- 4. mandatory-step atomicity: no ack/roll/bail inside a mandatory step
 ATOMIC = ([] i : STEPS @ begin.i ->
             (if Interruptible(i) then ATOMIC else INMAND(i)))
          [] ([] x : diff(Events, {| begin, ack, roll, bail |}) @ x -> ATOMIC)
          [] SKIP
-INMAND(i) = end_.i -> ATOMIC
-            [] ([] x : diff(Events, {| end_, ack, roll, bail |}) @ x -> INMAND(i))
+INMAND(i) = end_.i -> ATOMIC [] estop -> ATOMIC
+            [] ([] x : diff(Events, {| end_, estop, ack, roll, bail |}) @ x -> INMAND(i))
 
-assert ATOMIC [T= NODE(ALWAYSP)
-assert ATOMIC [T= NODE(NEVERP)
-assert ATOMIC [T= NODE(CHECKPOINTP)
-assert ATOMIC [T= NODE(ROLLBACKP)
+-- 6. no spurious interrupt: ack/roll/bail only after reqA or sreq
+COLD = ([] x : diff(Events, {| ack, roll, bail, reqA, sreq |}) @ x -> COLD)
+       [] reqA -> ARMED [] sreq -> ARMED [] SKIP
+ARMED = ([] x : diff(Events, {| dispatch |}) @ x -> ARMED)
+        [] dispatch -> COLD [] SKIP
 
--- 5. no spurious interrupt: ack only after reqA or a running estop
-COLD = ([] x : diff(Events, {| ack, roll, bail, reqA, estop |}) @ x -> COLD)
-       [] reqA -> ARMED
-       [] estop -> COLDE
-       [] SKIP
-COLDE = ([] x : diff(Events, {| ack, roll, bail, reqA, dispatch |}) @ x -> COLDE)
-        [] reqA -> ARMED [] dispatch -> ARMED [] SKIP
-ARMED = RUNALL
-
-assert COLD [T= NODE(ALWAYSP)
-assert COLD [T= NODE(NEVERP)
-assert COLD [T= NODE(CHECKPOINTP)
-assert COLD [T= NODE(ROLLBACKP)
-
--- 6. rollback order: rolls strictly reverse, then ack (ROLLBACK only)
+-- 7. rollback order (ROLLBACK): roll.3, roll.2, roll.1 in that order
 ROLLORD = ([] x : diff(Events, {| roll |}) @ x -> ROLLORD)
           [] (roll.3 -> R2 [] roll.2 -> R1' [] roll.1 -> RA) [] SKIP
 R2  = ([] x : diff(Events, {| roll |}) @ x -> R2)  [] roll.2 -> R1' [] SKIP
 R1' = ([] x : diff(Events, {| roll |}) @ x -> R1') [] roll.1 -> RA  [] SKIP
 RA  = ([] x : diff(Events, {| roll |}) @ x -> RA)  [] SKIP
 
-assert ROLLORD [T= NODE(ROLLBACKP)
-
--- 9. DEFER on the prefix layout: no ack before the mandatory block ends
-DEFER = ([] x : diff(Events, {| ack |}) @ x ->
-          (if x == end_.3 then RUNALL else DEFER)) [] SKIP
-
-assert DEFER [T= NODE(ALWAYSP)
-assert DEFER [T= NODE(NEVERP)
-assert DEFER [T= NODE(CHECKPOINTP)
-assert DEFER [T= NODE(ROLLBACKP)
-
--- 8. NEVER admits no ack at all
+-- 8b. NEVER admits no ack at all
 NOACK = ([] x : diff(Events, {| ack |}) @ x -> NOACK) [] SKIP
-assert NOACK [T= NODE(NEVERP)
 
--- 11. reflex-before-decide in the composition: a fired reflex is
---     dispatched before the decision stage completes
-RBD = ([] x : diff(Events, {| reflex_fire, reflex_dispatch,
-                              decide_done, reqA, reqR, reqD |}) @ x -> RBD)
+-- 9. emergency stop: only the safe-stop, then halt (no step, rollback, ack)
+ESPEC = ([] x : diff(Events, {| estop |}) @ x -> ESPEC)
+        [] estop -> safe_stop -> halt -> SKIP [] SKIP
+
+-- 10. block atomicity: once step 1 began, no ack until step 3 ended
+BLOCKATOMIC = ([] x : diff(Events, {| begin.1 |}) @ x -> BLOCKATOMIC)
+              [] begin.1 -> INB [] SKIP
+INB = end_.3 -> BLOCKATOMIC [] dispatch -> BLOCKATOMIC
+      [] ([] x : diff(Events, {| ack, end_.3, dispatch |}) @ x -> INB) [] SKIP
+
+-- 12. a fired reflex is launched before the decide stage completes
+RBD = ([] x : diff(Events, union(union(LAUNCH, GATE),
+                                 {| reflex_fire, decide_done |})) @ x -> RBD)
       [] reflex_fire -> RBDF
-      [] decide_done -> RBD [] reqA -> RBD [] reqR -> RBD [] reqD -> RBD
+      [] ([] x : union(LAUNCH, union(GATE, {| decide_done |})) @ x -> RBD)
       [] SKIP
-RBDF = ([] x : diff(Events, {| reflex_dispatch, decide_done,
-                               reqA, reqR, reqD |}) @ x -> RBDF)
-       [] reflex_dispatch -> RBD
+RBDF = ([] x : diff(Events, union(union(LAUNCH, GATE), {| decide_done |})) @ x -> RBDF)
+       [] ([] x : LAUNCH @ x -> RBD)
 
-assert RBD [T= SYSTEM(ALWAYSP)
-assert RBD [T= SYSTEM(NEVERP)
-assert RBD [T= SYSTEM(CHECKPOINTP)
-assert RBD [T= SYSTEM(ROLLBACKP)
+-- 14/18. exclusivity and claims: no deliberative dispatch from a reflex
+-- launch until the reflex action has ended
+EXCL = ([] x : diff(Events, {| rlaunch_f, rlaunch_c |}) @ x -> EXCL)
+       [] rlaunch_f -> CLAIM [] rlaunch_c -> CLAIM [] SKIP
+CLAIM = ([] x : diff(Events, {| dispatch, r_end |}) @ x -> CLAIM)
+        [] r_end -> EXCL [] SKIP
 
--- 1 & 10. deadlock freedom, in isolation and composed
-assert NODE(ALWAYSP)     :[deadlock free]
-assert NODE(NEVERP)      :[deadlock free]
-assert NODE(CHECKPOINTP) :[deadlock free]
-assert NODE(ROLLBACKP)   :[deadlock free]
-assert SYSTEM(ALWAYSP)     :[deadlock free]
-assert SYSTEM(NEVERP)      :[deadlock free]
-assert SYSTEM(CHECKPOINTP) :[deadlock free]
-assert SYSTEM(ROLLBACKP)   :[deadlock free]
+-- 15. preemption ordering: after a conflicting launch the reflex begins
+-- only after the owner released (stop)
+ORDER = ([] x : diff(Events, {| rlaunch_c |}) @ x -> ORDER)
+        [] rlaunch_c -> WAITREL [] SKIP
+WAITREL = ([] x : diff(Events, {| r_begin, stop |}) @ x -> WAITREL)
+          [] stop -> ORDER [] SKIP
 
--- Checks 2 (estop never refused), 3 (gate soundness), 7 (honour at first
--- eligible boundary) and 12 (reflex dispatch enabled during a mandatory
--- block) are state-space invariants rather than trace refinements; they
--- are checked directly over the reachable composed state space by
--- verify_runtime_composition.py.
+-- 16. PREEMPT: no step begins or ends between the launch and the release
+PROMPT = ([] x : diff(Events, {| rlaunch_c |}) @ x -> PROMPT)
+         [] rlaunch_c -> PR1 [] SKIP
+PR1 = ([] x : diff(Events, {| begin, end_, stop |}) @ x -> PR1)
+      [] stop -> PROMPT [] SKIP
+
+-- 17. WAIT_FOR_BLOCK: until the release, only the block in progress may
+-- continue -- no begin at a stop point, no end of an interruptible step
+WAITB = ([] x : diff(Events, {| rlaunch_c |}) @ x -> WAITB)
+        [] rlaunch_c -> WB1 [] SKIP
+WB1 = ([] x : diff(Events, {| begin, end_, stop |}) @ x -> WB1)
+      [] ([] i : STEPS @ (not StopPoint(i)) & begin.i -> WB1)
+      [] ([] i : STEPS @ (not Interruptible(i)) & end_.i -> WB1)
+      [] stop -> WAITB [] SKIP
+
+-- 18. without rollback_on_preempt there is no preemption rollback
+NOPROLL = ([] x : diff(Events, {| proll |}) @ x -> NOPROLL) [] SKIP
+
+-- ── Assertions ─────────────────────────────────────────────────────────
+assert OWNER(ALWAYSP, PREEMPTM, false)     :[deadlock free]
+assert OWNER(ROLLBACKP, WAITM, true)       :[deadlock free]
+assert SYSTEM(ALWAYSP, PREEMPTM, false)    :[deadlock free]
+assert SYSTEM(ROLLBACKP, PREEMPTM, true)   :[deadlock free]
+assert SYSTEM(ALWAYSP, WAITM, false)       :[deadlock free]
+assert SYSTEM(ROLLBACKP, WAITM, true)      :[deadlock free]
+
+assert ATOMIC      [T= OWNER(ALWAYSP, PREEMPTM, false)
+assert ATOMIC      [T= OWNER(CHECKPOINTP, PREEMPTM, false)
+assert ATOMIC      [T= OWNER(ROLLBACKP, PREEMPTM, false)
+assert COLD        [T= OWNER(ALWAYSP, PREEMPTM, false)
+assert COLD        [T= OWNER(ROLLBACKP, PREEMPTM, false)
+assert ROLLORD     [T= OWNER(ROLLBACKP, PREEMPTM, false)
+assert NOACK       [T= OWNER(NEVERP, PREEMPTM, false)
+assert ESPEC       [T= OWNER(ALWAYSP, PREEMPTM, false)
+assert ESPEC       [T= OWNER(ROLLBACKP, PREEMPTM, true)
+assert BLOCKATOMIC [T= OWNER(ALWAYSP, PREEMPTM, false)
+assert BLOCKATOMIC [T= OWNER(ROLLBACKP, PREEMPTM, false)
+
+assert RBD     [T= SYSTEM(ALWAYSP, PREEMPTM, false)
+assert RBD     [T= SYSTEM(ROLLBACKP, WAITM, true)
+assert EXCL    [T= SYSTEM(ALWAYSP, PREEMPTM, false)
+assert EXCL    [T= SYSTEM(ROLLBACKP, WAITM, true)
+assert ORDER   [T= SYSTEM(ALWAYSP, PREEMPTM, false)
+assert ORDER   [T= SYSTEM(ROLLBACKP, WAITM, true)
+assert PROMPT  [T= SYSTEM(ALWAYSP, PREEMPTM, false)
+assert PROMPT  [T= SYSTEM(ROLLBACKP, PREEMPTM, true)
+assert WAITB   [T= SYSTEM(ALWAYSP, WAITM, false)
+assert WAITB   [T= SYSTEM(ROLLBACKP, WAITM, true)
+assert NOPROLL [T= SYSTEM(ALWAYSP, PREEMPTM, false)
+assert NOPROLL [T= SYSTEM(ROLLBACKP, WAITM, false)
+
+-- Checks 2 (estop never refused), 3 (gate soundness), 5 (deliberative
+-- stops only at stop points), 8a (honour at the first eligible stop point),
+-- 13 (reflex launched while the action is inside a mandatory step) and the
+-- no-double-undo half of 18 are state-space invariants rather than trace
+-- refinements; verify_runtime_composition.py checks them directly over the
+-- reachable state space, for every policy, mode and rollback setting.

@@ -441,3 +441,57 @@ class TestExecutionStateBlock:
         )
         pick._current_step = pick.steps()[4]                 # "transport"
         assert pick.execution_state().mandatory_block_remaining_s == 0.0
+
+
+class _SlowUndoPick(MultiStepActionNode):
+    """ROLLBACK action whose rollback callables are slow (preemptable)."""
+    node_id             = "_SlowUndoPick"
+    interrupt_policy    = InterruptPolicy.ROLLBACK
+    rollback_on_preempt = True
+    resources           = frozenset({"arm"})
+    timeout_s           = 10.0
+
+    def __init__(self, bus: SignalBus) -> None:
+        super().__init__(bus)
+        self.undone: list[str] = []
+        self.walk_started = False
+
+    def _undo(self, name: str):  # type: ignore[no-untyped-def]
+        async def _rollback() -> None:
+            self.walk_started = True
+            await asyncio.sleep(0.05)
+            self.undone.append(name)
+        return _rollback
+
+    def steps(self) -> list[ActionStep]:
+        return [
+            ActionStep("lower", interruptible=False, rollback=self._undo("lower")),
+            ActionStep("close", interruptible=False, rollback=self._undo("close")),
+            ActionStep("carry", interruptible=True),
+        ]
+
+    async def execute_step(
+        self, step: ActionStep, proposal: Proposal, completed: list[StepResult]
+    ) -> StepResult:
+        if step.name == "close":
+            self.request_interrupt(InterruptRequest(
+                new_proposal=_p("Other"), requesting_instinct_id="t",
+            ))
+        await asyncio.sleep(0.01)
+        return StepResult(step_name=step.name, success=True)
+
+
+class TestPreemptDuringRollback:
+    @pytest.mark.asyncio
+    async def test_preempting_a_rollback_walk_does_not_undo_twice(self) -> None:
+        """rollback_on_preempt must not restart a walk already in progress."""
+        am, actuator, _, _ = _master()
+        pick = _SlowUndoPick(am.bus)
+        am.register(pick)
+        am.launch(_p("_SlowUndoPick"))
+        await _until(lambda: pick.walk_started)      # deliberative walk running
+        am.launch_reflex(_p("Retract", 250))
+        assert await am.wait_idle(2.0)
+        assert len(pick.undone) == len(set(pick.undone))   # nothing undone twice
+        assert pick.undone in ([], ["close"])              # walk cut short, not restarted
+        assert _results_by_id(am)["_SlowUndoPick"].preempted is True

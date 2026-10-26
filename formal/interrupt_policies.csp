@@ -19,13 +19,19 @@ Interruptible(i) = i >= 4
 Checkpoint(i)    = i == 5
 HasRollback(i)   = i <= 3
 
--- ALWAYS: a pending request is honoured at the first interruptible boundary.
+-- Stop point (v0.13, ADR 0005): the boundary before step i is not strictly
+-- inside a mandatory block -- before an interruptible step, or before a
+-- block (i == 1 here), so a request pending as the block is about to start
+-- is honoured there instead of the block being run and then undone.
+StopPoint(i) = Interruptible(i) or i == 1 or Interruptible(i - 1)
+
+-- ALWAYS: a pending request is honoured at the first stop point.
 -- irq is offered at EVERY state (including inside the mandatory block) and
 -- merely sets the pending flag: requests are deferred, never refused.
 ALWAYS = A(<1..N>, false)
 A(is, p) =
   if null(is) then stop -> SKIP
-  else if p and Interruptible(head(is)) then ack -> stop -> SKIP
+  else if p and StopPoint(head(is)) then ack -> stop -> SKIP
   else (step.head(is) -> A(tail(is), p)) [] (irq -> A(is, true))
 
 -- NEVER: irq is absorbed everywhere; ack is never emitted.
@@ -38,7 +44,7 @@ NV(is) =
 CHECKPOINT = C(<1..N>, false)
 C(is, p) =
   if null(is) then stop -> SKIP
-  else if p and Checkpoint(head(is)) then ack -> stop -> SKIP
+  else if p and Checkpoint(head(is)) and StopPoint(head(is)) then ack -> stop -> SKIP
   else (step.head(is) -> C(tail(is), p)) [] (irq -> C(is, true))
 
 -- ROLLBACK: as ALWAYS, but completed rollback-bearing steps are undone in
@@ -46,7 +52,7 @@ C(is, p) =
 ROLLBACK = R(<1..N>, <>, false)
 R(is, done, p) =
   if null(is) then stop -> SKIP
-  else if p and Interruptible(head(is)) then
+  else if p and StopPoint(head(is)) then
     UNDO(reverse_(done)) ; ack -> stop -> SKIP
   else (step.head(is) -> R(tail(is), done ^ <head(is)>, p))
        [] (irq -> R(is, done, true))
@@ -64,16 +70,20 @@ reverse_(<x> ^ xs) = reverse_(xs) ^ <x>
 
 RUNALL = ([] x : Events @ x -> RUNALL) [] SKIP
 
--- Deferred-interrupt property: ack can never occur before the mandatory
--- block (steps 1..3) has completed, regardless of when irq arrives.
-DEFER = ([] x : diff(Events, {|ack|}) @ x ->
-           (if x == step.3 then RUNALL else DEFER))
-        [] SKIP
+-- Block atomicity: once the mandatory block has begun (step.1), ack cannot
+-- occur until it has completed (step.3), regardless of when irq arrives.
+-- An ack before step.1 (request honoured at the block's entry) is allowed.
+BLOCKATOMIC = ([] x : diff(Events, {|step.1|}) @ x -> BLOCKATOMIC)
+              [] (step.1 -> INBLOCK)
+              [] SKIP
+INBLOCK = ([] x : diff(Events, {|ack|}) @ x ->
+             (if x == step.3 then RUNALL else INBLOCK))
+          [] SKIP
 
-assert DEFER [T= ALWAYS
-assert DEFER [T= CHECKPOINT
-assert DEFER [T= ROLLBACK
-assert DEFER [T= NEVER
+assert BLOCKATOMIC [T= ALWAYS
+assert BLOCKATOMIC [T= CHECKPOINT
+assert BLOCKATOMIC [T= ROLLBACK
+assert BLOCKATOMIC [T= NEVER
 
 -- Rollback ordering: once undoing starts it is exactly roll.3, roll.2,
 -- roll.1, then ack (reverse completion order); traces without rollback

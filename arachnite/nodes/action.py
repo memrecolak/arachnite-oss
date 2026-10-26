@@ -206,6 +206,10 @@ class MultiStepActionNode(BaseActionNode):
         # reservation, so an interrupt requested before execute() starts
         # is kept rather than wiped by execute()'s own reset.
         self._run_prepared: bool = False
+        # True while an interrupt/abort rollback walk runs: a preemption
+        # arriving then must not start the walk again (rollback_on_preempt),
+        # or completed steps would be undone twice.
+        self._unwinding: bool = False
 
     def _prepare_run(self) -> None:
         """Reset per-run state at reservation time (called by ActionMasterNode)."""
@@ -214,6 +218,7 @@ class MultiStepActionNode(BaseActionNode):
         self._reflex_preempt_by   = None
         self._completed_steps     = []
         self._current_step        = None
+        self._unwinding           = False
         self._run_prepared        = True
 
     def request_reflex_preempt(self, by: Proposal) -> None:
@@ -224,6 +229,7 @@ class MultiStepActionNode(BaseActionNode):
         """Drop per-run state after a cancelled run so nothing looks in-flight."""
         self._current_step      = None
         self._reflex_preempt_by = None
+        self._unwinding         = False
         self._run_prepared      = False
 
     @abstractmethod
@@ -552,11 +558,15 @@ class MultiStepActionNode(BaseActionNode):
         error: BaseException | None = None
 
         if self.interrupt_policy == InterruptPolicy.ROLLBACK:
+            # Not reset in a finally: if a preemption cancels the walk, the
+            # flag must still be set when the safe-stop runs.
+            self._unwinding = True
             try:
                 await self.on_interrupted(self._completed_steps.copy(), pending, proposal)
                 rolled_back = True
             except RollbackError as exc:
                 error = exc
+            self._unwinding = False
 
         self._current_step = None
         return Result(
@@ -579,10 +589,12 @@ class MultiStepActionNode(BaseActionNode):
     ) -> tuple[bool, BaseException | None]:
         """
         Safe-stop hook, then the rollback walk if ``rollback_on_preempt``.
-        ``allow_rollback=False`` (shutdown / emergency_stop) skips the walk.
+        ``allow_rollback=False`` (shutdown / emergency_stop) skips the walk,
+        and so does a preemption that cut into a rollback walk already in
+        progress — restarting it would undo completed steps twice.
         """
         rolled_back, error = await super()._run_safe_stop(proposal, preempted_by)
-        if self.rollback_on_preempt and allow_rollback:
+        if self.rollback_on_preempt and allow_rollback and not self._unwinding:
             try:
                 await self._rollback_completed(self._completed_steps.copy())
                 rolled_back = True
@@ -630,12 +642,14 @@ class MultiStepActionNode(BaseActionNode):
         if failed.error is not None:
             error.__cause__ = failed.error
         rolled_back = False
+        self._unwinding = True  # see _handle_interrupt: not reset on cancel
         try:
             rolled_back = await self.on_aborted(
                 self._completed_steps[:-1], step, proposal,
             )
         except RollbackError as exc:
             error = exc
+        self._unwinding = False
 
         self._current_step = None
         return Result(
