@@ -7,6 +7,7 @@ import time
 
 import pytest
 
+import arachnite.runtime as runtime_module
 from arachnite import SignalBus
 from arachnite.context import ContextNode
 from arachnite.models import Context, Proposal, Result, Signal
@@ -15,6 +16,7 @@ from arachnite.nodes.decision import DecisionMasterNode, GreedyDecisionNode
 from arachnite.nodes.instinct import BaseInstinctNode, BaseReflexInstinctNode, InstinctMasterNode
 from arachnite.nodes.sense import BaseSenseNode, SenseMasterNode
 from arachnite.runtime import ArachniteRuntime
+from tests.conftest import ManualClock
 
 SLOW_TICK_HZ = 2.0      # 500 ms tick: tick-quantised reflexes would be slow
 
@@ -111,13 +113,15 @@ def _build(
     reflex_mode: str = "event",
     extra_reflexes: tuple[BaseReflexInstinctNode, ...] = (),
     instincts: tuple[BaseInstinctNode, ...] = (),
+    extra_actions: tuple[BaseActionNode, ...] = (),
+    reflex_conflict: str = "dispatch_all",
     tick_hz: float = SLOW_TICK_HZ,
     bus: SignalBus,
 ) -> tuple[ArachniteRuntime, CollisionReflex, Retract]:
     sm = SenseMasterNode(bus=bus)
     for node in sense:
         sm.register(node)
-    im = InstinctMasterNode(bus=bus)
+    im = InstinctMasterNode(bus=bus, reflex_conflict=reflex_conflict)
     reflex = CollisionReflex(bus)
     im.register(reflex)
     for extra in extra_reflexes:
@@ -127,6 +131,8 @@ def _build(
     am = ActionMasterNode(bus=bus)
     retract = Retract(bus)
     am.register(retract)
+    for action in extra_actions:
+        am.register(action)
     rt = ArachniteRuntime(
         sense_master=sm, context=ContextNode(), instinct_master=im,
         decision_master=DecisionMasterNode(bus=bus, strategy=GreedyDecisionNode(bus=bus)),
@@ -273,3 +279,126 @@ def test_invalid_reflex_mode_rejected() -> None:
             action_master=ActionMasterNode(bus=bus), bus=bus,
             reflex_mode="sometimes",
         )
+
+
+# ── Mutation-evidence hardening (v0.13) ───────────────────────────────────────
+
+class SmokeReflex(BaseReflexInstinctNode):
+    """Lane reflex on another signal kind; counts its evaluations."""
+    node_id = "SmokeReflex"
+    priority = 240
+    trigger_on_signals = ["smoke"]
+
+    def __init__(self, bus: SignalBus) -> None:
+        super().__init__(bus)
+        self.evaluations = 0
+
+    async def evaluate(self, ctx: Context) -> Proposal | None:
+        self.evaluations += 1
+        return None
+
+
+class BrakeReflex(BaseReflexInstinctNode):
+    """Fires on the same hazard and priority as CollisionReflex (a tie)."""
+    node_id = "BrakeReflex"
+    priority = 250
+    trigger_on_signals = ["proximity"]
+
+    async def evaluate(self, ctx: Context) -> Proposal | None:
+        if any(s.kind == "proximity" and s.value < 0.05 for s in ctx.signals):
+            return Proposal(instinct_id=self.node_id, action_id="Brake",
+                            priority=self.priority, urgency=1.0)
+        return None
+
+
+class Brake(Retract):
+    """Reflex action on a resource disjoint from Retract's."""
+    node_id = "Brake"
+    resources = frozenset({"wheels"})
+
+
+class TestEventLaneEdges:
+    @pytest.mark.asyncio
+    async def test_signal_age_on_a_freshly_booted_clock(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A lane signal older than the TTL is stale, also when the clock started near zero"""
+        clock = ManualClock(now=0.5)
+        monkeypatch.setattr(runtime_module, "time", clock)
+        bus = SignalBus()
+        sensor = EventProximity(bus)
+        rt, reflex, _ = _build(sensor, bus=bus)
+        rt._reflex_signal_ttl_s = 0.05
+        await rt.start()
+        await rt.pause()
+        await sensor.push(_signal("left", "proximity", 1.0))
+        clock.now = 1.0                         # "left" is now 0.5 s old
+        await sensor.push(_signal("right", "proximity", 1.0))
+        await rt.stop()
+        assert reflex.seen[-1] == ["right:proximity"]
+
+    @pytest.mark.asyncio
+    async def test_zero_ttl_still_sees_the_trigger_signal(self) -> None:
+        """With reflex_signal_ttl_s=0 the reflex still sees the signal that triggered it"""
+        bus = SignalBus()
+        sensor = EventProximity(bus)
+        rt, _, retract = _build(sensor, bus=bus)
+        rt._reflex_signal_ttl_s = 0.0
+        await rt.start()
+        await rt.pause()
+        await sensor.push(_signal("EventProximity", "proximity", 0.01))
+        await rt.wait_idle(1.0)
+        await rt.stop()
+        assert len(retract.entered) == 1
+
+    @pytest.mark.asyncio
+    async def test_lane_evaluates_only_reflexes_triggered_by_the_kind(self) -> None:
+        """A pushed signal evaluates only the lane reflexes whose trigger kinds include it"""
+        bus = SignalBus()
+        sensor = EventProximity(bus)
+        smoke = SmokeReflex(bus)
+        rt, reflex, _ = _build(sensor, extra_reflexes=(smoke,), bus=bus)
+        await rt.start()
+        await rt.pause()
+        evaluations_before = reflex.evaluations
+        await sensor.push(_signal("EventProximity", "proximity", 1.0))
+        await rt.stop()
+        assert reflex.evaluations == evaluations_before + 1
+        assert smoke.evaluations == 0
+
+    @pytest.mark.asyncio
+    async def test_raise_policy_tie_on_the_lane_dispatches_all(self) -> None:
+        """A lane priority tie under reflex_conflict='raise' dispatches every reflex"""
+        bus = SignalBus()
+        sensor = EventProximity(bus)
+        brake = Brake(bus)
+        rt, _, retract = _build(
+            sensor, extra_reflexes=(BrakeReflex(bus),), extra_actions=(brake,),
+            reflex_conflict="raise", bus=bus,
+        )
+        await rt.start()
+        await rt.pause()
+        await sensor.push(_signal("EventProximity", "proximity", 0.01))
+        await rt.wait_idle(1.0)
+        await rt.stop()
+        assert len(retract.entered) == 1
+        assert len(brake.entered) == 1
+
+    @pytest.mark.asyncio
+    async def test_evaluation_timeout_never_raises_into_the_publisher(self) -> None:
+        """A lane evaluation that times out is logged; bus.publish() does not raise"""
+        bus = SignalBus()
+        sensor = EventProximity(bus)
+        rt, reflex, retract = _build(sensor, bus=bus)
+        rt._reflex_eval_timeout_s = 0.02
+
+        async def hung(ctx: Context) -> Proposal | None:
+            await asyncio.Event().wait()
+            return None
+
+        reflex.evaluate = hung  # type: ignore[method-assign]
+        await rt.start()
+        await rt.pause()
+        await bus.publish(_signal("EventProximity", "proximity", 0.01))   # must not raise
+        await rt.stop()
+        assert retract.entered == []

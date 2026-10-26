@@ -470,3 +470,114 @@ class TestReflexConflictError:
         await rt.tick()
 
         assert sorted(executed) == ["ActionA", "ActionB"]
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Stop points around mandatory blocks (mutation-evidence hardening, v0.13)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class LayoutAction(MultiStepActionNode):
+    """
+    Steps s0..sN with the given interruptible flags under ALWAYS; optionally
+    requests an interrupt from inside step ``interrupt_during``.
+    """
+    node_id          = "LayoutAction"
+    interrupt_policy = InterruptPolicy.ALWAYS
+
+    def __init__(
+        self, bus: SignalBus, layout: list[bool], interrupt_during: int | None = None,
+    ) -> None:
+        super().__init__(bus=bus)
+        self.layout = layout
+        self.interrupt_during = interrupt_during
+        self.ran: list[str] = []
+
+    def steps(self) -> list[ActionStep]:
+        return [ActionStep(f"s{i}", interruptible=flag) for i, flag in enumerate(self.layout)]
+
+    async def execute_step(
+        self, step: ActionStep, proposal: Proposal, completed: list[StepResult]
+    ) -> StepResult:
+        self.ran.append(step.name)
+        if self.interrupt_during is not None and step.name == f"s{self.interrupt_during}":
+            self.request_interrupt(_make_interrupt())
+        return StepResult(step_name=step.name, success=True)
+
+
+OPEN, MAND = True, False     # interruptible step / mandatory-block step
+
+
+class TestStopPointsAroundMandatoryBlocks:
+    @pytest.mark.asyncio
+    async def test_interrupt_inside_a_late_block_is_held_until_it_ends(self) -> None:
+        """An interrupt inside a block that starts after step 1 waits for the block's end"""
+        action = LayoutAction(SignalBus(), [OPEN, OPEN, MAND, MAND, OPEN], interrupt_during=2)
+        result = await action.execute(make_proposal(action_id=action.node_id))
+        assert action.ran == ["s0", "s1", "s2", "s3"]
+        assert result.interrupted
+        assert result.stopped_at_step == "s4"
+
+    @pytest.mark.asyncio
+    async def test_boundary_before_a_block_at_an_even_index_is_a_stop_point(self) -> None:
+        """A pending interrupt is honoured before a block starting at an even step index"""
+        action = LayoutAction(SignalBus(), [OPEN, OPEN, MAND, MAND], interrupt_during=1)
+        result = await action.execute(make_proposal(action_id=action.node_id))
+        assert action.ran == ["s0", "s1"]
+        assert result.interrupted
+        assert result.stopped_at_step == "s2"
+
+    @pytest.mark.asyncio
+    async def test_action_ending_in_a_block_at_an_even_index_completes(self) -> None:
+        """An action whose last step is a mandatory step at an even index runs to completion"""
+        action = LayoutAction(SignalBus(), [OPEN, OPEN, MAND])
+        result = await action.execute(make_proposal(action_id=action.node_id))
+        assert result.success
+        assert action.ran == ["s0", "s1", "s2"]
+
+    @pytest.mark.asyncio
+    async def test_leading_block_holds_an_interrupt_until_it_ends(self) -> None:
+        """An interrupt inside a block that starts at step 0 waits for the block's end"""
+        action = LayoutAction(SignalBus(), [MAND, MAND, OPEN], interrupt_during=0)
+        result = await action.execute(make_proposal(action_id=action.node_id))
+        assert action.ran == ["s0", "s1"]
+        assert result.interrupted
+        assert result.stopped_at_step == "s2"
+
+    @pytest.mark.asyncio
+    async def test_interrupt_pending_at_launch_is_honoured_before_a_leading_block(self) -> None:
+        """An interrupt arriving between launch() and step 0 stops before a leading block"""
+        bus = SignalBus()
+        action = LayoutAction(bus, [MAND, MAND])
+        am = ActionMasterNode(bus=bus)
+        am.register(action)
+        am.launch(make_proposal(action_id=action.node_id))
+        action.request_interrupt(_make_interrupt())    # task not started yet
+        assert await am.wait_idle(2.0)
+        assert action.ran == []
+        assert am.drain_completed()[0].interrupted
+
+
+class TestRuntimeLessReexecution:
+    @pytest.mark.asyncio
+    async def test_reexecute_after_an_interrupted_run_starts_clean(self) -> None:
+        """A second direct execute() is not affected by the first run's interrupt or steps"""
+        action = LayoutAction(SignalBus(), [OPEN, OPEN, OPEN], interrupt_during=0)
+        first = await action.execute(make_proposal(action_id=action.node_id))
+        assert first.interrupted
+        action.interrupt_during = None
+        action.ran.clear()
+        second = await action.execute(make_proposal(action_id=action.node_id))
+        assert not second.interrupted
+        assert action.ran == ["s0", "s1", "s2"]
+        assert len(second.step_results) == 3
+
+    @pytest.mark.asyncio
+    async def test_late_interrupt_after_a_finished_run_does_not_leak(self) -> None:
+        """An interrupt requested after a direct run finished does not stop the next run"""
+        action = LayoutAction(SignalBus(), [OPEN, OPEN, OPEN])
+        await action.execute(make_proposal(action_id=action.node_id))
+        action.request_interrupt(_make_interrupt())
+        action.ran.clear()
+        second = await action.execute(make_proposal(action_id=action.node_id))
+        assert not second.interrupted
+        assert action.ran == ["s0", "s1", "s2"]

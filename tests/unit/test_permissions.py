@@ -294,3 +294,62 @@ class TestRuntimePermissions:
         await rt.start()
         assert rt.is_running
         await rt.stop()
+
+
+# ── Mutation-evidence hardening (v0.13) ──────────────────────────────────────
+
+def _one_agent_manifest(nodes: dict[str, list[dict[str, object]]]) -> DeploymentManifest:
+    return DeploymentManifest.from_dict({
+        "mesh": {"name": "test", "transport_default": "local"},
+        "agents": [{"id": "agent-1", "nodes": nodes}],
+    })
+
+
+class TestValidatePermissionsEdges:
+
+    def test_violation_after_unlisted_node_detected(self) -> None:
+        """A node missing from the map does not stop validation of later nodes"""
+        bus = SignalBus()
+        nodes: list[BaseNode] = [_PlainSense(bus=bus), _GpuAction(bus=bus)]
+        with pytest.raises(PermissionValidationError, match="gpu"):
+            validate_permissions(nodes, {"GpuAction": {Permission.NETWORK}})
+
+    def test_violation_message_lists_the_allowed_set(self) -> None:
+        """The error names the allowed set, or '(none)' when it is empty"""
+        bus = SignalBus()
+        with pytest.raises(PermissionValidationError) as exc_info:
+            validate_permissions([_GpuAction(bus=bus)], {"GpuAction": {Permission.NETWORK}})
+        assert "not in its allowed set [network]" in str(exc_info.value)
+        with pytest.raises(PermissionValidationError) as exc_info:
+            validate_permissions([_NetworkSense(bus=bus)], {"NetworkSense": set()})
+        assert "not in its allowed set [(none)]" in str(exc_info.value)
+
+
+class TestManifestPermissionsEdges:
+
+    def test_validate_passes_when_allowed_is_a_strict_superset(self) -> None:
+        """Allowing more than a node declares is not a violation"""
+        _one_agent_manifest({"sense": [{
+            "kind": "tests.unit.test_permissions._NetworkSense",
+            "permissions": ["network", "gpu"],
+        }]}).validate()  # must not raise
+
+    def test_violation_after_unwhitelisted_node_detected(self) -> None:
+        """A node without a permissions key does not stop checking later nodes"""
+        manifest = _one_agent_manifest({"sense": [
+            {"kind": "tests.unit.test_permissions._PlainSense"},
+            {"kind": "tests.unit.test_permissions._NetworkSense", "permissions": []},
+        ]})
+        with pytest.raises(ManifestValidationError, match="network"):
+            manifest.validate()
+
+    def test_violation_message_lists_the_allowed_set(self) -> None:
+        """The manifest error names the allowed set, or '(none)' when it is empty"""
+        for allowed, shown in ((["network"], "[network]"), ([], "[(none)]")):
+            manifest = _one_agent_manifest({"action": [{
+                "kind": "tests.unit.test_permissions._GpuAction",
+                "permissions": allowed,
+            }]})
+            with pytest.raises(ManifestValidationError) as exc_info:
+                manifest.validate()
+            assert f"not in its allowed set {shown}" in str(exc_info.value)

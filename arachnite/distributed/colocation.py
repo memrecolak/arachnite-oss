@@ -23,11 +23,12 @@ def validate_colocation(
 
     Args:
         assignments: list of dicts with keys:
-            - node_class_name: str
-            - agent_node_id:   str
-            - is_reflex:       bool
+            - node_id:          str
+            - agent_node_id:    str
+            - node_section:     str  (manifest section; only "action"
+                                      assignments count as reflex targets)
+            - is_reflex:        bool
             - reflex_action_id: str | None  (action_id for reflex nodes)
-            - node_id:         str
 
     Raises:
         ManifestValidationError: if any co-location constraints are violated.

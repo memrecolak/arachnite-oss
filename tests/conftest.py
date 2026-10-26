@@ -80,6 +80,29 @@ def make_proposal(
     )
 
 
+class ManualClock:
+    """
+    Stand-in for the ``time`` module whose clocks read ``now``.
+
+    Monkeypatch it over a framework module's ``time`` attribute to make
+    durations and signal ages exact: ``monotonic()`` and ``perf_counter()``
+    return ``now`` (the test advances it); every other attribute is the
+    real ``time`` module's.
+    """
+
+    def __init__(self, now: float = 0.0) -> None:
+        self.now = now
+
+    def monotonic(self) -> float:
+        return self.now
+
+    def perf_counter(self) -> float:
+        return self.now
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(time, name)
+
+
 # ── Concrete test nodes ───────────────────────────────────────────────────────
 
 class ConstantSenseNode(BaseSenseNode):

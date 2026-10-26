@@ -741,6 +741,11 @@ class ArachniteRuntime:
         Launch reflex proposals (priority order) through the action master's
         arbitration, then yield once so a started reflex action enters
         ``execute()`` now rather than after the rest of the tick.
+
+        On Python < 3.12 one yield is not always enough: the reflex action's
+        first slice (and a preempted owner's safe-stop) may run after the
+        reflex stage instead. The reflex is still launched, and its resources
+        claimed, before deliberation; only the stage it is charged to differs.
         """
         started = False
         for rp in reflex_proposals:

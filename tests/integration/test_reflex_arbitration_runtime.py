@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import sys
 import time
+from collections.abc import Callable
 
 import pytest
 
@@ -387,3 +389,120 @@ class TestSameTickResourceConflict:
         high, low = await self._run(persist=True)
         assert high.calls == 1
         assert low.calls == 0
+
+
+# ── Mutation-evidence hardening (v0.13) ───────────────────────────────────────
+
+# Before Python 3.12, asyncio.wait_for() runs its awaitable in a task of its
+# own, so the single yield after the reflex launch reaches the action task but
+# not yet its execute() / safe-stop. The reflex still starts before
+# deliberation there; only the reflex-stage attribution differs.
+_NEEDS_INLINE_WAIT_FOR = pytest.mark.skipif(
+    sys.version_info < (3, 12),
+    reason="asyncio.wait_for() runs the awaitable in a separate task before 3.12",
+)
+
+
+class _StageProbe:
+    """TickInstrumenter recording what ``probe`` reports at the end of the reflex stage."""
+
+    def __init__(self, probe: Callable[[], object]) -> None:
+        self.probe = probe
+        self.at_reflex_end: object = None
+
+    def on_stage(self, stage: str, duration_s: float) -> None:
+        if stage == "reflex":
+            self.at_reflex_end = self.probe()
+
+    def on_tick_complete(self, tick_index: int, total_s: float) -> None:
+        pass
+
+
+class _SwitchedReflex(BaseReflexInstinctNode):
+    """Tick-stage reflex proposing Retract while ``active``."""
+    node_id = "SwitchedReflex"
+    priority = 250
+
+    def __init__(self, bus: SignalBus) -> None:
+        super().__init__(bus)
+        self.active = False
+
+    async def evaluate(self, ctx: Context) -> Proposal | None:
+        if not self.active:
+            return None
+        return Proposal(instinct_id=self.node_id, action_id="Retract",
+                        priority=self.priority, urgency=1.0)
+
+
+class _HoldArm(BaseActionNode):
+    """Deliberative owner of the arm until preempted; records its safe-stop."""
+    node_id = "HoldArm"
+    resources = frozenset({"arm"})
+
+    def __init__(self, bus: SignalBus) -> None:
+        super().__init__(bus)
+        self.started = asyncio.Event()
+        self.safe_stopped = False
+
+    async def execute(self, proposal: Proposal) -> Result:
+        self.started.set()
+        await asyncio.Event().wait()
+        return Result(action_id=self.node_id, success=True)
+
+    async def on_preempted(self, proposal: Proposal, preempted_by: Proposal) -> None:
+        self.safe_stopped = True
+
+
+async def _paused_stage_runtime() -> tuple[
+    ArachniteRuntime, ActionMasterNode, _SwitchedReflex, _HoldArm, Retract,
+]:
+    bus = SignalBus()
+    im = InstinctMasterNode(bus=bus)
+    reflex = _SwitchedReflex(bus)
+    im.register(reflex)
+    am = ActionMasterNode(bus=bus)
+    hold, retract = _HoldArm(bus), Retract(bus, World())
+    am.register(hold)
+    am.register(retract)
+    rt = ArachniteRuntime(
+        sense_master=SenseMasterNode(bus=bus), context=ContextNode(), instinct_master=im,
+        decision_master=DecisionMasterNode(bus=bus, strategy=GreedyDecisionNode(bus=bus)),
+        action_master=am, bus=bus, tick_rate_hz=TICK_HZ, reflex_mode="tick",
+    )
+    await rt.start()
+    await rt.pause()
+    await rt.wait_idle(1.0)
+    return rt, am, reflex, hold, retract
+
+
+class TestReflexStageAttribution:
+    @_NEEDS_INLINE_WAIT_FOR
+    @pytest.mark.asyncio
+    async def test_launched_reflex_enters_execute_within_the_reflex_stage(self) -> None:
+        """A reflex launched on a free resource enters execute() before the reflex stage ends"""
+        rt, _, reflex, _, retract = await _paused_stage_runtime()
+        probe = _StageProbe(lambda: retract.entered_at is not None)
+        rt.set_tick_instrumenter(probe)
+        reflex.active = True
+        await rt.tick()
+        reflex.active = False
+        await rt.wait_idle(1.0)
+        await rt.stop()
+        assert probe.at_reflex_end is True
+
+    @_NEEDS_INLINE_WAIT_FOR
+    @pytest.mark.asyncio
+    async def test_preempted_owner_safe_stops_within_the_reflex_stage(self) -> None:
+        """An armed reflex's preempted owner runs its safe-stop before the reflex stage ends"""
+        rt, am, reflex, hold, _ = await _paused_stage_runtime()
+        am.launch(Proposal(instinct_id="Planner", action_id="HoldArm",
+                           priority=60, urgency=0.5))
+        await hold.started.wait()
+        probe = _StageProbe(lambda: hold.safe_stopped)
+        rt.set_tick_instrumenter(probe)
+        reflex.active = True
+        await rt.tick()
+        reflex.active = False
+        await rt.wait_idle(1.0)
+        await rt.stop()
+        assert probe.at_reflex_end is True

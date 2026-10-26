@@ -566,3 +566,25 @@ class TestValidateColocationErrorAccumulation:
         with pytest.raises(ManifestValidationError) as exc_info:
             validate_colocation(assignments)
         assert "no ActionNode" in str(exc_info.value)
+
+
+# ── Mutation-evidence hardening (v0.13) ───────────────────────────────────────
+
+class TestValidateColocationActionSection:
+    @pytest.mark.parametrize("section", [None, "", "Action", "ability"])
+    def test_target_outside_the_action_section_is_not_an_action(
+        self, section: str | None,
+    ) -> None:
+        """Only an assignment in the 'action' section counts as a reflex target"""
+        target = _assignment("EmergencyStop", "edge-01")
+        if section is None:
+            del target["node_section"]
+        else:
+            target["node_section"] = section
+        assignments = [
+            target,
+            _assignment("CriticalReflex", "edge-01", "instinct",
+                        is_reflex=True, reflex_action_id="EmergencyStop"),
+        ]
+        with pytest.raises(ManifestValidationError, match="no ActionNode"):
+            validate_colocation(assignments)

@@ -10,6 +10,7 @@ import pytest
 from arachnite import SignalBus
 from arachnite.exceptions import (
     ActionNotFoundError,
+    ActionTimeoutError,
     ActionVetoed,
     MandatoryBlockViolation,
     NodeRegistrationError,
@@ -25,6 +26,7 @@ from arachnite.models import (
     Result,
     StepResult,
 )
+from arachnite.nodes import action as action_module
 from arachnite.nodes.action import (
     ActionGuard,
     ActionMasterNode,
@@ -32,6 +34,7 @@ from arachnite.nodes.action import (
     GuardVerdict,
     MultiStepActionNode,
 )
+from tests.conftest import ManualClock
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
@@ -1549,3 +1552,176 @@ class TestCheckInterruptQuiescent:
 
         assert result.success is True
         assert node.polls == [False, False, False]
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Mutation-evidence hardening (v0.13) — kills the gap mutants that survived
+# the reflex-arbitration mutation run on the Table 6 sites
+# ══════════════════════════════════════════════════════════════════════════════
+
+class _ClockAdvancingAction(BaseActionNode):
+    """Single-shot action that moves a ManualClock forward while it runs."""
+    node_id = "_ClockAdvancingAction"
+
+    def __init__(self, bus: SignalBus, clock: ManualClock, run_s: float) -> None:
+        super().__init__(bus=bus)
+        self.clock = clock
+        self.run_s = run_s
+
+    async def execute(self, proposal: Proposal) -> Result:
+        self.clock.now += self.run_s
+        return Result(action_id=self.node_id, success=True)
+
+
+class _ClockedStepsAction(MultiStepActionNode):
+    """grip (mandatory, moves the clock 3 s) → carry; optionally asks for a
+    WAIT_FOR_BLOCK reflex hand-off from inside the block."""
+    node_id = "_ClockedStepsAction"
+
+    def __init__(self, bus: SignalBus, clock: ManualClock, hand_off: bool) -> None:
+        super().__init__(bus=bus)
+        self.clock = clock
+        self.hand_off = hand_off
+
+    def steps(self) -> list[ActionStep]:
+        return [
+            ActionStep("grip",  interruptible=False),
+            ActionStep("carry", interruptible=True),
+        ]
+
+    async def execute_step(
+        self, step: ActionStep, proposal: Proposal, completed: list[StepResult]
+    ) -> StepResult:
+        if step.name == "grip":
+            if self.hand_off:
+                self.request_reflex_preempt(_proposal("Retract"))
+            self.clock.now += 3.0
+        return StepResult(step_name=step.name, success=True)
+
+
+class _JammedGripAction(RaisingStepAction):
+    """ROLLBACK abort whose undo of 'grip' fails; retries are allowed."""
+    node_id          = "_JammedGripAction"
+    interrupt_policy = InterruptPolicy.ROLLBACK
+    max_retries      = 2
+
+    async def _undo_grip(self) -> None:
+        self.rolled.append("grip")
+        raise OSError("gripper jammed")
+
+
+class _AlwaysFailingAction(_CountingAction):
+    """Returns a failed Result on every attempt."""
+    node_id     = "_AlwaysFailingAction"
+    max_retries = 1
+
+    async def execute(self, proposal: Proposal) -> Result:
+        self.calls += 1
+        return Result(action_id=self.node_id, success=False, error=RuntimeError("no"))
+
+
+class _HangingStepAction(MultiStepActionNode):
+    """One step that never finishes on its own; timeouts are set per test."""
+    node_id = "_HangingStepAction"
+
+    def __init__(
+        self, bus: SignalBus, *, step_timeout_s: float | None, action_timeout_s: float,
+    ) -> None:
+        super().__init__(bus=bus)
+        self.step_timeout_s = step_timeout_s
+        self.timeout_s = action_timeout_s
+
+    def steps(self) -> list[ActionStep]:
+        return [ActionStep("hang", interruptible=True, timeout_s=self.step_timeout_s)]
+
+    async def execute_step(
+        self, step: ActionStep, proposal: Proposal, completed: list[StepResult]
+    ) -> StepResult:
+        await asyncio.Event().wait()
+        return StepResult(step_name=step.name, success=True)
+
+
+class TestReportedDuration:
+    @pytest.mark.asyncio
+    async def test_dispatch_reports_elapsed_time_measured_by_the_master(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A dispatched Result's duration_s is the master-measured elapsed time"""
+        clock = ManualClock(now=1.0)
+        monkeypatch.setattr(action_module, "time", clock)
+        bus = _bus()
+        am = ActionMasterNode(bus=bus)
+        am.register(_ClockAdvancingAction(bus, clock, run_s=3.0))
+        result = await am.dispatch(_proposal("_ClockAdvancingAction"))
+        assert result.success is True
+        assert result.duration_s == pytest.approx(3.0)
+
+    @pytest.mark.asyncio
+    async def test_multistep_duration_is_elapsed_time_on_a_freshly_booted_clock(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """duration_s is end minus start even when the clock started near zero"""
+        clock = ManualClock(now=1.0)
+        monkeypatch.setattr(action_module, "time", clock)
+        node = _ClockedStepsAction(_bus(), clock, hand_off=False)
+        result = await node.execute(_proposal("_ClockedStepsAction"))
+        assert result.success is True
+        assert result.duration_s == pytest.approx(3.0)
+
+    @pytest.mark.asyncio
+    async def test_runtime_less_reflex_hand_off_reports_elapsed_time(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A WAIT_FOR_BLOCK hand-off outside a master still reports elapsed time"""
+        clock = ManualClock(now=1.0)
+        monkeypatch.setattr(action_module, "time", clock)
+        node = _ClockedStepsAction(_bus(), clock, hand_off=True)
+        result = await node.execute(_proposal("_ClockedStepsAction"))
+        assert result.preempted is True
+        assert result.stopped_at_step == "carry"
+        assert result.duration_s == pytest.approx(3.0)
+
+
+class TestRetryBudget:
+    @pytest.mark.asyncio
+    async def test_abort_with_failed_rollback_is_not_retried(self) -> None:
+        """An abort whose rollback failed is never re-run from step 1"""
+        bus = _bus()
+        am = ActionMasterNode(bus=bus)
+        node = _JammedGripAction(bus=bus)
+        am.register(node)
+        result = await am.dispatch(_proposal("_JammedGripAction"))
+        assert result.interrupted is False
+        assert isinstance(result.error, RollbackError)
+        assert node.rolled == ["grip"]              # one attempt, one undo
+
+    @pytest.mark.asyncio
+    async def test_failing_action_is_attempted_max_retries_plus_one_times(self) -> None:
+        """A persistently failing action runs exactly max_retries + 1 times"""
+        bus = _bus()
+        am = ActionMasterNode(bus=bus)
+        node = _AlwaysFailingAction(bus=bus)
+        am.register(node)
+        result = await am.dispatch(_proposal("_AlwaysFailingAction"))
+        assert result.success is False
+        assert node.calls == 2
+
+
+class TestStepTimeoutSelection:
+    @pytest.mark.asyncio
+    async def test_step_timeout_overrides_action_timeout(self) -> None:
+        """A step's own timeout_s bounds it, not the longer action timeout"""
+        node = _HangingStepAction(_bus(), step_timeout_s=0.05, action_timeout_s=30.0)
+        result = await asyncio.wait_for(node.execute(_proposal("_HangingStepAction")), 2.0)
+        assert result.success is False
+        assert isinstance(result.error, StepAbortError)
+        assert isinstance(result.error.__cause__, ActionTimeoutError)
+
+    @pytest.mark.asyncio
+    async def test_action_timeout_bounds_step_without_its_own(self) -> None:
+        """A step without timeout_s is bounded by the action's timeout_s"""
+        node = _HangingStepAction(_bus(), step_timeout_s=None, action_timeout_s=0.05)
+        result = await asyncio.wait_for(node.execute(_proposal("_HangingStepAction")), 2.0)
+        assert result.success is False
+        assert isinstance(result.error, StepAbortError)
+        assert isinstance(result.error.__cause__, ActionTimeoutError)

@@ -781,3 +781,49 @@ class TestReflexPriorityOrdering:
         proposals = await im.evaluate_reflexes(_ctx())
         assert len(proposals) == 3
         assert proposals[0].priority == 250
+
+
+# ── Mutation-evidence hardening (v0.13) ───────────────────────────────────────
+
+class _ConfiguredPriorityReflex(BaseReflexInstinctNode):
+    """Reflex whose priority is parsed at runtime, as from a config file."""
+    node_id  = "_ConfiguredPriorityReflex"
+    priority = int("1000")      # above CPython's small-int cache
+
+    async def evaluate(self, ctx: Context) -> Proposal | None:
+        return Proposal(
+            instinct_id=self.node_id, action_id="EmergencyStop",
+            priority=int(str(self.priority)), urgency=1.0,
+        )
+
+
+class _ConfiguredPriorityReflexB(_ConfiguredPriorityReflex):
+    node_id = "_ConfiguredPriorityReflexB"
+
+
+class _SilentReflex(BaseReflexInstinctNode):
+    """Enabled reflex that never fires."""
+    node_id  = "_SilentReflex"
+    priority = 250
+
+    async def evaluate(self, ctx: Context) -> Proposal | None:
+        return None
+
+
+class TestReflexConflictPolicyEdges:
+    @pytest.mark.asyncio
+    async def test_raise_policy_detects_tie_between_distinct_large_priorities(self) -> None:
+        """A tie is detected by value, also for equal priorities that are distinct int objects"""
+        im = InstinctMasterNode(bus=_bus(), reflex_conflict="raise")
+        im.register(_ConfiguredPriorityReflex(bus=_bus()))
+        im.register(_ConfiguredPriorityReflexB(bus=_bus()))
+        with pytest.raises(ReflexConflictError) as exc_info:
+            await im.evaluate_reflexes(_ctx())
+        assert exc_info.value.priority == 1000
+
+    @pytest.mark.asyncio
+    async def test_raise_policy_with_no_firing_reflex_returns_empty(self) -> None:
+        """The raise policy returns no proposals when no reflex fires"""
+        im = InstinctMasterNode(bus=_bus(), reflex_conflict="raise")
+        im.register(_SilentReflex(bus=_bus()))
+        assert await im.evaluate_reflexes(_ctx()) == []
