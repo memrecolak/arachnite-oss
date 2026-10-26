@@ -46,7 +46,9 @@ from arachnite.supervisor import NodeSupervisor
 
 # ── Tick-stage instrumentation protocol ──────────────────────────────────────
 #
-# ADR 0002 (2026-04-16): opt-in per-stage timing hook for the tick loop.
+# Tick-stage instrumentation ADR (2026-04-16; numbered 0002 in the project's
+# original ADR series — not docs/decisions/0002 in this repository): opt-in
+# per-stage timing hook for the tick loop.
 # Default runtime path pays a single ``is not None`` branch per stage
 # boundary; when an instrumenter is attached it receives one
 # ``on_stage(name, duration_s)`` call per stage per tick plus one
@@ -55,7 +57,7 @@ from arachnite.supervisor import NodeSupervisor
 # The vocabulary of stage names is fixed and published as
 # ``TICK_STAGE_NAMES`` so external tooling (benchmarks, OpenTelemetry
 # adapters, Prometheus sinks) can rely on a stable set of identifiers.
-# Additions require a new ADR (see ADR 0002 §Consequences).
+# Additions require a new ADR (see the tick-stage instrumentation ADR §Consequences).
 
 TICK_STAGE_NAMES: tuple[str, ...] = (
     "sense",
@@ -83,7 +85,7 @@ class TickInstrumenter(Protocol):
 
     Stage names are drawn from ``TICK_STAGE_NAMES`` and cover the six
     pipeline stages: ``sense``, ``context``, ``reflex``, ``instinct``,
-    ``decide``, ``act``. See ADR 0002 for the mapping to ``tick()``
+    ``decide``, ``act``. See the tick-stage instrumentation ADR for the mapping to ``tick()``
     source lines.
     """
 
@@ -96,19 +98,25 @@ class ArachniteRuntime:
     Wires all master nodes together and runs the tick loop.
 
     The tick sequence each cycle:
+    0. Drain Results of actions that finished since the previous tick
     1. SenseMasterNode.read_all()         → signals
     1b. Inject buffered supervisor + node_fault signals captured since the
         previous tick (a node raising during tick N surfaces here on tick N+1)
-    2. ContextNode.update(signals)        → context
+    2. ContextNode.update(signals, results) → context
     3. InstinctMasterNode.evaluate_reflexes(ctx) → reflex proposals
-       └─ dispatch each reflex immediately (bypass decision, sequential)
+       └─ launch_reflex() each (bypass decision; preempt per ReflexPreemption)
     4. InstinctMasterNode.evaluate_all(ctx) → normal proposals
     5. DecisionMasterNode.on_new_proposals_many() → proposals + interrupts
-    6. ActionMasterNode.dispatch_many(chosen) → results (concurrent)
-    7. ContextNode.update result feedback
+    6. ActionMasterNode.launch(chosen)    → tasks (blocked ones parked)
+    7. Tick-end hooks
 
-    Different ActionNodes execute concurrently via asyncio.gather().
-    The same ActionNode cannot run twice concurrently.
+    Actions run as tasks across ticks — the tick never awaits them — so
+    sensing and reflexes continue while a long action runs (ADR 0005).
+    Their Results reach ``ctx.last_results`` on the tick after they finish.
+    At most one running action owns a declared resource; the same
+    ActionNode never runs twice concurrently. With ``reflex_mode="event"``
+    reflexes that declare ``trigger_on_signals`` are evaluated on signal
+    arrival instead of in step 3.
 
     Spec reference: Section 7.
     """
@@ -230,7 +238,7 @@ class ArachniteRuntime:
         self._state_update_buffer: list[Signal] = []
         self._bus.subscribe("state_update", self._on_state_update_signal)
 
-        # Optional per-stage timing callback (ADR 0002). When ``None``
+        # Optional per-stage timing callback (the tick-stage instrumentation ADR). When ``None``
         # the tick path short-circuits on a single branch per stage.
         self._tick_instrumenter: TickInstrumenter | None = tick_instrumenter
 
@@ -323,7 +331,7 @@ class ArachniteRuntime:
         with contextlib.suppress(ValueError):
             self._decision_observers.remove(observer)
 
-    # ── Tick instrumentation (ADR 0002) ──────────────────────────────────────
+    # ── Tick instrumentation (tick-stage instrumentation ADR) ────────────────
 
     def set_tick_instrumenter(
         self, instrumenter: TickInstrumenter | None,
@@ -331,7 +339,7 @@ class ArachniteRuntime:
         """Install (or clear) the per-stage timing callback.
 
         Safe to call before or after ``start()``. Passing ``None`` restores
-        the zero-overhead default path. See ADR 0002 for the contract that
+        the zero-overhead default path. See the tick-stage instrumentation ADR for the contract that
         implementations must follow.
         """
         self._tick_instrumenter = instrumenter
@@ -839,12 +847,12 @@ class ArachniteRuntime:
         # stays consistent even if ``set_tick_instrumenter`` is called
         # concurrently (single-threaded event loop guarantees atomicity at
         # attribute-assignment granularity, but the caching makes the
-        # semantics explicit). Per ADR 0002 the boundary logic short-circuits
+        # semantics explicit). Per the instrumentation ADR the boundary logic short-circuits
         # on ``is not None`` when no instrumenter is attached.
         instrumenter = self._tick_instrumenter
         stage_start = tick_start
 
-        # 0. Tick-start hooks on all leaf nodes (charged to `sense` per ADR 0002)
+        # 0. Tick-start hooks on all leaf nodes (charged to `sense`, instrumentation ADR)
         await asyncio.gather(
             self._sense_master.notify_tick_start(self._tick_count),
             self._instinct_master.notify_tick_start(self._tick_count),
@@ -1058,7 +1066,7 @@ class ArachniteRuntime:
                     instinct_id=p.instinct_id,
                 )
 
-        # 7. Tick-end hooks on all leaf nodes (charged to `act` per ADR 0002)
+        # 7. Tick-end hooks on all leaf nodes (charged to `act`, instrumentation ADR)
         tick_duration = time.monotonic() - tick_start
         await asyncio.gather(
             self._sense_master.notify_tick_end(self._tick_count, tick_duration),
@@ -1079,7 +1087,7 @@ class ArachniteRuntime:
     ) -> None:
         """Invoke ``on_stage`` and isolate any instrumenter error.
 
-        Per ADR 0002: instrumenter exceptions must not crash the tick loop.
+        Per the instrumentation ADR: instrumenter exceptions must not crash the tick loop.
         Log at WARNING level and continue. The once-per-tick granularity
         keeps the noise floor manageable even if the instrumenter is
         persistently broken.
