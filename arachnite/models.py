@@ -147,6 +147,9 @@ class Result:
     stopped_at_step:  str | None = None
     step_results:     list[StepResult] = field(default_factory=list)
     rolled_back:      bool = False
+    # True when a reflex took the action's resources away mid-execution
+    # (ADR 0005). Implies interrupted=True; never retried.
+    preempted:        bool = False
 
 
 # ══════════════════════════════════════════════════════════════════════════════

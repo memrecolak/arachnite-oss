@@ -229,17 +229,23 @@ class InstinctMasterNode(FaultReportingMixin, BaseNode):
                 with contextlib.suppress(Exception):
                     await node.on_proposal_rejected(p)
 
-    async def evaluate_reflexes(self, ctx: Context) -> list[Proposal]:
+    async def evaluate_reflexes(
+        self,
+        ctx: Context,
+        nodes: Sequence[BaseReflexInstinctNode] | None = None,
+    ) -> list[Proposal]:
         """
-        Evaluate all ReflexInstinctNodes concurrently.
+        Evaluate ReflexInstinctNodes concurrently — all of them, or only
+        ``nodes`` when given (the event-driven reflex lane evaluates the
+        subset triggered by an arriving signal).
 
         Returns non-None proposals sorted by priority descending.
         Called by the runtime before evaluate_all().
         """
-        if not self._reflex_nodes:
+        candidates = self._reflex_nodes.values() if nodes is None else nodes
+        enabled = [n for n in candidates if n.enabled]
+        if not enabled:
             return []
-
-        enabled = [n for n in self._reflex_nodes.values() if n.enabled]
 
         async def _eval(node: BaseReflexInstinctNode) -> Proposal | None:
             try:
@@ -265,6 +271,7 @@ class InstinctMasterNode(FaultReportingMixin, BaseNode):
                 raise ReflexConflictError(
                     top_priority,
                     [p.instinct_id for p in conflicts],
+                    proposals=proposals,
                 )
 
         self.logger.debug(

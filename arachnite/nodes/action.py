@@ -163,23 +163,63 @@ class MultiStepActionNode(BaseActionNode):
         """
         Called after execution stops due to an interrupt request.
         Default: call rollback() on completed non-interruptible steps
-        in reverse order.
+        in reverse order (see ``_rollback_completed``).
         """
-        non_interruptible_done = [
-            sr for sr in reversed(completed)
-            if any(
-                s.name == sr.step_name and not s.interruptible
-                for s in self.steps()
-            )
-        ]
-        steps_by_name = {s.name: s for s in self.steps()}
-        for step_result in non_interruptible_done:
-            step = steps_by_name.get(step_result.step_name)
-            if step and step.rollback:
-                try:
-                    await step.rollback()
-                except Exception as exc:  # noqa: BLE001
-                    raise RollbackError(self.node_id, step.name, exc) from exc
+        await self._rollback_completed(completed)
+
+    async def on_aborted(
+        self,
+        completed: list[StepResult],
+        failed_step: ActionStep,
+        proposal: Proposal,
+    ) -> bool:
+        """
+        Called when a step aborts the sequence — it returned
+        ``abort_sequence=True``, exceeded its timeout, or raised.
+        ``completed`` holds the steps that ran before ``failed_step``.
+
+        Default: under ``InterruptPolicy.ROLLBACK`` undo the completed
+        non-interruptible steps in reverse order and return True; under every
+        other policy do nothing and return False. Return whether a rollback
+        ran. May raise ``RollbackError``.
+        """
+        if self.interrupt_policy != InterruptPolicy.ROLLBACK:
+            return False
+        await self._rollback_completed(completed)
+        return True
+
+    async def _rollback_completed(self, completed: list[StepResult]) -> None:
+        """
+        Run the rollback callable of every completed non-interruptible step,
+        most recent first. Every rollback is attempted even if an earlier one
+        raises; the failures are then raised together as one ``RollbackError``
+        so no partial walk goes unreported.
+        """
+        all_steps = self.steps()
+        non_interruptible = {s.name for s in all_steps if not s.interruptible}
+        steps_by_name = {s.name: s for s in all_steps}
+        failures: list[tuple[str, BaseException]] = []
+        for step_result in reversed(completed):
+            if step_result.step_name not in non_interruptible:
+                continue
+            step = steps_by_name[step_result.step_name]
+            if step.rollback is None:
+                continue
+            try:
+                await step.rollback()
+            except Exception as exc:  # noqa: BLE001
+                self.logger.error(
+                    "Rollback raised",
+                    step=step.name,
+                    error=str(exc),
+                    error_type=type(exc).__name__,
+                )
+                failures.append((step.name, exc))
+        if failures:
+            first_step, first_exc = failures[0]
+            raise RollbackError(
+                self.node_id, first_step, first_exc, failures=failures,
+            ) from first_exc
 
     async def on_step_timeout(
         self,
@@ -282,11 +322,9 @@ class MultiStepActionNode(BaseActionNode):
                         proposal, pending, start_time
                     )
 
-            # Enforce mandatory block — cannot interrupt non-interruptible steps
+            # Mandatory block — a pending interrupt is held until the block
+            # completes (and ignored altogether under NEVER).
             if self._interrupt_requested and not step.interruptible:
-                if self.interrupt_policy == InterruptPolicy.NEVER:
-                    pass  # ignore interrupt for NEVER policy
-                # All other policies: hold the interrupt, complete the block
                 self.logger.warning(
                     "Interrupt held — inside mandatory block",
                     step=step.name,
@@ -311,16 +349,9 @@ class MultiStepActionNode(BaseActionNode):
                     step=step.name,
                 )
 
-            # Step requested abort
+            # Step requested abort (abort_sequence, step timeout, or raised)
             if step_result.abort_sequence:
-                self._current_step = None
-                return Result(
-                    action_id   = self.node_id,
-                    success     = False,
-                    error       = StepAbortError(self.node_id, step.name),
-                    duration_s  = time.monotonic() - start_time,
-                    step_results = self._completed_steps.copy(),
-                )
+                return await self._handle_abort(proposal, step, start_time)
 
             # Step failed but didn't request abort — log and continue
             if not step_result.success:
@@ -357,6 +388,22 @@ class MultiStepActionNode(BaseActionNode):
         except asyncio.TimeoutError:
             # See note in _execute_with_retry — required for Python 3.10 support.
             result = await self.on_step_timeout(step, proposal)
+        except Exception as exc:  # noqa: BLE001
+            # execute_step() must never raise; a step that does is treated as
+            # an aborting failure so the sequence goes through on_aborted()
+            # (and its rollback) instead of escaping execute() half-done.
+            self.logger.error(
+                "Step raised",
+                step=step.name,
+                error=str(exc),
+                error_type=type(exc).__name__,
+            )
+            result = StepResult(
+                step_name      = step.name,
+                success        = False,
+                error          = exc,
+                abort_sequence = True,
+            )
         result = StepResult(
             step_name  = result.step_name,
             success    = result.success,
@@ -387,18 +434,53 @@ class MultiStepActionNode(BaseActionNode):
         )
         stopped_at = self._current_step.name if self._current_step else None
         rolled_back = False
+        error: BaseException | None = None
 
         if self.interrupt_policy == InterruptPolicy.ROLLBACK:
-            await self.on_interrupted(self._completed_steps.copy(), pending, proposal)
-            rolled_back = True
+            try:
+                await self.on_interrupted(self._completed_steps.copy(), pending, proposal)
+                rolled_back = True
+            except RollbackError as exc:
+                error = exc
 
         self._current_step = None
         return Result(
             action_id       = self.node_id,
             success         = False,
+            error           = error,
             duration_s      = time.monotonic() - start_time,
             interrupted     = True,
             stopped_at_step = stopped_at,
+            step_results    = self._completed_steps.copy(),
+            rolled_back     = rolled_back,
+        )
+
+    async def _handle_abort(
+        self,
+        proposal: Proposal,
+        step: ActionStep,
+        start_time: float,
+    ) -> Result:
+        """Finish an aborted sequence: run on_aborted() and report the outcome."""
+        failed = self._completed_steps[-1]
+        error: BaseException = StepAbortError(self.node_id, step.name)
+        if failed.error is not None:
+            error.__cause__ = failed.error
+        rolled_back = False
+        try:
+            rolled_back = await self.on_aborted(
+                self._completed_steps[:-1], step, proposal,
+            )
+        except RollbackError as exc:
+            error = exc
+
+        self._current_step = None
+        return Result(
+            action_id       = self.node_id,
+            success         = False,
+            error           = error,
+            duration_s      = time.monotonic() - start_time,
+            stopped_at_step = step.name,
             step_results    = self._completed_steps.copy(),
             rolled_back     = rolled_back,
         )
@@ -581,22 +663,32 @@ class ActionMasterNode(FaultReportingMixin, BaseNode):
 
     # ── Single dispatch (backward compat) ────────────────────────────────
 
-    async def dispatch(self, proposal: Proposal) -> Result:
+    async def dispatch(
+        self, proposal: Proposal, *, origin: str | None = None,
+    ) -> Result:
         """
         Route a single Proposal to its ActionNode by matching
         ``proposal.action_id``.  For concurrent dispatch of multiple
         proposals, use ``dispatch_many()``.
+
+        ``origin`` names the dispatch path: ``"reflex"`` for the reflex arc,
+        ``"decision"`` for the deliberative path. Guards are bypassed only for
+        ``origin="reflex"``; with ``origin=None`` (runtime-less callers) the
+        legacy rule applies — ``priority >= REFLEX_PRIORITY_FLOOR`` bypasses.
         """
-        return await self._dispatch_one(proposal)
+        return await self._dispatch_one(proposal, origin=origin)
 
     # ── Concurrent dispatch ──────────────────────────────────────────────
 
-    async def dispatch_many(self, proposals: list[Proposal]) -> list[Result]:
+    async def dispatch_many(
+        self, proposals: list[Proposal], *, origin: str | None = None,
+    ) -> list[Result]:
         """
         Dispatch multiple proposals concurrently via ``asyncio.gather()``.
 
         Filters out proposals whose ``action_id`` is already running or
         appears more than once (keeps highest priority per ``action_id``).
+        ``origin`` is forwarded to the guard check (see ``dispatch()``).
         """
         if not proposals:
             return []
@@ -618,11 +710,19 @@ class ActionMasterNode(FaultReportingMixin, BaseNode):
             return []
 
         results = await asyncio.gather(
-            *(self._dispatch_one(p) for p in to_dispatch)
+            *(self._dispatch_one(p, origin=origin) for p in to_dispatch)
         )
         return list(results)
 
-    async def _dispatch_one(self, proposal: Proposal) -> Result:
+    def _bypasses_guards(self, proposal: Proposal, origin: str | None) -> bool:
+        """Reflex-origin dispatches skip guards; legacy callers use priority."""
+        if origin is not None:
+            return origin == "reflex"
+        return proposal.priority >= REFLEX_PRIORITY_FLOOR
+
+    async def _dispatch_one(
+        self, proposal: Proposal, origin: str | None = None,
+    ) -> Result:
         """Execute a single proposal with retry logic and running-state tracking."""
         node = self._nodes.get(proposal.action_id)
         if node is None:
@@ -643,8 +743,8 @@ class ActionMasterNode(FaultReportingMixin, BaseNode):
         self._running_proposals[proposal.action_id] = proposal
 
         # Pre-dispatch guards — deterministic veto BEFORE execution and outside
-        # the retry loop. Reflex/safety proposals bypass guards (always fire).
-        if self._guards and proposal.priority < REFLEX_PRIORITY_FLOOR:
+        # the retry loop. Reflex-arc dispatches bypass guards (always fire).
+        if self._guards and not self._bypasses_guards(proposal, origin):
             verdict = self._run_guards(proposal)
             if not verdict.allow:
                 self._running_nodes.pop(proposal.action_id, None)
@@ -753,7 +853,15 @@ class ActionMasterNode(FaultReportingMixin, BaseNode):
                     error=exc,
                 )
             last_result = result
-            if result.success:
+            # Never retry an interrupted/preempted run (the stop was requested,
+            # not a fault) or a failed rollback (the plant is in an unknown
+            # partial state — re-running from step 1 could compound it).
+            if (
+                result.success
+                or result.interrupted
+                or result.preempted
+                or isinstance(result.error, RollbackError)
+            ):
                 break
 
         return last_result  # type: ignore[return-value]

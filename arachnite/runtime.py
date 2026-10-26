@@ -15,7 +15,11 @@ from typing import Protocol, runtime_checkable
 
 from arachnite.bus import SignalBus
 from arachnite.context import ContextNode
-from arachnite.exceptions import ActionNotFoundError, MandatoryBlockViolation
+from arachnite.exceptions import (
+    ActionNotFoundError,
+    MandatoryBlockViolation,
+    ReflexConflictError,
+)
 from arachnite.health import HealthMonitor
 from arachnite.logging import BaseLogSink, LogLevel, StdoutLogSink, StructuredLogger
 from arachnite.models import (
@@ -752,7 +756,19 @@ class ArachniteRuntime:
         # 3. Reflex pass — bypass decision, stays sequential (safety-critical).
         #    Per ADR 0002 this stage charges evaluate + dispatch together.
         reflex_results: list[Result] = []
-        reflex_proposals = await self._instinct_master.evaluate_reflexes(ctx)
+        try:
+            reflex_proposals = await self._instinct_master.evaluate_reflexes(ctx)
+        except ReflexConflictError as exc:
+            # reflex_conflict='raise' flags an ambiguous reflex configuration,
+            # but aborting the tick would also suppress every reflex and the
+            # whole deliberative pipeline. Fail safe: report loudly, then
+            # dispatch the conflicting reflexes in priority order.
+            self._logger.error(
+                "Reflex priority conflict; dispatching all in priority order",
+                priority=exc.priority,
+                instinct_ids=exc.node_ids,
+            )
+            reflex_proposals = list(exc.proposals)
         for rp in reflex_proposals:
             # Emit a framework-level "Reflex fired" event so safety auditors
             # can reconstruct every reflex-arc activation from the log stream
@@ -766,7 +782,7 @@ class ArachniteRuntime:
                 urgency=rp.urgency,
             )
             try:
-                result = await self._action_master.dispatch(rp)
+                result = await self._action_master.dispatch(rp, origin="reflex")
             except ActionNotFoundError:
                 self._logger.warning(
                     "Reflex dispatch skipped: action not found",
@@ -774,6 +790,13 @@ class ArachniteRuntime:
                     instinct_id=rp.instinct_id,
                 )
                 continue
+            if not result.success and not result.interrupted:
+                self._logger.warning(
+                    "Reflex action did not succeed",
+                    action_id=rp.action_id,
+                    instinct_id=rp.instinct_id,
+                    error=str(result.error),
+                )
             reflex_results.append(result)
 
         if reflex_results:
@@ -863,7 +886,9 @@ class ArachniteRuntime:
 
         # 6. Act — dispatch selected proposals concurrently, then tick-end hooks
         if to_dispatch:
-            results = await self._action_master.dispatch_many(to_dispatch)
+            results = await self._action_master.dispatch_many(
+                to_dispatch, origin="decision",
+            )
             self._last_results = reflex_results + results
             # dispatch_many returns [] when every proposal was filtered (all their
             # action_ids are already running); combined with an empty reflex_results

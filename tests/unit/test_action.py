@@ -14,6 +14,7 @@ from arachnite.exceptions import (
     MandatoryBlockViolation,
     NodeRegistrationError,
     RollbackError,
+    StepAbortError,
 )
 from arachnite.models import (
     ActionExecutionState,
@@ -191,6 +192,89 @@ class RollbackFailAction(MultiStepActionNode):
                 requesting_instinct_id="test",
             )
         return result
+
+
+class SelfInterruptingAction(MultiStepActionNode):
+    """ROLLBACK action that requests its own interrupt inside the block."""
+    node_id          = "SelfInterruptingAction"
+    interrupt_policy = InterruptPolicy.ROLLBACK
+
+    async def _undo(self) -> None:
+        return None
+
+    def steps(self) -> list[ActionStep]:
+        return [
+            ActionStep("mandatory", interruptible=False, rollback=self._undo),
+            ActionStep("optional",  interruptible=True),
+        ]
+
+    async def execute_step(
+        self, step: ActionStep, proposal: Proposal, completed: list[StepResult]
+    ) -> StepResult:
+        if step.name == "mandatory":
+            self.request_interrupt(_interrupt())
+        return StepResult(step_name=step.name, success=True)
+
+
+class MultiRollbackAction(MultiStepActionNode):
+    """Three mandatory steps; rollbacks of 'a' and 'c' raise, 'b' succeeds."""
+    node_id          = "MultiRollbackAction"
+    interrupt_policy = InterruptPolicy.ROLLBACK
+
+    def __init__(self, *args: object, **kwargs: object) -> None:
+        super().__init__(*args, **kwargs)
+        self.rolled: list[str] = []
+
+    def _undo(self, name: str, fail: bool):  # type: ignore[no-untyped-def]
+        async def _rollback() -> None:
+            self.rolled.append(name)
+            if fail:
+                raise RuntimeError(f"undo {name} failed")
+        return _rollback
+
+    def steps(self) -> list[ActionStep]:
+        return [
+            ActionStep("a", interruptible=False, rollback=self._undo("a", True)),
+            ActionStep("b", interruptible=False, rollback=self._undo("b", False)),
+            ActionStep("c", interruptible=False, rollback=self._undo("c", True)),
+            ActionStep("d", interruptible=True),
+        ]
+
+    async def execute_step(
+        self, step: ActionStep, proposal: Proposal, completed: list[StepResult]
+    ) -> StepResult:
+        if step.name == "c":
+            self.request_interrupt(_interrupt())
+        return StepResult(step_name=step.name, success=True)
+
+
+class RaisingStepAction(MultiStepActionNode):
+    """Second (mandatory) step raises — execute_step contract violation."""
+    node_id = "RaisingStepAction"
+
+    def __init__(self, *args: object, **kwargs: object) -> None:
+        super().__init__(*args, **kwargs)
+        self.rolled: list[str] = []
+
+    async def _undo_grip(self) -> None:
+        self.rolled.append("grip")
+
+    async def _undo_explode(self) -> None:
+        self.rolled.append("explode")
+
+    def steps(self) -> list[ActionStep]:
+        return [
+            ActionStep("grip",    interruptible=False, rollback=self._undo_grip),
+            ActionStep("explode", interruptible=False, rollback=self._undo_explode),
+            ActionStep("finish",  interruptible=True),
+        ]
+
+    async def execute_step(
+        self, step: ActionStep, proposal: Proposal, completed: list[StepResult]
+    ) -> StepResult:
+        if step.name == "explode":
+            raise ValueError("step blew up")
+        return StepResult(step_name=step.name, success=True)
 
 
 class ExecutionStateAction(MultiStepActionNode):
@@ -403,6 +487,26 @@ class _NeverPolicyWithPauseAction(MultiStepActionNode):
         return StepResult(step_name=step.name, success=True)
 
 
+class _NeverWithCheckpointAction(MultiStepActionNode):
+    """NEVER policy; first step requests an interrupt, second is a checkpoint."""
+    node_id          = "_NeverWithCheckpointAction"
+    interrupt_policy = InterruptPolicy.NEVER
+
+    def steps(self) -> list[ActionStep]:
+        return [
+            ActionStep("arm", interruptible=True),
+            ActionStep("cp",  interruptible=True, checkpoint=True),
+            ActionStep("end", interruptible=True),
+        ]
+
+    async def execute_step(
+        self, step: ActionStep, proposal: Proposal, completed: list[StepResult]
+    ) -> StepResult:
+        if step.name == "arm":
+            self.request_interrupt(_interrupt())
+        return StepResult(step_name=step.name, success=True)
+
+
 class TestMultiStepNeverPolicy:
     @pytest.mark.asyncio
     async def test_never_policy_ignores_interrupt(self) -> None:
@@ -426,9 +530,18 @@ class TestMultiStepNeverPolicy:
 
         asyncio.create_task(set_interrupt())
         result = await action.execute(_proposal("_NeverPolicyWithPauseAction"))
-        # Both steps run — NEVER policy suppresses the interrupt (line 234: pass)
+        # Both steps run — NEVER policy suppresses the interrupt
         assert len(result.step_results) == 2
         assert not result.interrupted
+
+    @pytest.mark.asyncio
+    async def test_never_policy_ignores_interrupt_at_checkpoint_step(self) -> None:
+        """A checkpoint marker must not open an interrupt point under NEVER."""
+        action = _NeverWithCheckpointAction(bus=_bus())
+        result = await action.execute(_proposal("_NeverWithCheckpointAction"))
+        assert [sr.step_name for sr in result.step_results] == ["arm", "cp", "end"]
+        assert not result.interrupted
+        assert result.success is True
 
 
 class TestMultiStepCheckpointPolicy:
@@ -448,12 +561,94 @@ class TestMultiStepCheckpointPolicy:
 
 class TestMultiStepRollbackFails:
     @pytest.mark.asyncio
-    async def test_rollback_failure_raises_rollback_error(self) -> None:
+    async def test_rollback_failure_is_reported_not_raised(self) -> None:
         action = RollbackFailAction(bus=_bus())
         # execute_step sets _interrupt_requested after "mandatory" completes,
         # so the interrupt fires at the next interruptible step.
-        with pytest.raises(RollbackError):
-            await action.execute(_proposal("RollbackFailAction"))
+        result = await action.execute(_proposal("RollbackFailAction"))
+        assert result.success is False
+        assert result.interrupted is True
+        assert result.rolled_back is False
+        assert isinstance(result.error, RollbackError)
+
+    @pytest.mark.asyncio
+    async def test_every_rollback_attempted_despite_failures(self) -> None:
+        action = MultiRollbackAction(bus=_bus())
+        result = await action.execute(_proposal("MultiRollbackAction"))
+        # Walk order is reverse completion: c (raises), b (ok), a (raises).
+        assert action.rolled == ["c", "b", "a"]
+        assert isinstance(result.error, RollbackError)
+        assert [name for name, _ in result.error.failures] == ["c", "a"]
+        assert result.error.step_name == "c"
+        assert result.rolled_back is False
+
+    @pytest.mark.asyncio
+    async def test_rollback_error_not_retried(self) -> None:
+        action = RollbackFailAction(bus=_bus())
+        action.max_retries = 2
+        master = ActionMasterNode(bus=_bus())
+        master.register(action)
+        calls = 0
+        original = action.execute
+
+        async def counting(proposal: Proposal) -> Result:
+            nonlocal calls
+            calls += 1
+            return await original(proposal)
+
+        action.execute = counting  # type: ignore[method-assign]
+        result = await master.dispatch(_proposal("RollbackFailAction"))
+        assert calls == 1
+        assert isinstance(result.error, RollbackError)
+
+
+class TestMultiStepAbort:
+    @pytest.mark.asyncio
+    async def test_raising_step_aborts_without_escaping(self) -> None:
+        action = RaisingStepAction(bus=_bus())
+        result = await action.execute(_proposal("RaisingStepAction"))
+        assert result.success is False
+        assert isinstance(result.error, StepAbortError)
+        assert isinstance(result.error.__cause__, ValueError)
+        assert result.stopped_at_step == "explode"
+
+    @pytest.mark.asyncio
+    async def test_abort_under_rollback_policy_undoes_completed_mandatory_steps(
+        self,
+    ) -> None:
+        action = RaisingStepAction(bus=_bus())
+        action.interrupt_policy = InterruptPolicy.ROLLBACK
+        result = await action.execute(_proposal("RaisingStepAction"))
+        # Only the step that completed before the failure is undone.
+        assert action.rolled == ["grip"]
+        assert result.rolled_back is True
+
+    @pytest.mark.asyncio
+    async def test_abort_under_always_policy_does_not_roll_back(self) -> None:
+        action = RaisingStepAction(bus=_bus())
+        result = await action.execute(_proposal("RaisingStepAction"))
+        assert action.rolled == []
+        assert result.rolled_back is False
+
+    @pytest.mark.asyncio
+    async def test_interrupted_result_not_retried(self) -> None:
+        action = SelfInterruptingAction(bus=_bus())
+        action.max_retries = 2
+        master = ActionMasterNode(bus=_bus())
+        master.register(action)
+        calls = 0
+        original = action.execute
+
+        async def counting(proposal: Proposal) -> Result:
+            nonlocal calls
+            calls += 1
+            return await original(proposal)
+
+        action.execute = counting  # type: ignore[method-assign]
+        result = await master.dispatch(_proposal("SelfInterruptingAction"))
+        assert result.interrupted is True
+        assert result.rolled_back is True
+        assert calls == 1
 
 
 # ── MultiStepActionNode — execution_state and is_interruptible ────────────────
@@ -962,6 +1157,40 @@ class TestActionGuard:
 
         assert result.success is True             # reflex fired despite deny-all
         assert act.calls == 1
+
+    @pytest.mark.asyncio
+    async def test_reflex_origin_bypasses_guards_at_any_priority(self) -> None:
+        bus = _bus()
+        am  = ActionMasterNode(bus=bus)
+        act = _CountingAction(bus=bus)
+        am.register(act)
+        am.register_guard(_deny_guard)
+
+        low = Proposal(
+            instinct_id="reflex", action_id="_CountingAction",
+            priority=120, urgency=1.0,
+        )
+        result = await am.dispatch(low, origin="reflex")
+
+        assert result.success is True
+        assert act.calls == 1
+
+    @pytest.mark.asyncio
+    async def test_decision_origin_cannot_bypass_guards_by_priority(self) -> None:
+        bus = _bus()
+        am  = ActionMasterNode(bus=bus)
+        act = _CountingAction(bus=bus)
+        am.register(act)
+        am.register_guard(_deny_guard)
+
+        high = Proposal(
+            instinct_id="normal", action_id="_CountingAction",
+            priority=250, urgency=1.0,
+        )
+        result = await am.dispatch(high, origin="decision")
+
+        assert isinstance(result.error, ActionVetoed)
+        assert act.calls == 0
 
     @pytest.mark.asyncio
     async def test_dispatch_many_honors_guards(self) -> None:

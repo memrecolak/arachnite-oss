@@ -48,7 +48,8 @@ def validate_colocation(
         if not a.get("is_reflex"):
             continue
         reflex_id   = str(a["node_id"])
-        action_id   = str(a.get("reflex_action_id", ""))
+        raw_action  = a.get("reflex_action_id")
+        action_id   = "" if raw_action is None else str(raw_action)
         reflex_agent = str(a["agent_node_id"])
 
         if not action_id:

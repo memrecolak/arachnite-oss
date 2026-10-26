@@ -7,6 +7,8 @@ Spec reference: Section 18.
 
 from __future__ import annotations
 
+from typing import Any
+
 # ── Base ──────────────────────────────────────────────────────────────────────
 
 class ArachniteError(Exception):
@@ -102,16 +104,27 @@ class InterruptError(ArachniteError):
 
 
 class RollbackError(ArachniteError):
-    """A rollback callable raised during MultiStepActionNode.on_interrupted()."""
+    """
+    One or more rollback callables raised during a MultiStepActionNode rollback
+    walk. The walk attempts every rollback before raising, so ``failures``
+    lists each (step_name, exception) in walk order; ``step_name``/``cause``
+    describe the first failure.
+    """
 
     def __init__(
         self,
         action_id: str,
         step_name: str,
         cause: BaseException,
+        failures: list[tuple[str, BaseException]] | None = None,
     ) -> None:
+        self.failures: list[tuple[str, BaseException]] = (
+            failures if failures else [(step_name, cause)]
+        )
+        extra = len(self.failures) - 1
+        suffix = f" (+{extra} more rollback failure(s))" if extra else ""
         super().__init__(
-            f"Rollback failed for action '{action_id}' at step '{step_name}': {cause}"
+            f"Rollback failed for action '{action_id}' at step '{step_name}': {cause}{suffix}"
         )
         self.action_id = action_id
         self.step_name = step_name
@@ -120,15 +133,17 @@ class RollbackError(ArachniteError):
 
 class MandatoryBlockViolation(ArachniteError):
     """
-    Raised if something attempts to force-stop an action inside a mandatory
-    completion block outside of an emergency shutdown sequence.
+    Raised when a deliberative interrupt targets an action inside a mandatory
+    completion block. Mandatory blocks yield only to a declared reflex
+    preemption (ADR 0005) or to emergency_stop().
     """
 
     def __init__(self, action_id: str, step_name: str) -> None:
         super().__init__(
             f"Cannot interrupt action '{action_id}' at step '{step_name}': "
             "step is inside a mandatory completion block. "
-            "Use runtime.emergency_stop() to bypass mandatory blocks."
+            "Only a reflex with ReflexPreemption.PREEMPT or "
+            "runtime.emergency_stop() can cut into a mandatory block."
         )
         self.action_id = action_id
         self.step_name = step_name
@@ -173,13 +188,21 @@ class SupervisorError(ArachniteError):
 class ReflexConflictError(ArachniteError):
     """Two reflex nodes with equal priority both fired in the same tick."""
 
-    def __init__(self, priority: int, node_ids: list[str]) -> None:
+    def __init__(
+        self,
+        priority: int,
+        node_ids: list[str],
+        proposals: list[Any] | None = None,
+    ) -> None:
         super().__init__(
             f"Priority conflict: reflex nodes {node_ids} all fired at priority={priority}. "
             "Assign unique priorities or set InstinctMasterNode.reflex_conflict='dispatch_all'."
         )
         self.priority = priority
         self.node_ids = node_ids
+        #: Every reflex proposal of the evaluation that raised, priority
+        #: descending — lets the runtime still dispatch them (fail-safe).
+        self.proposals: list[Any] = list(proposals) if proposals else []
 
 
 # ── Codec ────────────────────────────────────────────────────────────────────

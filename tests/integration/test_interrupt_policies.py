@@ -411,3 +411,40 @@ class TestReflexConflictError:
         # Should not raise since ReflexC has higher priority, no tie
         proposals = await instinct_master.evaluate_reflexes(ctx)
         assert proposals[0].instinct_id == "ReflexC"
+
+    @pytest.mark.asyncio
+    async def test_runtime_survives_conflict_and_still_dispatches(self) -> None:
+        """A 'raise' conflict must not abort the tick: both reflexes still fire."""
+        executed: list[str] = []
+
+        class ActionA(BaseActionNode):
+            node_id = "ActionA"
+
+            async def execute(self, proposal: Proposal) -> Result:
+                executed.append(self.node_id)
+                return Result(action_id=self.node_id, success=True)
+
+        class ActionB(ActionA):
+            node_id = "ActionB"
+
+        bus             = SignalBus()
+        instinct_master = InstinctMasterNode(bus=bus, reflex_conflict="raise")
+        instinct_master.register(ReflexA(bus=bus))
+        instinct_master.register(ReflexB(bus=bus))
+        action_master   = ActionMasterNode(bus=bus)
+        action_master.register(ActionA(bus=bus))
+        action_master.register(ActionB(bus=bus))
+        rt = ArachniteRuntime(
+            sense_master    = SenseMasterNode(bus=bus),
+            context         = ContextNode(),
+            instinct_master = instinct_master,
+            decision_master = DecisionMasterNode(
+                bus=bus, strategy=GreedyDecisionNode(bus=bus),
+            ),
+            action_master   = action_master,
+            bus             = bus,
+        )
+
+        await rt.tick()
+
+        assert sorted(executed) == ["ActionA", "ActionB"]

@@ -236,6 +236,33 @@ class TestRestartSetupFailure:
         await sv.cancel_restart_tasks()
 
 
+class TestRestartBudgetExactCount:
+    @pytest.mark.asyncio
+    async def test_exactly_max_restarts_then_dead(self, bus: SignalBus) -> None:
+        """max_restarts=3 allows exactly three restarts; the fourth fault is terminal.
+
+        Uses a budget > 1 on purpose: with max_restarts=1 an off-by-one or a
+        non-incrementing counter (count | 1) is indistinguishable from a
+        correct one.
+        """
+        sv   = make_supervisor(bus, policy=RestartPolicy.ON_FAILURE,
+                               max_restarts=3, restart_delay_s=0.0)
+        node = SimpleNode(bus=bus)
+        sv.track(node)
+
+        for _ in range(6):
+            if sv.state_of("SimpleNode") == NodeState.DEAD:
+                break
+            await sv.on_fault("SimpleNode", RuntimeError("boom"))
+            for _ in range(50):
+                if sv.restart_task_count == 0:
+                    break
+                await asyncio.sleep(0)
+
+        assert node.setup_count == 3
+        assert sv.state_of("SimpleNode") == NodeState.DEAD
+
+
 class TestSupervisorRepr:
     def test_repr_contains_supervisor_id(self, bus: SignalBus) -> None:
         from arachnite.supervisor import NodeSupervisor

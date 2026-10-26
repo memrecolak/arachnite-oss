@@ -1,9 +1,10 @@
 # Robot arm pick-and-place — two-AgentNode deployment manifest.
 #
-# vision-node   runs on the machine with the camera / proximity sensor
-#               (e.g. Jetson Nano with USB camera + VL53L1X ToF sensor).
-# control-node  runs on the machine driving the motors
-#               (e.g. Raspberry Pi 4 with servo HAT).
+# vision-node   runs on the machine with the camera
+#               (e.g. Jetson Nano with USB camera).
+# control-node  runs on the machine driving the motors and wired to the
+#               proximity sensor (e.g. Raspberry Pi 4 with servo HAT and a
+#               VL53L1X ToF sensor).
 #
 # In the single-process simulation (simulate.py) both agents use
 # LocalTransport and run in the same process.
@@ -11,8 +12,11 @@
 # the broker address in mesh.transport_options.
 #
 # Co-location constraint (enforced by DeploymentManifest.validate()):
-#   CollisionReflex and EmergencyRetractAction are BOTH on control-node.
-#   This guarantees zero network-hop latency for the reflex path.
+#   CollisionReflex and its target EmergencyRetractAction are BOTH on
+#   control-node, so the reflex path has zero network hops.
+#   The reflex's input (ProximitySenseNode) is placed there too: a reflex
+#   only sees signals produced on its own AgentNode, so a remote proximity
+#   sensor would leave the reflex blind.
 
 mesh:
   name: robot-arm-cell
@@ -22,23 +26,24 @@ agents:
   - id: vision-node
     transport: local
     tick_rate_hz: 20.0
-    description: "Perception layer — proximity and object detection"
+    description: "Perception layer — object detection"
     tags: [perception, jetson]
     nodes:
       sense:
-        - kind: examples.robot_arm.nodes.ProximitySenseNode
         - kind: examples.robot_arm.nodes.ObjectDetectionSenseNode
 
   - id: control-node
     transport: local
     tick_rate_hz: 10.0
-    description: "Motor control layer — grasp planning and execution"
+    description: "Motor control layer — proximity, grasp planning and execution"
     tags: [control, raspi]
     nodes:
       sense:
+        - kind: examples.robot_arm.nodes.ProximitySenseNode
         - kind: examples.robot_arm.nodes.JointPositionSenseNode
       instinct:
         - kind: examples.robot_arm.nodes.CollisionReflex
+          action_id: EmergencyRetractAction
         - kind: examples.robot_arm.nodes.GraspInstinct
       action:
         - kind: examples.robot_arm.nodes.EmergencyRetractAction

@@ -58,8 +58,17 @@ class TestValidateColocation:
         ]
         with pytest.raises(ManifestValidationError) as exc_info:
             validate_colocation(assignments)
-        # colocation validator converts None → 'None' string and reports it missing
+        # A missing (None) target is reported as missing — not as an
+        # ActionNode literally named 'None'.
         assert "CriticalReflex" in str(exc_info.value)
+        assert "has no reflex_action_id set" in str(exc_info.value)
+        assert "'None'" not in str(exc_info.value)
+
+    def test_robot_arm_example_manifest_validates(self) -> None:
+        from pathlib import Path
+
+        path = Path(__file__).resolve().parents[2] / "examples" / "robot_arm" / "manifest.yaml"
+        DeploymentManifest.from_yaml(str(path)).validate()  # must not raise
 
     def test_reflex_with_empty_string_action_id_raises(self) -> None:
         # Empty string (not None) hits the `if not action_id:` branch directly
