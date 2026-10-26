@@ -45,6 +45,8 @@ agents:
         - kind: examples.robot_arm.nodes.CollisionReflex
           action_id: EmergencyRetractAction
         - kind: examples.robot_arm.nodes.GraspInstinct
+        - kind: examples.robot_arm.nodes.PlaceHeldObjectInstinct
       action:
         - kind: examples.robot_arm.nodes.EmergencyRetractAction
         - kind: examples.robot_arm.nodes.PickAndPlaceAction
+        - kind: examples.robot_arm.nodes.PlaceHeldObjectAction

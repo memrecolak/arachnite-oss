@@ -11,16 +11,26 @@ Architecture
 ------------
 Two logical AgentNodes (see manifest.yaml):
 
-  vision-node   ProximitySenseNode, ObjectDetectionSenseNode
-  control-node  JointPositionSenseNode,
-                CollisionReflex  (priority 250, reflex)  ← co-located with
-                EmergencyRetractAction                       EmergencyRetract
+  vision-node   ObjectDetectionSenseNode
+  control-node  ProximitySenseNode, JointPositionSenseNode,
+                CollisionReflex  (priority 250, reflex, PREEMPT)
+                EmergencyRetractAction        (co-located with its reflex)
                 GraspInstinct    (priority 80,  normal)
+                PlaceHeldObjectInstinct (priority 70, recovery)
                 PickAndPlaceAction (MultiStepActionNode, ROLLBACK policy)
+                PlaceHeldObjectAction (MultiStepActionNode)
 
-Mandatory completion block in PickAndPlaceAction:
-  lower_gripper (1.0 s) + close_gripper (0.5 s) + raise_gripper (1.0 s)
-  Worst-case interrupt latency for this block = 2.5 s (sum of timeout_s).
+Actuator resources (ADR 0005): PickAndPlaceAction and PlaceHeldObjectAction
+command {"arm", "gripper"}; EmergencyRetractAction commands {"arm"} only and
+never touches the gripper.
+
+Mandatory completion block in PickAndPlaceAction: lower_gripper +
+close_gripper + raise_gripper. Deliberation can never cut into it. The
+collision reflex declares ReflexPreemption.PREEMPT, so a collision inside the
+block cancels the step, runs PickAndPlaceAction.on_preempted() (freeze the
+arm, keep the grip -- no rollback, nothing is dropped) and then retracts the
+arm with the object still held. Once the hazard has cleared,
+PlaceHeldObjectInstinct has deliberation finish the job.
 """
 
 from __future__ import annotations
@@ -44,6 +54,7 @@ from arachnite import (
     Context,
     InterruptPolicy,
     Proposal,
+    ReflexPreemption,
     Result,
     Signal,
     StepResult,
@@ -72,6 +83,11 @@ class ArmState:
     start_time:          float       = field(default_factory=time.monotonic)
     pick_count:          int         = 0
     emergency_count:     int         = 0
+    # Safety bookkeeping for the reflex-during-action evaluation (E9): how
+    # often a running action was preempted, and how often a held object was
+    # let go anywhere other than the place target.
+    preempt_count:       int         = 0
+    object_drops:        int         = 0
     # Per-pick wall-clock instrumentation — mirrors
     # ``baselines/shared_sim.py:ArmState`` so the cross-framework comparison
     # reports a per-pick latency distribution that means the same thing for
@@ -92,6 +108,21 @@ SIM = ArmState()
 # Standalone runs of the example (examples/robot_arm/simulate.py) keep
 # BENCHMARK_MODE == False so the demo still reflects realistic robot timing.
 BENCHMARK_MODE: bool = False
+
+
+# Simulated actuation durations (seconds) for standalone runs, sized like a
+# small desktop arm: the mandatory block (lower + close + raise = 2.0 s)
+# spans ~20 ticks at 10 Hz, so a hazard can arrive in the middle of it.
+# Each stays below its step timeout. BENCHMARK_MODE skips all of them.
+STEP_DURATION_S: dict[str, float] = {
+    "move_to_object":  1.0,
+    "lower_gripper":   0.8,
+    "close_gripper":   0.4,
+    "raise_gripper":   0.8,
+    "move_to_target":  1.0,
+    "release_gripper": 0.2,
+    "retract":         0.3,
+}
 
 
 async def _sim_sleep(seconds: float) -> None:
@@ -211,9 +242,15 @@ class CollisionReflex(BaseReflexInstinctNode):
     Bypasses DecisionMasterNode entirely.
     MUST be co-located with EmergencyRetractAction (same AgentNode).
     priority = 250 (≥ 200 required for reflexes).
+
+    PREEMPT: a collision during PickAndPlaceAction's mandatory block cuts in
+    through its safe-stop instead of waiting the block out. With
+    ``reflex_mode="event"`` the reflex runs on every proximity signal.
     """
-    node_id  = "CollisionReflex"
-    priority = 250
+    node_id            = "CollisionReflex"
+    priority           = 250
+    preemption         = ReflexPreemption.PREEMPT
+    trigger_on_signals = ["proximity"]
 
     @override
     async def evaluate(self, ctx: Context) -> Proposal | None:
@@ -271,19 +308,20 @@ class PickAndPlaceAction(MultiStepActionNode):
     """
     Six-step pick-and-place sequence.
 
-    Mandatory completion block: lower_gripper + close_gripper + raise_gripper
-    These three steps must run to completion once started — interrupting mid-grip
-    would leave the arm in an unsafe configuration.
+    Mandatory completion block: lower_gripper + close_gripper + raise_gripper.
+    A deliberative interrupt is held until the block completes (worst case:
+    the remaining step timeouts, 1.0 + 0.5 + 1.0 s); the ROLLBACK policy then
+    undoes the block in reverse order.
 
-    Worst-case interrupt latency = sum(timeout_s of mandatory steps)
-                                 = 1.0 + 0.5 + 1.0 = 2.5 seconds.
-
-    Uses ROLLBACK policy: if interrupted after the mandatory block,
-    the rollback callables restore hardware to a safe state.
+    A reflex is different (ADR 0005): CollisionReflex preempts, so the block
+    is cut at its current await and ``on_preempted()`` brings the arm to a
+    safe hold -- joints frozen, grip kept. No rollback runs on preemption:
+    reversing a grasp next to an obstacle would drop the object.
     """
     node_id          = "PickAndPlaceAction"
     interrupt_policy = InterruptPolicy.ROLLBACK
     timeout_s        = 10.0
+    resources        = frozenset({"arm", "gripper"})
 
     @override
     def steps(self) -> list[ActionStep]:
@@ -321,20 +359,20 @@ class PickAndPlaceAction(MultiStepActionNode):
         match step.name:
             case "move_to_object":
                 self.logger.info("Moving to object", distance=SIM.object_distance)
-                await _sim_sleep(0.05)         # sim: 50 ms travel
+                await _sim_sleep(STEP_DURATION_S["move_to_object"])
                 SIM.joints = [10.0, -20.0, 30.0, -10.0, 5.0, 0.0]
                 return StepResult(step_name="move_to_object", success=True,
                                   output={"joints": list(SIM.joints)})
 
             case "lower_gripper":
                 self.logger.info("Lowering gripper (mandatory)")
-                await _sim_sleep(0.02)         # sim: 20 ms
+                await _sim_sleep(STEP_DURATION_S["lower_gripper"])
                 SIM.joints[1] -= 15.0
                 return StepResult(step_name="lower_gripper", success=True)
 
             case "close_gripper":
                 self.logger.info("Closing gripper (mandatory)")
-                await _sim_sleep(0.01)         # sim: 10 ms
+                await _sim_sleep(STEP_DURATION_S["close_gripper"])
                 SIM.gripper  = 1.0
                 SIM.holding  = True
                 return StepResult(step_name="close_gripper", success=True,
@@ -342,7 +380,7 @@ class PickAndPlaceAction(MultiStepActionNode):
 
             case "raise_gripper":
                 self.logger.info("Raising gripper (mandatory)")
-                await _sim_sleep(0.02)         # sim: 20 ms
+                await _sim_sleep(STEP_DURATION_S["raise_gripper"])
                 SIM.joints[1] += 15.0
                 return StepResult(step_name="raise_gripper", success=True)
 
@@ -350,13 +388,13 @@ class PickAndPlaceAction(MultiStepActionNode):
                 tx = proposal.parameters.get("target_x", 0.0)
                 ty = proposal.parameters.get("target_y", 0.6)
                 self.logger.info("Moving to target", target_x=tx, target_y=ty)
-                await _sim_sleep(0.05)         # sim: 50 ms travel
+                await _sim_sleep(STEP_DURATION_S["move_to_target"])
                 SIM.joints = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
                 return StepResult(step_name="move_to_target", success=True)
 
             case "release_gripper":
                 self.logger.info("Releasing object at target")
-                await _sim_sleep(0.01)
+                await _sim_sleep(STEP_DURATION_S["release_gripper"])
                 await _noise.actuation_delay()
                 SIM.gripper  = 0.0
                 SIM.holding  = False
@@ -378,6 +416,17 @@ class PickAndPlaceAction(MultiStepActionNode):
                 return StepResult(step_name=step.name, success=False,
                                   error=ValueError(f"Unknown step: {step.name}"))
 
+    @override
+    async def on_preempted(self, proposal: Proposal, preempted_by: Proposal) -> None:
+        """Safe-stop: freeze the arm where it is and keep the grip."""
+        SIM.preempt_count += 1
+        self.logger.warning(
+            "Preempted by reflex: arm frozen, grip kept",
+            step=self._current_step.name if self._current_step else None,
+            holding=SIM.holding,
+            reflex=preempted_by.instinct_id,
+        )
+
     # ── Rollback callables ────────────────────────────────────────────────────
 
     async def _raise_gripper(self) -> None:
@@ -390,6 +439,8 @@ class PickAndPlaceAction(MultiStepActionNode):
         """Undo close_gripper: release whatever was grabbed."""
         self.logger.warning("Rollback: opening gripper")
         await _sim_sleep(0.01)
+        if SIM.holding:
+            SIM.object_drops += 1   # let go away from the place target
         SIM.gripper = 0.0
         SIM.holding = False
 
@@ -402,14 +453,18 @@ class PickAndPlaceAction(MultiStepActionNode):
 
 class EmergencyRetractAction(BaseActionNode):
     """
-    Reflex target: immediately resets all joints to the home position
-    and opens the gripper.
+    Reflex target: immediately retracts all joints to the home position.
+
+    Commands the arm only -- the gripper keeps its state, so an object being
+    carried is retracted with the arm instead of being dropped next to the
+    obstacle.
 
     Co-location rule: must be on the same AgentNode as CollisionReflex.
     timeout_s is short — this must complete before the next tick.
     """
     node_id   = "EmergencyRetractAction"
     timeout_s = 1.0
+    resources = frozenset({"arm"})
 
     @override
     async def execute(self, proposal: Proposal) -> Result:
@@ -418,22 +473,88 @@ class EmergencyRetractAction(BaseActionNode):
             "EMERGENCY RETRACT -- collision imminent",
             distance=dist,
         )
-        # Immediate home: zero all joints, open gripper
+        # Immediate home: zero all joints; the gripper is not ours to touch
         await _noise.actuation_delay()
         SIM.joints   = [0.0] * 6
-        SIM.gripper  = 0.0
-        SIM.holding  = False
         SIM.collision_imminent = False
         SIM.start_time = time.monotonic()
         SIM.emergency_count += 1
         # Discard the in-flight pick stopwatch — the pick was aborted.
         SIM.pick_start_ns = -1
-        await _sim_sleep(0.005)      # sim: 5 ms retract
+        await _sim_sleep(STEP_DURATION_S["retract"])
         return Result(
             action_id = self.node_id,
             success   = True,
             output    = {
                 "distance":        dist,
                 "emergency_count": SIM.emergency_count,
+                "holding":         SIM.holding,
             },
         )
+
+
+# ── Recovery after a preempted pick ──
+
+class PlaceHeldObjectInstinct(BaseInstinctNode):
+    """
+    Recovery: an object is still held but no pick is running (the pick was
+    preempted by the collision reflex) -- once the hazard has cleared, finish
+    the job by placing it at the target.
+
+    priority = 70 (goal-directed, below GraspInstinct).
+    """
+    node_id  = "PlaceHeldObjectInstinct"
+    priority = 70
+
+    @override
+    async def evaluate(self, ctx: Context) -> Proposal | None:
+        if not SIM.holding or SIM.collision_imminent:
+            return None
+        running = {state.action_id for state in ctx.action_states}
+        if "PickAndPlaceAction" in running:
+            return None
+        return Proposal(
+            instinct_id = self.node_id,
+            action_id   = "PlaceHeldObjectAction",
+            priority    = self.priority,
+            urgency     = 0.6,
+            rationale   = "Object still held after an interrupted pick",
+        )
+
+
+class PlaceHeldObjectAction(MultiStepActionNode):
+    """Carry a held object to the place target and release it."""
+    node_id   = "PlaceHeldObjectAction"
+    timeout_s = 5.0
+    resources = frozenset({"arm", "gripper"})
+
+    @override
+    def steps(self) -> list[ActionStep]:
+        return [
+            ActionStep("move_to_target",  interruptible=True, timeout_s=2.0),
+            ActionStep("release_gripper", interruptible=True, timeout_s=0.5),
+        ]
+
+    @override
+    async def execute_step(
+        self,
+        step:      ActionStep,
+        proposal:  Proposal,
+        completed: list[StepResult],
+    ) -> StepResult:
+        match step.name:
+            case "move_to_target":
+                await _sim_sleep(STEP_DURATION_S["move_to_target"])
+                SIM.joints = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+                return StepResult(step_name=step.name, success=True)
+            case "release_gripper":
+                await _sim_sleep(STEP_DURATION_S["release_gripper"])
+                SIM.gripper = 0.0
+                SIM.holding = False
+                SIM.pick_count += 1
+                SIM.start_time = time.monotonic()
+                return StepResult(step_name=step.name, success=True,
+                                  output={"pick_count": SIM.pick_count})
+            case _:
+                return StepResult(step_name=step.name, success=False,
+                                  error=ValueError(f"Unknown step: {step.name}"))

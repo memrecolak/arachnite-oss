@@ -4,64 +4,78 @@ examples/robot_arm/simulate.py
 Single-process simulation of the pick-and-place robot arm case study.
 
 Runs all nodes in one ArachniteRuntime using the default LocalTransport.
-At t ≈ 15 s a collision event is injected to demonstrate the reflex arc
-firing mid-action, deferring its interrupt through the mandatory block,
-and then triggering EmergencyRetractAction.
+Actions run as tasks while the tick loop keeps sensing (ADR 0005), so the
+collision reflex is evaluated even while a pick is in progress.
+
+Two collision scenarios:
+
+  --collide-at SECONDS   inject a collision at a fixed wall-clock time
+                         (default 15 s; the arm is usually idle then)
+  --collide-in-block     inject the collision the moment PickAndPlaceAction
+                         starts close_gripper — inside its mandatory block
+
+In the in-block scenario the reflex (ReflexPreemption.PREEMPT) cuts into the
+block: PickAndPlaceAction.on_preempted() freezes the arm and keeps the grip,
+EmergencyRetractAction retracts the arm with the object still held, and once
+the hazard has cleared PlaceHeldObjectInstinct places the object. No object
+is dropped.
 
 Run:
-    python examples/robot_arm/simulate.py
-
-Expected output:
-  - Several successful pick-and-place cycles (distance drifts into range)
-  - At t≈15 s: collision injected → reflex fires → mandatory block completes
-    → EmergencyRetractAction executes → state resets → cycles resume
+    python -m examples.robot_arm.simulate
+    python -m examples.robot_arm.simulate --collide-in-block --reflex-mode event
 """
 
 from __future__ import annotations
 
+import argparse
 import asyncio
 import time
 
 from arachnite import (
+    ActionMasterNode,
     ArachniteRuntime,
     ContextNode,
     DecisionMasterNode,
-    ActionMasterNode,
     InstinctMasterNode,
+    LogLevel,
     SenseMasterNode,
     SignalBus,
     StdoutLogSink,
-    LogLevel,
     WeightedDecisionNode,
 )
-
 from examples.robot_arm.nodes import (
+    SIM,
     CollisionReflex,
     EmergencyRetractAction,
     GraspInstinct,
     JointPositionSenseNode,
     ObjectDetectionSenseNode,
     PickAndPlaceAction,
+    PlaceHeldObjectAction,
+    PlaceHeldObjectInstinct,
     ProximitySenseNode,
-    SIM,
 )
 
-_RUN_SECONDS       = 35.0
-_COLLISION_AT      = 15.0   # seconds after start — inject collision event
-_COLLISION_CLEARED = False
+_RUN_SECONDS = 35.0
 
 
-async def _inject_collision(rt: ArachniteRuntime) -> None:
-    """Background task: sets collision flag at t=COLLISION_AT."""
-    global _COLLISION_CLEARED
-    await asyncio.sleep(_COLLISION_AT)
+async def _collide_at(seconds: float) -> None:
+    """Background task: sets the collision flag at a fixed time."""
+    await asyncio.sleep(seconds)
     print("\n" + "=" * 60)
-    print(f"  [t={_COLLISION_AT:.0f}s] *** COLLISION INJECTED -- proximity -> 0.02 m")
+    print(f"  [t={seconds:.0f}s] *** COLLISION INJECTED -- proximity -> 0.02 m")
+    print("=" * 60 + "\n")
+    SIM.collision_imminent = True   # EmergencyRetractAction clears it
+
+
+async def _collide_in_block(pick: PickAndPlaceAction) -> None:
+    """Background task: sets the collision flag as close_gripper starts."""
+    while not (pick._current_step and pick._current_step.name == "close_gripper"):
+        await asyncio.sleep(0.001)
+    print("\n" + "=" * 60)
+    print("  *** COLLISION INJECTED inside the mandatory block (close_gripper)")
     print("=" * 60 + "\n")
     SIM.collision_imminent = True
-    # The reflex will clear it in EmergencyRetractAction.execute()
-    await asyncio.sleep(_RUN_SECONDS - _COLLISION_AT)
-    await rt.stop()
 
 
 async def _status_printer() -> None:
@@ -81,7 +95,7 @@ async def _status_printer() -> None:
         )
 
 
-async def main() -> None:
+async def main(collide_at: float, collide_in_block: bool, reflex_mode: str) -> None:
     log_sinks = [StdoutLogSink(level=LogLevel.WARNING)]  # only warnings + errors
     bus = SignalBus()
 
@@ -98,9 +112,12 @@ async def main() -> None:
 
     instinct_master.register(CollisionReflex(bus=bus, log_sinks=log_sinks))
     instinct_master.register(GraspInstinct(bus=bus, log_sinks=log_sinks))
+    instinct_master.register(PlaceHeldObjectInstinct(bus=bus, log_sinks=log_sinks))
 
-    action_master.register(PickAndPlaceAction(bus=bus, log_sinks=log_sinks))
+    pick = PickAndPlaceAction(bus=bus, log_sinks=log_sinks)
+    action_master.register(pick)
     action_master.register(EmergencyRetractAction(bus=bus, log_sinks=log_sinks))
+    action_master.register(PlaceHeldObjectAction(bus=bus, log_sinks=log_sinks))
 
     rt = ArachniteRuntime(
         sense_master    = sense_master,
@@ -111,33 +128,51 @@ async def main() -> None:
         bus             = bus,
         tick_rate_hz    = 10.0,
         log_sinks       = log_sinks,
+        reflex_mode     = reflex_mode,
     )
 
+    scenario = (
+        "inside the mandatory block" if collide_in_block else f"at t={collide_at:.0f} s"
+    )
     print("Robot arm simulation -- pick-and-place + collision reflex")
-    print(f"Running for {_RUN_SECONDS:.0f} s at 10 Hz.  "
-          f"Collision injected at t={_COLLISION_AT:.0f} s.")
-    print("-" * 60)
-    print(f"  {'t':>6}  {'dist':>8}  {'gripper':>8}  {'holding':>8}  "
-          f"{'picks':>6}  {'emergencies':>12}")
+    print(f"Running for {_RUN_SECONDS:.0f} s at 10 Hz, reflex_mode={reflex_mode}. "
+          f"Collision {scenario}.")
     print("-" * 60)
 
     await rt.start()
-    asyncio.create_task(_inject_collision(rt))
-    asyncio.create_task(_status_printer())
+    injector = (
+        _collide_in_block(pick) if collide_in_block else _collide_at(collide_at)
+    )
+    tasks = [asyncio.create_task(injector), asyncio.create_task(_status_printer())]
 
     try:
-        await rt.wait()
-    except KeyboardInterrupt:
+        await asyncio.sleep(_RUN_SECONDS)
+    finally:
         await rt.stop()
+        for task in tasks:
+            task.cancel()
 
     print("-" * 60)
     print("Simulation complete.")
     print(f"  Ticks executed : {rt.tick_count}")
     print(f"  Picks completed: {SIM.pick_count}")
     print(f"  Emergencies    : {SIM.emergency_count}")
+    print(f"  Preemptions    : {SIM.preempt_count}")
+    print(f"  Objects dropped: {SIM.object_drops}")
     print(f"  Final state    : gripper={'closed' if SIM.gripper > 0.5 else 'open'}, "
           f"holding={SIM.holding}")
 
 
+def _parse() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Robot-arm pick-and-place simulation")
+    parser.add_argument("--collide-at", type=float, default=15.0,
+                        help="inject the collision at this time (s)")
+    parser.add_argument("--collide-in-block", action="store_true",
+                        help="inject the collision as close_gripper starts")
+    parser.add_argument("--reflex-mode", choices=("tick", "event"), default="tick")
+    return parser.parse_args()
+
+
 if __name__ == "__main__":
-    asyncio.run(main())
+    args = _parse()
+    asyncio.run(main(args.collide_at, args.collide_in_block, args.reflex_mode))
