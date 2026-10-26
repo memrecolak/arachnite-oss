@@ -36,6 +36,7 @@ pip install "arachnite[nats]"           # NATS transport
 pip install "arachnite[redis]"          # Redis transport
 pip install "arachnite[web]"            # bundled signal dashboard
 pip install "arachnite[llm]"            # Anthropic LLM provider
+pip install "arachnite[yaml]"           # DeploymentManifest.from_yaml()
 pip install "arachnite[benchmarks]"     # psutil for RSS measurement
 ```
 
