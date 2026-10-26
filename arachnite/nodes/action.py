@@ -406,16 +406,23 @@ class MultiStepActionNode(BaseActionNode):
             self._current_step = step
             pending = all_steps[i + 1:]
 
-            # A WAIT_FOR_BLOCK reflex is waiting: the first interruptible
-            # boundary after the block hands the resources over, whatever
-            # the interrupt policy (policies govern deliberation, not reflexes).
-            if self._reflex_preempt_by is not None and step.interruptible:
+            # The boundary before this step is a stop point unless it lies
+            # strictly inside a mandatory block (previous and this step both
+            # non-interruptible). In particular the boundary *before* a block
+            # is one: a pending stop is honoured there instead of running the
+            # whole block only to undo it afterwards.
+            stop_point = step.interruptible or i == 0 or all_steps[i - 1].interruptible
+
+            # A WAIT_FOR_BLOCK reflex is waiting: the first stop point hands
+            # the resources over, whatever the interrupt policy (policies
+            # govern deliberation, not reflexes).
+            if self._reflex_preempt_by is not None and stop_point:
                 return await self._handle_reflex_preempt(
                     proposal, self._reflex_preempt_by, start_time,
                 )
 
             # Check interrupt request before starting this step
-            if self._interrupt_requested and step.interruptible:
+            if self._interrupt_requested and stop_point:
                 should_interrupt = (
                     self.interrupt_policy in (
                         InterruptPolicy.ALWAYS, InterruptPolicy.ROLLBACK

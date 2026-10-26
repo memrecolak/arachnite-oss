@@ -339,9 +339,11 @@ class CoolSequence(MultiStepActionNode):
 ```
 
 Multi-step semantics to rely on:
-- A deliberative interrupt is honoured only at a boundary before an **interruptible**
-  step (per `interrupt_policy`). A request arriving before or inside a mandatory block
-  is held until the block completes. Deliberation can never cut into a mandatory block.
+- A deliberative interrupt is honoured at the next safe stop point (per
+  `interrupt_policy`): any step boundary not strictly inside a mandatory block. That
+  includes the boundary *before* a block, so a request pending there stops the action
+  before the block starts. A request arriving inside a block is held until the block
+  completes. Deliberation can never cut into a mandatory block.
 - ROLLBACK: `on_interrupted()` (default) runs the rollback of every completed
   non-interruptible step in reverse order and attempts **all** of them. Failures are
   raised together as one `RollbackError` whose `failures` lists `(step_name, exc)`.

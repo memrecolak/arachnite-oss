@@ -114,8 +114,10 @@ class TestRollbackOnInterruptStrict:
         assert action.rolled_back == ["step2"]
 
     @pytest.mark.asyncio
-    async def test_interrupt_before_mandatory_block_stops_at_step1(self, bus: SignalBus) -> None:
-        """Interrupt requested before step1 should stop at step1 boundary."""
+    async def test_interrupt_before_mandatory_block_stops_at_block_entry(
+        self, bus: SignalBus,
+    ) -> None:
+        """Interrupt pending after step1 stops at the step1/step2 boundary."""
         action = MandatoryBlockAction(bus=bus)
         proposal = make_proposal(action_id="StrictMandatoryBlockAction")
 
@@ -137,11 +139,12 @@ class TestRollbackOnInterruptStrict:
         action.execute_step = counting_step  # type: ignore[method-assign]
         result = await action.execute(proposal)
 
-        # step2 is mandatory so interrupt is held; step2 completes,
-        # then interrupt fires before step3
+        # The boundary before a mandatory block is a stop point: the pending
+        # interrupt is honoured there instead of running step2's block only
+        # to undo it afterwards.
         assert result.interrupted is True
-        assert len(result.step_results) == 2
-        assert [sr.step_name for sr in result.step_results] == ["step1", "step2"]
+        assert [sr.step_name for sr in result.step_results] == ["step1"]
+        assert result.stopped_at_step == "step2"
 
 
 # ── SafetyMonitorRegistry: verify exact violations ──────────────────────────

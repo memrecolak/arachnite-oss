@@ -162,7 +162,7 @@ class RollbackAction(MultiStepActionNode):
 
 class TestRollbackPolicy:
     @pytest.mark.asyncio
-    async def test_rollback_called_after_mandatory_block(self) -> None:
+    async def test_interrupt_before_block_never_enters_it(self) -> None:
         bus    = SignalBus()
         action = RollbackAction(bus=bus)
 
@@ -174,8 +174,30 @@ class TestRollbackPolicy:
         action.request_interrupt(_make_interrupt())
         result = await task
 
-        # ROLLBACK policy: interrupt fires at first interruptible step after
-        # the mandatory block (step3), then rollback of step2 is invoked.
+        # The interrupt is honoured at the boundary before the mandatory
+        # block (step2): the block is never started, so nothing is undone.
+        assert result.interrupted
+        assert result.stopped_at_step == "step2"
+        assert action.rolled_back == []
+
+    @pytest.mark.asyncio
+    async def test_rollback_called_after_mandatory_block(self) -> None:
+        bus    = SignalBus()
+        action = RollbackAction(bus=bus)
+        original_execute = action.execute_step
+
+        async def interrupt_inside_block(
+            step: ActionStep, proposal: Proposal, completed: list[StepResult]
+        ) -> StepResult:
+            if step.name == "step2":
+                action.request_interrupt(_make_interrupt())
+            return await original_execute(step, proposal, completed)
+
+        action.execute_step = interrupt_inside_block  # type: ignore[method-assign]
+        result = await action.execute(make_proposal(action_id=action.node_id))
+
+        # ROLLBACK policy: an interrupt arriving inside the block is held,
+        # fires at the first boundary after it, and rolls back step2.
         assert result.interrupted
         assert result.rolled_back
         assert "step2" in action.rolled_back

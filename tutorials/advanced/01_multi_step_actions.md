@@ -61,8 +61,10 @@ class ActionStep:
 The two fields you'll care about most:
 
 - **`interruptible`** — if `True`, the action may be stopped at the boundary
-  before this step. If `False`, the step belongs to a *mandatory block*: the
-  decision layer can never interrupt it, and a graceful `stop()` waits for
+  before this step. If `False`, the step belongs to a *mandatory block*. The
+  action can still be stopped just *before* the block starts (a pending stop
+  is honoured there rather than running the block only to undo it), but once
+  the block has started the decision layer can never interrupt it, and a graceful `stop()` waits for
   it to finish. Only two things cut into a mandatory block: a reflex that
   needs the same hardware (with the default `ReflexPreemption.PREEMPT`, see
   below) and `emergency_stop()`.
@@ -81,7 +83,7 @@ more important proposal wants the same hardware) and from a graceful
 ```python
 from arachnite.models import InterruptPolicy
 
-# Stop at the next interruptible step boundary
+# Stop at the next safe boundary (any boundary not inside a mandatory block)
 interrupt_policy = InterruptPolicy.ALWAYS
 
 # Run to completion no matter what (atomic action)

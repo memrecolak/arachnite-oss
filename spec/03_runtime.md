@@ -849,7 +849,7 @@ class ActionStep:
 
     name: str                          \# human\-readable label for logging
 
-    interruptible: bool = True         \# may execution stop before this step?
+    interruptible: bool = True         \# False: part of a mandatory block
 
     rollback: Callable\[\[\], Awaitable\[None\]\] | None = None
 
@@ -863,7 +863,7 @@ class ActionStep:
 
     metadata: dict = field\(default\_factory=dict\)
 
-Steps are declared as a flat list\. Consecutive non\-interruptible steps form an implicit mandatory block — no deliberative interrupt is honoured inside it \(§17\.5 lists the only ways it can end early\)\. The boundary before a step with interruptible=True is a safe stop point: a pending interrupt is honoured there, before the step starts\.
+Steps are declared as a flat list\. Consecutive non\-interruptible steps form an implicit mandatory block — no deliberative interrupt is honoured inside it \(§17\.5 lists the only ways it can end early\)\. Every step boundary that is not strictly inside a block is a safe stop point — the boundary before an interruptible step, and the boundary *before* a block \(so a pending interrupt is honoured before the block starts, instead of running the block only to undo it\)\. Boundaries between two non\-interruptible steps are not stop points\.
 
 ## __17\.2 StepResult__
 
@@ -907,7 +907,7 @@ __Behaviour on interrupt request__
 
 __ALWAYS__
 
-Stop at the next step boundary before a step with interruptible=True\. If the next step is interruptible, stop as soon as the current step completes\. Fast and simple\.
+Stop at the next safe stop point \(any boundary not strictly inside a mandatory block\)\. Outside a block this is as soon as the current step completes\. Fast and simple\.
 
 __NEVER__
 
@@ -1063,7 +1063,7 @@ __Cancellation safety\.__ Independently of the cooperative path, a ``PREEMPT`` r
 
 A mandatory completion block is a sequence of consecutive steps where every step has interruptible=False\. "Mandatory block atomicity" is three separate properties \(ADR 0005\):
 
-1\. __Deliberative atomicity__ \(enforced\)\. No deliberative interrupt cuts into a block: ``ActionMasterNode\.request\_interrupt\(\)`` raises ``MandatoryBlockViolation``, the decision layer never selects an owner inside a block for interruption, ``check\_interrupt\(\)`` returns False there, and an interrupt flag set before the block \(e\.g\. the shutdown interrupt\) is held until the first interruptible boundary after it\.
+1\. __Deliberative atomicity__ \(enforced\)\. No deliberative interrupt cuts into a block: ``ActionMasterNode\.request\_interrupt\(\)`` raises ``MandatoryBlockViolation``, the decision layer never selects an owner inside a block for interruption, ``check\_interrupt\(\)`` returns False there, an interrupt pending when the block is about to start is honoured at the boundary before it \(the block is never entered\), and one arriving inside the block \(e\.g\. the shutdown interrupt\) is held until the first stop point after it\.
 2\. __Resource exclusivity__ \(enforced for declared resources\)\. While the action runs, no other action can own any of its declared ``resources`` \(§17\.12\)\.
 3\. __Bounded reflex admission__ \(derived, not guaranteed\)\. A reflex whose action needs the owner's resources is admitted within a bound computed from declared timeouts — immediately after the owner's safe\-stop under ``PREEMPT``, after the remaining block under ``WAIT\_FOR\_BLOCK``\. The bounds and their assumptions are in §17\.12; they are not hard real\-time guarantees\.
 
