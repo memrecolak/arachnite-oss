@@ -1230,6 +1230,8 @@ class ActionMasterNode(FaultReportingMixin, BaseNode):
         """Buffer a launched task's Result and signal idleness."""
         buffered = task in self._buffered
         self._buffered.discard(task)
+        if task.cancelled():
+            self._release_unstarted(task, buffered=buffered)
         if buffered and not task.cancelled():
             exc = task.exception()
             if exc is not None:
@@ -1242,6 +1244,38 @@ class ActionMasterNode(FaultReportingMixin, BaseNode):
                 self._completed.append(task.result())
         if not self._running_nodes and not self._armed:
             self._idle.set()
+
+    def _release_unstarted(self, task: asyncio.Task[Result], *, buffered: bool) -> None:
+        """
+        Release an action whose task was cancelled before its first step.
+
+        A cancel that lands before the task body starts never enters
+        ``_run``, so its ``finally`` cannot release the reservation. The
+        action commanded nothing, so no safe-stop is due; a preemption is
+        still reported as a preempted Result.
+        """
+        action_id = next(
+            (aid for aid, t in self._tasks.items() if t is task), None,
+        )
+        if action_id is None:
+            return  # the body ran and released already
+        preempted = action_id in self._preempted_by
+        node = self._running_nodes.get(action_id)
+        if isinstance(node, MultiStepActionNode):
+            node._clear_run_state()
+        self.logger.info(
+            "Action cancelled before it started",
+            action_id=action_id,
+            preempted=preempted,
+        )
+        if buffered and preempted:
+            self._completed.append(Result(
+                action_id   = action_id,
+                success     = False,
+                interrupted = True,
+                preempted   = True,
+            ))
+        self._release(action_id)
 
     def drain_completed(self) -> list[Result]:
         """Return (and clear) the Results of launched actions finished so far."""

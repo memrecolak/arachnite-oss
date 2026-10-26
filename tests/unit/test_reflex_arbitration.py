@@ -495,3 +495,40 @@ class TestPreemptDuringRollback:
         assert len(pick.undone) == len(set(pick.undone))   # nothing undone twice
         assert pick.undone in ([], ["close"])              # walk cut short, not restarted
         assert _results_by_id(am)["_SlowUndoPick"].preempted is True
+
+
+class TestCancelledBeforeStart:
+    """A cancel that lands before the task's first step must still release."""
+
+    @pytest.mark.asyncio
+    async def test_reflex_preempting_an_unstarted_owner_runs(self) -> None:
+        bus = SignalBus()
+        am = ActionMasterNode(bus=bus)
+        actuator = Actuator()
+        move = MoveArm(bus, actuator)
+        retract = Retract(bus, actuator)
+        am.register(move)
+        am.register(retract)
+        # Same synchronous span: MoveArm's task has not taken a step yet.
+        assert am.launch(_p("MoveArm")).status is LaunchStatus.LAUNCHED
+        assert am.launch_reflex(_p("Retract", 250)).status is LaunchStatus.ARMED
+        assert await am.wait_idle(1.0)
+        assert am.resource_owners() == {}
+        assert am.armed_reflexes() == {}
+        assert move.calls == 0
+        assert retract.entered_at is not None
+        results = _results_by_id(am)
+        assert results["MoveArm"].preempted is True
+        assert results["MoveArm"].success is False
+        assert results["Retract"].success is True
+
+    @pytest.mark.asyncio
+    async def test_cancel_before_start_releases_the_resource(self) -> None:
+        bus = SignalBus()
+        am = ActionMasterNode(bus=bus)
+        am.register(MoveArm(bus, Actuator()))
+        am.launch(_p("MoveArm"))
+        await am.cancel("MoveArm", timeout=0.5)
+        assert am.running_action_ids() == set()
+        assert am.resource_owners() == {}
+        assert await am.wait_idle(0.5)

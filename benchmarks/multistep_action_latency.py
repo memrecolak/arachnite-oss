@@ -250,6 +250,15 @@ class _MandatoryBlockAction(MultiStepActionNode):
     # ``_STEP_SLEEP_S`` this gives the block's wall-clock duration — a
     # synthetic proxy for the ``Σ timeout_s`` formal bound.
     _MANDATORY_INNER_AWAITS = 10
+    # Inner await after which the block signals ``mid_block``: the probe
+    # fires its interrupt from there, so the request lands inside the block
+    # on any host and timer resolution (a sleep-based delay does not on
+    # Windows before Python 3.11, where every short sleep lasts ~15.6 ms).
+    _FIRE_AFTER_AWAITS = 3
+
+    def __init__(self, *args: object, **kwargs: object) -> None:
+        super().__init__(*args, **kwargs)
+        self.mid_block = asyncio.Event()
 
     def steps(self) -> list[ActionStep]:
         return [
@@ -262,7 +271,9 @@ class _MandatoryBlockAction(MultiStepActionNode):
         self, step: ActionStep, proposal: Proposal, completed: list[StepResult],
     ) -> StepResult:
         if step.name == "mandatory":
-            for _ in range(self._MANDATORY_INNER_AWAITS):
+            for i in range(self._MANDATORY_INNER_AWAITS):
+                if i == self._FIRE_AFTER_AWAITS:
+                    self.mid_block.set()
                 await asyncio.sleep(_STEP_SLEEP_S)
         else:
             await asyncio.sleep(_STEP_SLEEP_S)
@@ -376,12 +387,9 @@ async def _measure_mandatory_block_worst_case() -> tuple[float, bool]:
     action = _MandatoryBlockAction(bus=bus)
 
     async def _fire_interrupt_midblock() -> None:
-        # Wait until execute() is inside the mandatory step — well past
-        # the prep step and partway through the inner awaits.
-        target_delay = _STEP_SLEEP_S * (
-            1.5 + _MandatoryBlockAction._MANDATORY_INNER_AWAITS * 0.3
-        )
-        await asyncio.sleep(target_delay)
+        # Fire once execute() is inside the mandatory step, partway through
+        # its inner awaits.
+        await action.mid_block.wait()
         action.request_interrupt(_interrupt_request())
 
     task = asyncio.create_task(_fire_interrupt_midblock())
