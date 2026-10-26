@@ -173,7 +173,7 @@ class DeploymentManifest:
         if not _YAML_AVAILABLE:
             raise ImportError(
                 "DeploymentManifest.from_yaml() requires 'pyyaml'. "
-                "Install with: pip install pyyaml"
+                'Install with: pip install "arachnite[yaml]"'
             )
         with open(path) as f:
             raw = yaml.safe_load(f)
