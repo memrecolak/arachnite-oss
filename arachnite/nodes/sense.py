@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import time
 from abc import abstractmethod
+from collections import deque
 from collections.abc import Sequence
 
 from arachnite.bus import SignalBus
@@ -18,6 +19,15 @@ from arachnite.exceptions import NodeRegistrationError, SignalBusError
 from arachnite.logging import BaseLogSink
 from arachnite.models import MergePolicy, Signal, StateUpdateSignal
 from arachnite.nodes.base import BaseNode, FaultReportingMixin
+
+# Pushed signals kept per node for the next tick's deliberation. The lane
+# stays live while the runtime is paused, when no tick drains them.
+MAX_PENDING_PUSHES = 256
+
+# Slack on the poll throttle: a tick that comes back a clock tick early
+# (15.6 ms on Windows) must not skip a sensor whose interval equals the
+# tick period.
+_POLL_SLACK_S = time.get_clock_info("monotonic").resolution + 0.001
 
 
 class BaseSenseNode(BaseNode):
@@ -49,8 +59,9 @@ class BaseSenseNode(BaseNode):
         **kwargs: object,
     ) -> None:
         super().__init__(bus, config, log_sinks, agent_node_id, **kwargs)  # type: ignore[arg-type]
-        self._last_read_time: float = 0.0
-        self._pushed: list[Signal] = []
+        self._last_read_time: float = float("-inf")
+        self._pushed: deque[Signal] = deque(maxlen=MAX_PENDING_PUSHES)
+        self._pushes_dropped = 0
 
     async def push(self, signal: Signal) -> None:
         """
@@ -68,6 +79,8 @@ class BaseSenseNode(BaseNode):
         if not isinstance(signal, StateUpdateSignal):
             # A StateUpdateSignal already reaches ContextNode through the
             # runtime's bus buffer; queueing it too would apply it twice.
+            if len(self._pushed) == self._pushed.maxlen:
+                self._pushes_dropped += 1  # oldest one goes
             self._pushed.append(signal)
         try:
             await self.bus.publish(signal)
@@ -80,7 +93,15 @@ class BaseSenseNode(BaseNode):
 
     def _drain_pushed(self) -> list[Signal]:
         """Return (and clear) signals pushed since the last read_all()."""
-        pushed, self._pushed = self._pushed, []
+        pushed = list(self._pushed)
+        self._pushed.clear()
+        if self._pushes_dropped:
+            self.logger.warning(
+                "Pushed signals dropped before a tick could take them",
+                dropped=self._pushes_dropped,
+                kept=len(pushed),
+            )
+            self._pushes_dropped = 0
         return pushed
 
     @abstractmethod
@@ -206,14 +227,17 @@ class SenseMasterNode(FaultReportingMixin, BaseNode):
         start = time.monotonic()
 
         async def _read_one(node: BaseSenseNode) -> Signal | None:
-            if (time.monotonic() - node._last_read_time) < node.poll_interval_s:
+            # Spacing is measured between read *starts*, as ticks are
+            # spaced between tick starts; measuring from the end of the
+            # previous read skipped every other tick when the poll
+            # interval equals the tick period.
+            started = time.monotonic()
+            if started - node._last_read_time < node.poll_interval_s - _POLL_SLACK_S:
                 return None
+            node._last_read_time = started
             try:
-                signal = await node.read()
-                node._last_read_time = time.monotonic()
-                return signal
+                return await node.read()
             except Exception as exc:  # noqa: BLE001
-                node._last_read_time = time.monotonic()
                 # Report the fault to the supervisor (via the runtime-wired
                 # handler) so node_fault reaches next tick's Context, then still
                 # give the node its on_error fallback chance for this tick.

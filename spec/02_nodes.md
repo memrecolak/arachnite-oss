@@ -222,7 +222,7 @@ Kinds without a configured policy default to `ALL`\. Single signals of a configu
 | `0\.5` | Read at most 2 times per second — typical for I2C temperature probes |
 | `1\.0+` | Read once per second or less — GPS modules, power\-hungry peripherals |
 
-**Timestamps are per\-sensor:** `read\_all\(\)` captures a fresh `time\.monotonic\(\)` for each sensor individually, both for the throttle check and for updating `\_last\_read\_time`\. This ensures that `\_last\_read\_time` reflects when the sensor's `read\(\)` actually completed, not when the batch started\. Sensors with slow `read\(\)` implementations therefore get accurate throttle windows\.
+**Timestamps are per\-sensor:** `read\_all\(\)` captures a fresh `time\.monotonic\(\)` for each sensor individually, and `poll\_interval\_s` is the minimum spacing between the *starts* of two reads, as ticks are spaced between tick starts \(less a slack of one monotonic\-clock resolution plus 1 ms, so a tick that wakes a clock tick early is not skipped\)\. A sensor whose `poll\_interval\_s` equals the tick period is therefore read on every tick, whatever its `read\(\)` duration, and no two reads start within one interval\.
 
 **Important:** if your tick rate is higher than 1/poll\_interval\_s, the sensor will not produce a signal every tick\. Instincts that depend on this sensor's signals will see no matching signals on throttled ticks\. This is by design — set `poll\_interval\_s` to match your hardware's actual read rate\.
 

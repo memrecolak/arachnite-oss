@@ -181,7 +181,14 @@ class SignalBus:
             except Exception as exc:  # noqa: BLE001
                 errors.append(exc)
 
-        await asyncio.gather(*(_safe_call(cb) for cb in callbacks))
+        # return_exceptions: a callback that raises CancelledError itself
+        # (it awaited something that was cancelled) is a subscriber error,
+        # not a cancel of the publisher; a cancel of the publisher still
+        # propagates out of gather().
+        outcomes = await asyncio.gather(
+            *(_safe_call(cb) for cb in callbacks), return_exceptions=True,
+        )
+        errors.extend(o for o in outcomes if isinstance(o, BaseException))
         return errors
 
     def _may_egress(self, kind: str) -> bool:

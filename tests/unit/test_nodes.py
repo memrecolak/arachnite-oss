@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
+import time
+
 import pytest
 
 from arachnite.exceptions import NodeRegistrationError
@@ -41,16 +44,29 @@ class TestSenseMasterNode:
             sense_master.register(ConstantSenseNode(bus=bus))
 
     @pytest.mark.asyncio
-    async def test_last_read_time_reflects_actual_completion(
-        self, sense_master, bus
-    ) -> None:
-        """A-06: _last_read_time must reflect when read() finished, not batch start"""
-        import time
+    async def test_poll_interval_spaces_read_starts(self, sense_master, bus) -> None:
+        """A-06: no two reads of a sensor start within its poll interval, even if read() is slow"""
         node = SlowSenseNode(bus=bus, delay=0.05)
+        node.poll_interval_s = 0.2
         sense_master.register(node)
-        before = time.monotonic()
-        await sense_master.read_all()
-        assert node._last_read_time >= before + 0.04
+        assert len(await sense_master.read_all()) == 1
+        assert await sense_master.read_all() == []      # 50 ms later: still throttled
+
+    @pytest.mark.asyncio
+    async def test_poll_interval_equal_to_tick_period_reads_every_tick(
+        self, sense_master, bus,
+    ) -> None:
+        """Reads paced at exactly poll_interval_s are all taken, despite read() duration"""
+        node = SlowSenseNode(bus=bus, delay=0.02)
+        node.poll_interval_s = 0.1
+        sense_master.register(node)
+        reads = 0
+        for _ in range(6):
+            # Paced like the runtime loop: sleep out the rest of the period.
+            started = time.monotonic()
+            reads += len(await sense_master.read_all())
+            await asyncio.sleep(max(0.0, 0.1 - (time.monotonic() - started)))
+        assert reads == 6
 
     @pytest.mark.asyncio
     async def test_publishes_to_bus(self, sense_master, bus) -> None:

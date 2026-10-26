@@ -145,6 +145,7 @@ SITES: tuple[Site, ...] = (
                     "ActionMasterNode._run",
                     "ActionMasterNode._execute_with_retry",
                     "ActionMasterNode._retry_blocked",
+                    "ActionMasterNode._timed_out",
                     "ActionMasterNode.dispatch",
                     "ActionMasterNode.dispatch_many",
                     "ActionMasterNode._dispatch_one",

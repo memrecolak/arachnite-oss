@@ -378,5 +378,5 @@ class SignalBus:
 - publish\(\) dispatches to all matching subscribers concurrently via asyncio\.gather\(\)\.
 - The bus does not persist signals\. Persistence is ContextNode’s responsibility\.
 - A wildcard kind '\*' receives every signal regardless of type\.
-- Exceptions in a subscriber are caught and re\-raised as SignalBusError after all other subscribers have been notified\. publish\_many\(\) completes every publish before it re\-raises the first such error\.
+- Exceptions in a subscriber are caught and re\-raised as SignalBusError after all other subscribers have been notified\. publish\_many\(\) completes every publish before it re\-raises the first such error\. A subscriber that raises ``CancelledError`` of its own \(it awaited something that was cancelled\) counts as a subscriber error; a cancel of the publisher still propagates\.
 

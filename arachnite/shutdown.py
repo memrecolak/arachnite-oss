@@ -98,19 +98,15 @@ class ShutdownCoordinator:
         # finishes; no new ticks start because _running is False. Actions run
         # as tasks outside the tick (ADR 0005), so this wait is one tick long.
         self._phase = ShutdownPhase.DRAIN_REFLEXES
+        # asyncio.wait() never raises the loop task's own cancellation into
+        # this coroutine (an emergency stop taking over may cancel it).
         loop_task = runtime._loop_task
         if loop_task is not None and not loop_task.done():
-            try:
-                await asyncio.wait_for(
-                    asyncio.shield(loop_task), timeout=self._teardown_timeout_s,
-                )
-            except asyncio.TimeoutError:
-                # ``asyncio.TimeoutError`` is aliased to the builtin
-                # ``TimeoutError`` only on Python >= 3.11; catch the asyncio
-                # one explicitly so 3.10 reaches the cancellation path.
+            done, _ = await asyncio.wait({loop_task}, timeout=self._teardown_timeout_s)
+            if not done:
+                runtime._loop_cancel_requested = True
                 loop_task.cancel()
-                with contextlib.suppress(asyncio.CancelledError, Exception):
-                    await loop_task
+                await asyncio.wait({loop_task})
             runtime._loop_task = None
 
         # Phase 3: Complete mandatory block — re-deliver the shutdown interrupt

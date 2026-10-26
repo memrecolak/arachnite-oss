@@ -127,6 +127,25 @@ class TestSignalBus:
         assert len(received) == 1
 
     @pytest.mark.asyncio
+    async def test_subscriber_raising_cancelled_error_is_a_subscriber_error(self) -> None:
+        bus      = SignalBus()
+        received = []
+
+        async def broken(sig):  # type: ignore[no-untyped-def]
+            fut = asyncio.get_running_loop().create_future()
+            fut.cancel()
+            await fut
+
+        async def healthy(sig):  # type: ignore[no-untyped-def]
+            received.append(sig)
+
+        bus.subscribe("thermal", broken)
+        bus.subscribe("thermal", healthy)
+        with pytest.raises(SignalBusError):
+            await bus.publish(make_signal("thermal"))
+        assert len(received) == 1
+
+    @pytest.mark.asyncio
     async def test_publish_many_empty_is_noop(self) -> None:
         bus = SignalBus()
         await bus.publish_many([])  # hits early-return guard

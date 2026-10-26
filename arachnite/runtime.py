@@ -11,6 +11,7 @@ import asyncio
 import contextlib
 import contextvars
 import time
+from collections import deque
 from collections.abc import Callable
 from typing import Protocol, runtime_checkable
 
@@ -52,12 +53,16 @@ from arachnite.safety_monitor import MonitorState
 from arachnite.shutdown import ShutdownCoordinator
 from arachnite.supervisor import NodeSupervisor
 
-# True inside tick() and in every task it starts (node calls, launched
-# actions): emergency_stop() called from there must not await the tick that
-# is awaiting its caller.
-_IN_TICK: contextvars.ContextVar[bool] = contextvars.ContextVar(
-    "arachnite_in_tick", default=False,
+# The token of the tick whose code is running in this context. Child tasks
+# inherit it, so it is compared with the runtime's *current* tick token: a
+# task spawned during a tick that outlives it is no longer "inside the tick".
+_TICK_TOKEN: contextvars.ContextVar[object | None] = contextvars.ContextVar(
+    "arachnite_tick_token", default=None,
 )
+
+# Event-lane launch outcomes kept for monitor_state() between ticks (the lane
+# stays live while paused, when no tick drains them).
+_MAX_PENDING_OUTCOMES = 1024
 
 # ── Tick-stage instrumentation protocol ──────────────────────────────────────
 #
@@ -191,7 +196,19 @@ class ArachniteRuntime:
         self._last_results: list[Result]  = []
         self._shutdown_phase = ShutdownPhase.NOT_STARTED
         self._loop_task: asyncio.Task[None] | None = None
-        self._emergency_task: asyncio.Task[None] | None = None
+        # The one task doing the shutdown work (graceful or emergency);
+        # stop(), emergency_stop() and wait() all wait for it.
+        self._shutdown_task: asyncio.Task[None] | None = None
+        self._shutdown_kind: str | None = None  # "graceful" | "emergency"
+        # True once the runtime itself cancels the loop task (shutdown), so
+        # the loop can tell that from a stray CancelledError out of a node.
+        self._loop_cancel_requested = False
+        # Token of the tick in flight (see _TICK_TOKEN), and whether the
+        # background loop (not a manual tick() call) is running it.
+        self._active_tick: object | None = None
+        self._loop_ticking = False
+        self._loop_tick_idle = asyncio.Event()
+        self._loop_tick_idle.set()
         self._teardown_timeout_s: float = 5.0
         self._shutdown_coordinator = shutdown_coordinator or ShutdownCoordinator(
             teardown_timeout_s=self._teardown_timeout_s,
@@ -291,7 +308,7 @@ class ArachniteRuntime:
         # Observations for monitor_state(): reflex launch outcomes (tick
         # stage and event lane) since the last completed tick, and facts
         # recorded by the last tick.
-        self._reflex_outcomes: list[LaunchStatus] = []
+        self._reflex_outcomes: deque[LaunchStatus] = deque(maxlen=_MAX_PENDING_OUTCOMES)
         self._monitor_report: dict[str, object] = {}
 
     # ── Public properties ─────────────────────────────────────────────────────
@@ -372,6 +389,14 @@ class ArachniteRuntime:
         """Call setup() on all master nodes, then start the tick loop."""
         if self._running:
             return
+        # A restart waits for the previous shutdown to finish completely, so
+        # its teardown cannot run after (and undo) this start.
+        previous = self._shutdown_task
+        if previous is not None and not previous.done():
+            await asyncio.wait({previous})
+        self._shutdown_task = None
+        self._shutdown_kind = None
+        self._loop_cancel_requested = False
 
         # Collect all leaf nodes for startup validation
         all_nodes: list[BaseNode] = []
@@ -417,11 +442,27 @@ class ArachniteRuntime:
         """
         Gracefully stop the loop and teardown all nodes.
         Delegates to ShutdownCoordinator which runs all 7 phases in order.
+        The shutdown runs in its own task, so it completes even if the caller
+        is cancelled. A second call (or one during an emergency stop) waits
+        for the shutdown in progress. Called from inside the tick or from a
+        running action, it starts the shutdown and returns at once —
+        waiting there would wait for the caller itself; ``await wait()``
+        elsewhere waits for completion.
         Spec reference: Section 15.1, 15.2.
         """
-        if not self._running:
-            return
-        self._stop_reflex_lane()
+        if self._shutdown_task is None:
+            if not self._running:
+                return
+            self._running = False
+            self._stop_event.set()
+            self._stop_reflex_lane()
+            self._shutdown_kind = "graceful"
+            self._shutdown_task = asyncio.get_running_loop().create_task(
+                self._graceful_shutdown(), name="arachnite-stop",
+            )
+        await self._await_shutdown()
+
+    async def _graceful_shutdown(self) -> None:
         await self._shutdown_coordinator.execute(self)
         self._shutdown_phase = self._shutdown_coordinator.phase
 
@@ -429,45 +470,61 @@ class ArachniteRuntime:
         """
         Immediate shutdown — skips phases 1-3, abandons mandatory blocks.
 
-        Stops the tick loop, then cancels every running action: each one's
-        ``on_preempted()`` safe-stop hook runs (bounded), no rollback. This is
-        a shutdown path; cutting into a mandatory block to *respond* to a
-        hazard is the job of a PREEMPT reflex (ADR 0005).
+        Closes the action master at once (nothing new starts), stops the tick
+        loop, then cancels every running action: each one's
+        ``on_preempted()`` safe-stop hook runs (bounded), no rollback; a
+        safe-stop already running is waited for. This is a shutdown path;
+        cutting into a mandatory block to *respond* to a hazard is the job of
+        a PREEMPT reflex (ADR 0005).
 
-        Called from node code inside a tick, or from an action the tick
-        launched, the rest of the shutdown is handed to a separate task and
-        this call returns at once: finishing it here would cancel the tick
-        that is awaiting the caller. Nothing new can start meanwhile.
+        The shutdown runs in its own task. During a graceful ``stop()`` it
+        takes over (unless that stop is already tearing nodes down); a second
+        call waits for the first; after a completed stop it does nothing.
+        Called from inside the tick or from a running action it returns once
+        the shutdown has started (the tick and the action are themselves
+        being cancelled); anywhere else it returns when the shutdown is
+        complete.
         Spec reference: Section 15.3.
         """
+        current = self._shutdown_task
+        if current is not None and (current.done() or self._shutdown_kind == "emergency"):
+            await self._await_shutdown()
+            return
+        if current is None and not self._running:
+            return  # never started, or already stopped
         self._running = False
         self._stop_event.set()
         self._stop_reflex_lane()
         self._action_master.close()
         self._logger.info("Emergency stop initiated")
-        if _IN_TICK.get():
-            self._emergency_task = asyncio.get_running_loop().create_task(
-                self._finish_emergency_stop(), name="arachnite-emergency-stop",
-            )
-            return
-        await self._finish_emergency_stop()
+        self._shutdown_kind = "emergency"
+        self._shutdown_task = asyncio.get_running_loop().create_task(
+            self._finish_emergency_stop(current), name="arachnite-emergency-stop",
+        )
+        await self._await_shutdown()
 
-    async def _finish_emergency_stop(self) -> None:
-        """Cancel the tick loop, then every action (safe-stop), then teardown."""
+    async def _finish_emergency_stop(self, graceful: asyncio.Task[None] | None) -> None:
+        """Take over from a graceful stop, cancel the loop, every action, then teardown."""
+        if graceful is not None and not graceful.done():
+            if self._shutdown_coordinator.phase in (
+                ShutdownPhase.TEARDOWN_NODES,
+                ShutdownPhase.DISCONNECT_TRANSPORT,
+                ShutdownPhase.COMPLETE,
+            ):
+                # Already tearing nodes down: let it finish, never twice.
+                await asyncio.wait({graceful})
+                return
+            graceful.cancel()
+            await asyncio.wait({graceful})
         # Cancel and await the tick loop BEFORE stopping actions and tearing
         # masters down, so no tick can launch anything new or race node
-        # teardown. Skipped when called from within the loop itself
-        # (self-cancel would deadlock).
+        # teardown.
         loop_task = self._loop_task
-        if (
-            loop_task is not None
-            and not loop_task.done()
-            and loop_task is not asyncio.current_task()
-        ):
+        if loop_task is not None and not loop_task.done():
+            self._loop_cancel_requested = True
             loop_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError, Exception):
-                await loop_task
-            self._loop_task = None
+            await asyncio.wait({loop_task})
+        self._loop_task = None
         await self._action_master.cancel_all(
             timeout=self._action_master.safe_stop_budget_s(),
         )
@@ -478,9 +535,35 @@ class ArachniteRuntime:
             self._action_master.teardown(),
         )
 
+    def _inside_runtime_work(self) -> bool:
+        """True in the code of the tick in flight or of a running action."""
+        token = _TICK_TOKEN.get()
+        if token is not None and token is self._active_tick:
+            return True
+        current = asyncio.current_task()
+        return current is not None and (
+            current is self._loop_task or self._action_master.is_action_task(current)
+        )
+
+    async def _await_shutdown(self) -> None:
+        """Wait for the shutdown in progress (following a take-over) to finish."""
+        if self._inside_runtime_work():
+            return
+        task = self._shutdown_task
+        while task is not None:
+            await asyncio.wait({task})
+            if self._shutdown_task is task:
+                break
+            task = self._shutdown_task
+        if task is not None and not task.cancelled():
+            exc = task.exception()
+            if exc is not None:
+                raise exc
+
     async def wait(self) -> None:
-        """Block until stop() or emergency_stop() is called."""
+        """Block until stop() or emergency_stop() is called and has finished."""
         await self._stop_event.wait()
+        await self._await_shutdown()
 
     # ── Live node registration ─────────────────────────────────────────────────
 
@@ -585,9 +668,12 @@ class ArachniteRuntime:
         """
         node = self._action_master.get_node(node_id)
         if node is not None:
-            await self._action_master.cancel(
-                node_id, timeout=node.safe_stop_timeout_s + 0.5,
-            )
+            # First call withdraws a reflex armed under node_id, the second
+            # cancels its running run (each is a no-op if there is none).
+            for _ in range(2):
+                await self._action_master.cancel(
+                    node_id, timeout=node.safe_stop_timeout_s + 0.5,
+                )
             with contextlib.suppress(Exception):
                 await node.teardown()
         self._action_master.unregister(node_id)
@@ -596,10 +682,18 @@ class ArachniteRuntime:
     # ── Pause / Resume ────────────────────────────────────────────────────────
 
     async def pause(self) -> None:
-        """Pause sensing and tick loop. Supervisors keep running."""
+        """
+        Pause sensing and tick loop. Supervisors keep running.
+
+        A tick the loop is running finishes first (reflexes still launch;
+        its deliberative launches are dropped), then the nodes get
+        ``on_pause()``. The event-driven reflex lane stays live.
+        """
         if self._paused:
             return
         self._paused = True
+        if not self._inside_runtime_work():
+            await self._loop_tick_idle.wait()
         await asyncio.gather(
             self._sense_master.on_pause(),
             self._instinct_master.on_pause(),
@@ -904,8 +998,28 @@ class ArachniteRuntime:
                 continue
 
             start = time.monotonic()
+            self._loop_ticking = True
+            self._loop_tick_idle.clear()
             try:
                 await self.tick()
+            except asyncio.CancelledError:
+                # A CancelledError the runtime did not request (a node awaited
+                # something that was cancelled) must not end the loop
+                # silently. Python 3.10 cannot tell it from a cancel of this
+                # task, so there it still ends the loop.
+                current = asyncio.current_task()
+                cancelling = getattr(current, "cancelling", None)
+                if (
+                    self._loop_cancel_requested
+                    or not self._running
+                    or cancelling is None       # Python 3.10
+                    or cancelling() > 0
+                ):
+                    raise
+                self._logger.error(
+                    "A node raised CancelledError inside the tick; continuing",
+                    tick=self._tick_count,
+                )
             except Exception as exc:  # noqa: BLE001
                 self._logger.error(
                     "Unhandled exception in tick loop",
@@ -913,6 +1027,9 @@ class ArachniteRuntime:
                     error=str(exc),
                     error_type=type(exc).__name__,
                 )
+            finally:
+                self._loop_ticking = False
+                self._loop_tick_idle.set()
 
             elapsed = time.monotonic() - start
             sleep   = max(0.0, self._interval - elapsed)
@@ -958,11 +1075,15 @@ class ArachniteRuntime:
         ``await wait_idle()`` before asserting on their effects; their
         Results appear in the next tick's ``ctx.last_results``.
         """
-        token = _IN_TICK.set(True)
+        tick_token = object()
+        self._active_tick = tick_token
+        context_token = _TICK_TOKEN.set(tick_token)
         try:
             await self._run_tick()
         finally:
-            _IN_TICK.reset(token)
+            _TICK_TOKEN.reset(context_token)
+            if self._active_tick is tick_token:
+                self._active_tick = None
 
     async def _run_tick(self) -> None:
         """Pipeline body of :meth:`tick`."""
@@ -1196,6 +1317,14 @@ class ArachniteRuntime:
             if existing is None or p.priority > existing.priority:
                 best[p.action_id] = p
         interrupting = {ir.new_proposal.instinct_id for ir in interrupts}
+        if self._paused and self._loop_ticking and best:
+            # pause() arrived while the loop ran this tick: launch nothing
+            # deliberative (reflexes above already launched).
+            self._logger.info(
+                "Paused during the tick; deliberative launches dropped",
+                action_ids=sorted(best),
+            )
+            best = {}
         for p in sorted(best.values(), key=lambda q: (q.priority, q.urgency), reverse=True):
             outcome = self._action_master.launch(p, origin="decision")
             if outcome.status is LaunchStatus.BLOCKED:
@@ -1212,7 +1341,8 @@ class ArachniteRuntime:
 
         # 7. Tick-end hooks on all leaf nodes (charged to `act`, instrumentation ADR)
         tick_duration = time.monotonic() - tick_start
-        outcomes, self._reflex_outcomes = self._reflex_outcomes, []
+        outcomes = list(self._reflex_outcomes)
+        self._reflex_outcomes.clear()
         self._monitor_report = {
             "reflex_outcomes": outcomes,
             "reflex_routed": reflex_routed,

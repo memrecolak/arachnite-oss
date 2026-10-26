@@ -684,6 +684,10 @@ reservation all happen synchronously, then `execute()` starts as a tracked task 
 | `NOT_FOUND` | no ActionNode registered under that action_id |
 | `CLOSED` | the master is shutting down (`close()` / `cancel_all()`); nothing new starts until `setup()` |
 
+`cancel(action_id)` withdraws a reflex armed under that id if there is one, otherwise
+cancels the running run; a run the master cancels (`cancel()`, `cancel_all()`) ends
+with `Result(interrupted=True)`, for `launch()` and awaited `dispatch()` alike.
+
 Results of launched actions are collected with `drain_completed()` (the runtime does
 this each tick). `await action_master.wait_idle(timeout)` / `await runtime.wait_idle(timeout)`
 waits until nothing is running or armed, and returns False on timeout.
@@ -876,7 +880,10 @@ class ToFSense(BaseSenseNode):
 - **`await rt.emergency_stop()`** closes the action master (launches return `CLOSED`),
   stops the loop and the reflex lane, then cancels every action. Each one runs its
   `on_preempted()` safe-stop (bounded; one already running is waited for); **no rollback** runs.
-  Called from inside a tick, it returns at once and finishes after that tick.
+  The shutdown runs in its own task: `await rt.wait()` returns when it has *finished*
+  (safe-stops done, nodes torn down). A second call waits; one during `stop()` takes
+  it over. Called from inside the tick or a running action, `stop()` /
+  `emergency_stop()` return once the shutdown has started.
   Then the nodes tear down. This is a *shutdown* path, not a hazard response: to cut
   into a mandatory block and keep the agent running, use a PREEMPT reflex.
 

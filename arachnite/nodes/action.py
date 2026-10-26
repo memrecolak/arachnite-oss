@@ -9,12 +9,14 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import sys
 import time
+import weakref
 from abc import abstractmethod
-from collections.abc import Awaitable, Sequence
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from enum import Enum
-from typing import Protocol, TypeVar, runtime_checkable
+from typing import Any, Protocol, TypeVar, runtime_checkable
 
 from arachnite.bus import SignalBus
 from arachnite.config import NodeConfig
@@ -49,13 +51,17 @@ REFLEX_PRIORITY_FLOOR = 200
 _T = TypeVar("_T")
 
 
-async def _run_shielded(work: Awaitable[_T]) -> tuple[_T, int]:
+async def _run_shielded(work: Awaitable[_T], *, if_cancelled: _T) -> tuple[_T, int]:
     """
     Await ``work`` to completion even if the calling task is cancelled
     meanwhile, and report how many cancels arrived. A safe-stop that has
     started must finish: a second cancel (emergency stop, shutdown, another
     preemption) would otherwise abandon the actuators half-braked. The
     caller decides what to do with the absorbed cancels.
+
+    Nothing outside holds the inner task, so if it ends cancelled the work
+    cancelled itself (e.g. a hook awaiting a future its driver cancelled):
+    ``if_cancelled`` is returned instead of losing the caller's Result.
     """
     inner = asyncio.ensure_future(work)
     absorbed = 0
@@ -63,9 +69,83 @@ async def _run_shielded(work: Awaitable[_T]) -> tuple[_T, int]:
         try:
             return await asyncio.shield(inner), absorbed
         except asyncio.CancelledError:
+            if inner.cancelled():
+                return if_cancelled, absorbed
             if inner.done():
                 raise
             absorbed += 1
+
+
+if sys.version_info >= (3, 11):
+
+    async def _within(
+        work: Awaitable[_T],
+        timeout: float | None,
+        *,
+        stop_requested: Callable[[], bool] | None = None,
+    ) -> _T:
+        """
+        Await ``work`` in the current task, raising ``TimeoutError`` after
+        ``timeout`` seconds. Unlike ``asyncio.wait_for`` on Python 3.10 no
+        inner task is created, so a cancel can neither be swallowed nor leave
+        an orphaned task running. ``stop_requested`` is used on 3.10 only.
+        """
+        async with asyncio.timeout(timeout):
+            return await work
+
+else:  # pragma: no cover - exercised by the Python 3.10 CI leg
+    # Per-task stack of active timeout scopes; each entry is [fired].
+    _SCOPES: weakref.WeakKeyDictionary[asyncio.Task[Any], list[list[bool]]] = (
+        weakref.WeakKeyDictionary()
+    )
+
+    async def _within(
+        work: Awaitable[_T],
+        timeout: float | None,
+        *,
+        stop_requested: Callable[[], bool] | None = None,
+    ) -> _T:
+        """
+        Python 3.10 stand-in for ``asyncio.timeout``: the timer cancels the
+        current task, and the resulting CancelledError becomes
+        ``asyncio.TimeoutError`` only if this scope fired, no enclosing scope
+        fired and nobody asked the action to stop (``stop_requested``).
+        """
+        task = asyncio.current_task()
+        if timeout is None or task is None:
+            return await work
+        stack = _SCOPES.setdefault(task, [])
+        depth = len(stack)
+        fired = [False]
+        finished = [False]
+        stack.append(fired)
+
+        def _fire() -> None:
+            if not finished[0]:
+                fired[0] = True
+                task.cancel()
+
+        handle = asyncio.get_running_loop().call_later(timeout, _fire)
+        try:
+            return await work
+        except asyncio.CancelledError:
+            outer_fired = any(scope[0] for scope in stack[:depth])
+            external = stop_requested is not None and stop_requested()
+            if fired[0] and not outer_fired and not external:
+                raise asyncio.TimeoutError from None
+            raise
+        finally:
+            finished[0] = True
+            handle.cancel()
+            stack.pop()
+
+
+def _cancelling() -> int:
+    """Pending cancel requests of the current task (always 0 on Python 3.10)."""
+    current = asyncio.current_task()
+    if current is None or not hasattr(current, "cancelling"):
+        return 0
+    return int(current.cancelling())
 
 
 def _uncancel(count: int) -> None:
@@ -134,10 +214,14 @@ class BaseActionNode(BaseNode):
     safe_stop_timeout_s: float = 1.0
 
     #: Set by ActionMasterNode when it cancels this action (preemption,
-    #: cancel, shutdown). On Python 3.10 ``asyncio.wait_for`` can swallow a
-    #: cancel that lands as its awaitable finishes; MultiStepActionNode
-    #: checks this flag at every step boundary so the action still stops.
+    #: cancel, shutdown, a cancelled ``dispatch()`` caller); cleared when the
+    #: run is released. MultiStepActionNode also checks it at every step
+    #: boundary, so a cancel that lands as a step finishes still stops it.
     _cancel_requested: bool = False
+
+    #: Set by ``ActionMasterNode.cancel_all()`` (shutdown / emergency stop):
+    #: a safe-stop that has not started yet runs without the rollback walk.
+    _shutdown_requested: bool = False
 
     async def on_preempted(self, proposal: Proposal, preempted_by: Proposal) -> None:
         """
@@ -162,9 +246,8 @@ class BaseActionNode(BaseNode):
         """
         error: BaseException | None = None
         try:
-            await asyncio.wait_for(
-                self.on_preempted(proposal, preempted_by),
-                timeout=self.safe_stop_timeout_s,
+            await _within(
+                self.on_preempted(proposal, preempted_by), self.safe_stop_timeout_s,
             )
         except asyncio.TimeoutError:
             self.logger.error(
@@ -264,8 +347,14 @@ class MultiStepActionNode(BaseActionNode):
         self._run_prepared        = True
 
     def request_reflex_preempt(self, by: Proposal) -> None:
-        """Ask to be preempted at the first step boundary after the current block."""
-        self._reflex_preempt_by = by
+        """
+        Ask to be preempted at the first step boundary after the current
+        block. With several waiting reflexes the highest-priority one is
+        recorded (it is admitted first, so its proposal goes to the safe-stop).
+        """
+        current = self._reflex_preempt_by
+        if current is None or by.priority > current.priority:
+            self._reflex_preempt_by = by
 
     def _clear_run_state(self) -> None:
         """Drop per-run state after a cancelled run so nothing looks in-flight."""
@@ -449,6 +538,8 @@ class MultiStepActionNode(BaseActionNode):
             self._completed_steps     = []
             self._managed             = False
             self._handoff_by          = None
+            self._cancel_requested    = False
+            self._shutdown_requested  = False
         self._run_prepared = False
 
         all_steps  = self.steps()
@@ -456,7 +547,7 @@ class MultiStepActionNode(BaseActionNode):
 
         for i, step in enumerate(all_steps):
             if self._cancel_requested:
-                raise asyncio.CancelledError()  # cancel swallowed by wait_for (3.10)
+                raise asyncio.CancelledError()  # a cancel lost as a step finished
             self._current_step = step
             pending = all_steps[i + 1:]
 
@@ -505,7 +596,7 @@ class MultiStepActionNode(BaseActionNode):
             step_result  = await self._run_step_timed(step, proposal, step_timeout)
             self._completed_steps.append(step_result)
             if self._cancel_requested:
-                raise asyncio.CancelledError()  # cancel swallowed by wait_for (3.10)
+                raise asyncio.CancelledError()  # a cancel lost as a step finished
 
             # Step cooperatively bailed mid-execution on an interrupt — surface
             # it like the between-steps interrupt path (Result.interrupted), not
@@ -552,9 +643,10 @@ class MultiStepActionNode(BaseActionNode):
         step_start = time.monotonic()
         self.logger.debug("Step starting", step=step.name)
         try:
-            result = await asyncio.wait_for(
+            result = await _within(
                 self.execute_step(step, proposal, list(self._completed_steps)),
-                timeout=timeout,
+                timeout,
+                stop_requested=lambda: self._cancel_requested,
             )
         except asyncio.TimeoutError:
             # See note in _execute_with_retry — required for Python 3.10 support.
@@ -1156,6 +1248,14 @@ class ActionMasterNode(FaultReportingMixin, BaseNode):
             else:
                 self._preempt(owner_id, proposal)
 
+        # Waiting only on armed claimants: if they rank lower and nothing
+        # running holds the resources, admission starts this reflex now
+        # instead of leaving it behind a lower-priority claim.
+        if not owners:
+            self._admit_armed()
+            if action_id not in self._armed:
+                return LaunchOutcome(LaunchStatus.LAUNCHED, action_id)
+
         return LaunchOutcome(
             LaunchStatus.ARMED, action_id, frozenset(owners | claimants),
         )
@@ -1218,6 +1318,7 @@ class ActionMasterNode(FaultReportingMixin, BaseNode):
         for resource in node.resources:
             self._owners[resource] = action_id
         node._cancel_requested = False
+        node._shutdown_requested = False
         if isinstance(node, MultiStepActionNode):
             node._prepare_run()
         self._idle.clear()
@@ -1243,7 +1344,10 @@ class ActionMasterNode(FaultReportingMixin, BaseNode):
 
         Every safe-stop runs to completion once started (``_run_shielded``):
         an emergency stop, shutdown or another preemption arriving meanwhile
-        waits for it instead of abandoning the actuators half-braked.
+        waits for it instead of abandoning the actuators half-braked. A run
+        the master cancelled (preemption, ``cancel()``, ``cancel_all()``)
+        ends with a Result (``interrupted=True``); only a cancel from outside
+        the master (e.g. event-loop shutdown) propagates.
         """
         action_id = node.node_id
         start = time.monotonic()
@@ -1253,13 +1357,18 @@ class ActionMasterNode(FaultReportingMixin, BaseNode):
             except asyncio.CancelledError:
                 by = self._preempted_by.get(action_id)
                 preempted = by is not None
+                requested = node._cancel_requested
                 # Shutdown / emergency_stop cancels run the safe-stop only;
-                # rollback_on_preempt applies to reflex preemption.
-                (rolled_back, error), absorbed = await _run_shielded(node._run_safe_stop(
-                    proposal,
-                    by if by is not None else _SHUTDOWN_PROPOSAL,
-                    allow_rollback=preempted,
-                ))
+                # rollback_on_preempt applies to reflex preemption, unless a
+                # shutdown came before the safe-stop started.
+                (rolled_back, error), absorbed = await _run_shielded(
+                    node._run_safe_stop(
+                        proposal,
+                        by if by is not None else _SHUTDOWN_PROPOSAL,
+                        allow_rollback=preempted and not node._shutdown_requested,
+                    ),
+                    if_cancelled=(False, self._safe_stop_cancelled(node)),
+                )
                 stopped_at: str | None = None
                 step_results: list[StepResult] = []
                 if isinstance(node, MultiStepActionNode):
@@ -1273,16 +1382,17 @@ class ActionMasterNode(FaultReportingMixin, BaseNode):
                         action_id=action_id,
                         stopped_at=stopped_at,
                     )
-                    raise  # shutdown / external cancel: safe-stop done, propagate
-                # The preempting cancel (and any that arrived during the
-                # safe-stop) is consumed: the run ends with a preempted Result.
+                    if not requested:
+                        raise  # a cancel from outside the master: propagate
+                # The master's cancel (and any that arrived during the
+                # safe-stop) is consumed: the run ends with a Result.
                 _uncancel(1 + absorbed)
                 result = Result(
                     action_id       = action_id,
                     success         = False,
                     error           = error,
                     interrupted     = True,
-                    preempted       = True,
+                    preempted       = preempted,
                     stopped_at_step = stopped_at,
                     step_results    = step_results,
                     rolled_back     = rolled_back,
@@ -1294,7 +1404,10 @@ class ActionMasterNode(FaultReportingMixin, BaseNode):
                 by = node._handoff_by
                 node._handoff_by = None
                 (rolled_back, error), absorbed = await _run_shielded(
-                    node._run_safe_stop(proposal, by),
+                    node._run_safe_stop(
+                        proposal, by, allow_rollback=not node._shutdown_requested,
+                    ),
+                    if_cancelled=(False, self._safe_stop_cancelled(node)),
                 )
                 _uncancel(absorbed)
                 result = Result(
@@ -1331,8 +1444,24 @@ class ActionMasterNode(FaultReportingMixin, BaseNode):
         )
         return result
 
+    def _safe_stop_cancelled(self, node: BaseActionNode) -> BaseException:
+        """Report a safe-stop hook that ended in CancelledError (it cancelled itself)."""
+        self.logger.error(
+            "Safe-stop hook ended with CancelledError",
+            action_id=node.node_id,
+        )
+        return RuntimeError(f"safe-stop of '{node.node_id}' ended with CancelledError")
+
+    def is_action_task(self, task: asyncio.Task[Any] | None) -> bool:
+        """True if ``task`` is the task body of a running action."""
+        return task is not None and any(t is task for t in self._tasks.values())
+
     def _release(self, action_id: str) -> None:
         """Free the action's reservation and resources, then admit armed reflexes."""
+        node = self._running_nodes.get(action_id)
+        if node is not None:
+            node._cancel_requested = False
+            node._shutdown_requested = False
         self._running_nodes.pop(action_id, None)
         self._running_proposals.pop(action_id, None)
         self._origins.pop(action_id, None)
@@ -1368,8 +1497,8 @@ class ActionMasterNode(FaultReportingMixin, BaseNode):
 
         A cancel that lands before the task body starts never enters
         ``_run``, so its ``finally`` cannot release the reservation. The
-        action commanded nothing, so no safe-stop is due; a preemption is
-        still reported as a preempted Result.
+        action commanded nothing, so no safe-stop is due; a preemption or a
+        master cancel is still reported as an interrupted Result.
         """
         action_id = next(
             (aid for aid, t in self._tasks.items() if t is task), None,
@@ -1378,6 +1507,7 @@ class ActionMasterNode(FaultReportingMixin, BaseNode):
             return  # the body ran and released already
         preempted = action_id in self._preempted_by
         node = self._running_nodes.get(action_id)
+        requested = node is not None and node._cancel_requested
         if isinstance(node, MultiStepActionNode):
             node._clear_run_state()
         self.logger.info(
@@ -1385,12 +1515,12 @@ class ActionMasterNode(FaultReportingMixin, BaseNode):
             action_id=action_id,
             preempted=preempted,
         )
-        if preempted:
+        if preempted or requested:
             result = Result(
                 action_id   = action_id,
                 success     = False,
                 interrupted = True,
-                preempted   = True,
+                preempted   = preempted,
             )
             if buffered:
                 self._completed.append(result)
@@ -1428,10 +1558,14 @@ class ActionMasterNode(FaultReportingMixin, BaseNode):
 
     async def cancel(self, action_id: str, timeout: float | None = None) -> None:
         """
-        Cancel one running action (safe-stop runs) and wait for it, or drop
-        an armed reflex. Owners waiting to hand over to a dropped reflex are
-        released from that hand-off unless another armed reflex still needs
-        their resources.
+        Withdraw the reflex armed under ``action_id`` if there is one;
+        otherwise cancel the running run of ``action_id`` (its safe-stop runs,
+        and its Result reports ``interrupted=True``) and wait for it.
+
+        Withdrawing an armed reflex never touches a running run, even one
+        under the same action_id: owners that were waiting to hand over to
+        it carry on, unless another armed reflex still needs their resources.
+        Call again to cancel the running run as well.
         """
         dropped = self._armed.pop(action_id, None)
         if dropped is not None:
@@ -1439,6 +1573,7 @@ class ActionMasterNode(FaultReportingMixin, BaseNode):
             self._admit_armed()
             if not self._running_nodes and not self._armed:
                 self._idle.set()
+            return
         task = self._tasks.get(action_id)
         if task is None or task.done():
             return
@@ -1466,13 +1601,15 @@ class ActionMasterNode(FaultReportingMixin, BaseNode):
         Cancel every running action — each runs its safe-stop, no rollback —
         drop armed reflexes, and close the master so nothing new starts
         until the next ``setup()``. Used by shutdown and emergency_stop. A
-        safe-stop already in progress is waited for, not cut short.
+        safe-stop already in progress (with its rollback walk) is waited for,
+        not cut short; one not yet started skips the walk.
         """
         self._closed = True
         self._armed.clear()
         tasks = [t for t in self._tasks.values() if not t.done()]
         for node in self._running_nodes.values():
             node._cancel_requested = True
+            node._shutdown_requested = True
         for task in tasks:
             task.cancel()
         if tasks:
@@ -1594,13 +1731,24 @@ class ActionMasterNode(FaultReportingMixin, BaseNode):
             )
         task = self._start(node, proposal, origin or "direct", buffer=False)
         try:
-            return await task
+            return await asyncio.shield(task)
         except asyncio.CancelledError:
-            # Preempted before its first step: the run produced no Result of
-            # its own, but the caller still gets one (Result totality).
-            stashed = self._unstarted_results.pop(task, None)
-            if stashed is not None and task.cancelled():
-                return stashed
+            if task.done():
+                if not task.cancelled() and _cancelling() == 0:
+                    return task.result()
+                # Cancelled before its first step: the run produced no
+                # Result of its own, but the caller still gets one.
+                stashed = self._unstarted_results.pop(task, None)
+                if stashed is not None and _cancelling() == 0:
+                    return stashed
+                raise
+            # The caller itself was cancelled: stop the action through the
+            # master (safe-stop, flag seen at every step boundary), wait for
+            # it to release, then propagate.
+            node._cancel_requested = True
+            task.cancel()
+            await asyncio.wait({task})
+            self._unstarted_results.pop(task, None)
             raise
 
     def _run_guards(self, proposal: Proposal) -> GuardVerdict:
@@ -1639,15 +1787,16 @@ class ActionMasterNode(FaultReportingMixin, BaseNode):
                 if isinstance(node, MultiStepActionNode):
                     node._prepare_run()  # a fresh, still master-managed run
             try:
-                result = await asyncio.wait_for(
+                result = await _within(
                     node.execute(proposal),
-                    timeout=node.timeout_s,
+                    node.timeout_s,
+                    stop_requested=lambda: node._cancel_requested,
                 )
             except asyncio.TimeoutError:
                 # Note: ``asyncio.TimeoutError`` is aliased to the builtin
                 # ``TimeoutError`` only on Python >= 3.11. On 3.10 the two are
                 # distinct classes, so catch the asyncio one explicitly.
-                result = await node.on_timeout(proposal)
+                result = await self._timed_out(node, proposal)
             except Exception as exc:  # noqa: BLE001
                 # Spec contract: execute() must always return a Result, never
                 # raise. If a user node violates that contract,
@@ -1678,6 +1827,22 @@ class ActionMasterNode(FaultReportingMixin, BaseNode):
                 break
 
         return last_result  # type: ignore[return-value]
+
+    async def _timed_out(self, node: BaseActionNode, proposal: Proposal) -> Result:
+        """``on_timeout()``, with a raising override turned into a failed Result."""
+        try:
+            return await node.on_timeout(proposal)
+        except Exception as exc:  # noqa: BLE001
+            self.logger.error(
+                "on_timeout() raised",
+                action_id=node.node_id,
+                error=str(exc),
+                error_type=type(exc).__name__,
+            )
+            await self._report_fault(node.node_id, exc)
+            error = ActionTimeoutError(node.node_id, None, node.timeout_s)
+            error.__cause__ = exc
+            return Result(action_id=node.node_id, success=False, error=error)
 
     def _retry_blocked(self, node: BaseActionNode) -> bool:
         """
