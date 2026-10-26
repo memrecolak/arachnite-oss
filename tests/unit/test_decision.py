@@ -383,6 +383,16 @@ class TestResourceConflictsAndHandOff:
             )
         assert dm.handoff_proposals == {}
 
+    def test_defer_keeps_only_persist_proposals_pending(self) -> None:
+        dm = DecisionMasterNode(bus=_bus())
+        keep = Proposal(instinct_id="A", action_id="X", priority=50,
+                        urgency=0.5, persist=True)
+        drop = _proposal("Y", instinct_id="B")
+        dm.defer(keep)
+        dm.defer(drop)
+        assert dm.pending_proposals == {"A": keep}
+        assert dm.handoff_proposals == {}
+
     @pytest.mark.asyncio
     async def test_clear_pending_drops_parked_proposal(self) -> None:
         dm = DecisionMasterNode(bus=_bus())

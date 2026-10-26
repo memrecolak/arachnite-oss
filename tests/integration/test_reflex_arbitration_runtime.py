@@ -315,3 +315,75 @@ class TestDeliberativeHandOff:
         # parked Inspect proposal started only once Patrol released the arm.
         assert inspect.ran_after_patrol_stopped
         assert len(patrol.executed) < 10
+
+
+class _ArmMove(BaseActionNode):
+    resources = frozenset({"arm"})
+
+    def __init__(self, bus: SignalBus, node_id: str) -> None:
+        self.node_id = node_id  # type: ignore[misc]
+        super().__init__(bus)
+        self.calls = 0
+
+    async def execute(self, proposal: Proposal) -> Result:
+        self.calls += 1
+        await asyncio.sleep(0.05)
+        return Result(action_id=self.node_id, success=True)
+
+
+class _OneShot(BaseInstinctNode):
+    """Proposes its action on the first evaluation only."""
+
+    def __init__(
+        self, bus: SignalBus, node_id: str, action_id: str, priority: int, persist: bool,
+    ) -> None:
+        self.node_id = node_id  # type: ignore[misc]
+        super().__init__(bus)
+        self.action_id = action_id
+        self.priority = priority
+        self.persist = persist
+        self.fired = False
+
+    async def evaluate(self, ctx: Context) -> Proposal | None:
+        if self.fired:
+            return None
+        self.fired = True
+        return Proposal(instinct_id=self.node_id, action_id=self.action_id,
+                        priority=self.priority, urgency=0.5, persist=self.persist)
+
+
+class TestSameTickResourceConflict:
+    @staticmethod
+    async def _run(persist: bool) -> tuple[_ArmMove, _ArmMove]:
+        bus = SignalBus()
+        am = ActionMasterNode(bus=bus)
+        high, low = _ArmMove(bus, "HighMove"), _ArmMove(bus, "LowMove")
+        am.register(high)
+        am.register(low)
+        im = InstinctMasterNode(bus=bus)
+        im.register(_OneShot(bus, "HighInst", "HighMove", 90, persist=False))
+        im.register(_OneShot(bus, "LowInst", "LowMove", 60, persist=persist))
+        rt = ArachniteRuntime(
+            sense_master=SenseMasterNode(bus=bus), context=ContextNode(),
+            instinct_master=im,
+            decision_master=DecisionMasterNode(bus=bus, strategy=GreedyDecisionNode(bus=bus)),
+            action_master=am, bus=bus, tick_rate_hz=TICK_HZ,
+        )
+        await rt.start()
+        await asyncio.sleep(0.3)        # ~15 ticks: HighMove done long before the end
+        await rt.stop()
+        return high, low
+
+    @pytest.mark.asyncio
+    async def test_loser_without_persist_is_not_run_later(self) -> None:
+        """Losing a same-tick conflict is not a hand-off: no stale dispatch."""
+        high, low = await self._run(persist=False)
+        assert high.calls == 1
+        assert low.calls == 0
+
+    @pytest.mark.asyncio
+    async def test_persist_loser_follows_pending_rules(self) -> None:
+        """A persist loser is pending, but its instinct going quiet clears it."""
+        high, low = await self._run(persist=True)
+        assert high.calls == 1
+        assert low.calls == 0

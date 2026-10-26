@@ -187,6 +187,36 @@ class _SafeStopMultiStep(MultiStepActionNode):
         self.safe_stops.append(preempted_by.instinct_id)
 
 
+class _StopProbe(MultiStepActionNode):
+    """ROLLBACK action: one mandatory grip, then interruptible walk steps."""
+    node_id          = "_StopProbe"
+    interrupt_policy = InterruptPolicy.ROLLBACK
+    timeout_s        = 10.0
+
+    def __init__(self, *args: object, **kwargs: object) -> None:
+        super().__init__(*args, **kwargs)
+        self.executed: list[str] = []
+        self.undone: list[str] = []
+
+    async def _undo_grip(self) -> None:
+        self.undone.append("grip")
+
+    def steps(self) -> list[ActionStep]:
+        return [
+            ActionStep("grip",  interruptible=False, rollback=self._undo_grip),
+            ActionStep("walk1", interruptible=True),
+            ActionStep("walk2", interruptible=True),
+            ActionStep("walk3", interruptible=True),
+        ]
+
+    async def execute_step(
+        self, step: ActionStep, proposal: Proposal, completed: list[StepResult]
+    ) -> StepResult:
+        self.executed.append(step.name)
+        await asyncio.sleep(0.05)
+        return StepResult(step_name=step.name, success=True)
+
+
 class TestTickActionState:
     @pytest.mark.asyncio
     async def test_tick_reads_execution_state_when_multistep_is_current(self) -> None:
@@ -1321,3 +1351,49 @@ class TestEmergencyStopLogEvents:
         assert node.rolled_back is False
         assert am.running_action_ids() == set()
         assert node._current_step is None
+
+    @pytest.mark.asyncio
+    async def test_emergency_stop_never_rolls_back_even_with_rollback_on_preempt(
+        self,
+    ) -> None:
+        """rollback_on_preempt applies to reflex preemption, not to shutdown."""
+        rt, am, _ = _build_rt()
+        node = _SafeStopMultiStep(bus=rt.bus)
+        node.rollback_on_preempt = True
+        am.register(node)
+        await rt.start()
+        am.launch(
+            Proposal(instinct_id="test", action_id=node.node_id, priority=100, urgency=0.5),
+        )
+        for _ in range(20):
+            if node.in_block:
+                break
+            await asyncio.sleep(0.01)
+
+        await rt.emergency_stop()
+
+        assert node.safe_stops == ["shutdown"]
+        assert node.rolled_back is False
+
+    @pytest.mark.asyncio
+    async def test_graceful_stop_at_slow_tick_starts_no_new_step(self) -> None:
+        """stop() reaches running actions at once, not one tick period later."""
+        rt, am, _ = _build_rt(tick_rate_hz=2.0)        # 500 ms between ticks
+        node = _StopProbe(bus=rt.bus)
+        am.register(node)
+        await rt.start()
+        await asyncio.sleep(0.05)                       # loop now sleeping ~450 ms
+        am.launch(
+            Proposal(instinct_id="test", action_id=node.node_id, priority=100, urgency=0.5),
+        )
+        for _ in range(50):
+            if node.executed[-1:] == ["walk1"]:
+                break
+            await asyncio.sleep(0.005)
+
+        started = time.perf_counter()
+        await rt.stop()
+
+        assert time.perf_counter() - started < 0.4      # did not wait out the tick
+        assert node.executed == ["grip", "walk1"]       # no step after stop()
+        assert node.undone == ["grip"]                  # ROLLBACK ran

@@ -71,10 +71,25 @@ class ShutdownCoordinator:
         Called by ArachniteRuntime.stop().
         Sets runtime._running = False at phase 1 to halt the tick loop.
         """
-        # Phase 1: Stop sensing
+        # Phase 1: Stop sensing — and deliver the shutdown interrupt to every
+        # running action right away (held while a block runs), so no action
+        # starts another step while the in-flight tick drains.
         self._phase = ShutdownPhase.STOP_SENSING
         runtime._running = False
         runtime._stop_event.set()
+        action_master = runtime._action_master
+        shutdown_request = InterruptRequest(
+            new_proposal           = Proposal(
+                instinct_id = "shutdown",
+                action_id   = "__shutdown__",
+                priority    = 9999,
+                urgency     = 1.0,
+                rationale   = "Graceful shutdown",
+            ),
+            requesting_instinct_id = "shutdown",
+            reason                 = "stop() called",
+        )
+        action_master.interrupt_all(shutdown_request)
         if self._on_shutdown_action is not None:
             with contextlib.suppress(Exception):
                 await self._on_shutdown_action()
@@ -98,26 +113,14 @@ class ShutdownCoordinator:
                     await loop_task
             runtime._loop_task = None
 
-        # Phase 3: Complete mandatory block — deliver the shutdown interrupt
-        # now (it is held while a block runs) and let every running action
-        # leave its mandatory block, up to the computed timeout. Each action
-        # then stops at the first boundary after its block — no new step
-        # starts once shutdown has begun.
+        # Phase 3: Complete mandatory block — re-deliver the shutdown interrupt
+        # (covers actions the drained tick launched) and let every running
+        # action leave its mandatory block, up to the computed timeout. Each
+        # action then stops at the first boundary after its block — no new
+        # step starts once shutdown has begun.
         self._phase = ShutdownPhase.COMPLETE_MANDATORY
-        action_master = runtime._action_master
         if action_master.running_action_ids():
-            shutdown_proposal = Proposal(
-                instinct_id = "shutdown",
-                action_id   = "__shutdown__",
-                priority    = 9999,
-                urgency     = 1.0,
-                rationale   = "Graceful shutdown",
-            )
-            action_master.interrupt_all(InterruptRequest(
-                new_proposal           = shutdown_proposal,
-                requesting_instinct_id = "shutdown",
-                reason                 = "stop() called",
-            ))
+            action_master.interrupt_all(shutdown_request)
             await action_master.wait_until_interruptible(self._mandatory_timeout(runtime))
 
         # Phase 4: Interrupt remaining actions — wait for the interrupted

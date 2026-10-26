@@ -191,6 +191,16 @@ class DecisionMasterNode(BaseNode):
             self._handoff_ages[proposal.instinct_id] = 0
         self._handoff[proposal.instinct_id] = proposal
 
+    def defer(self, proposal: Proposal) -> None:
+        """
+        Return a selected proposal that could not start (it lost a same-tick
+        resource conflict, without interrupting anyone) to the normal pending
+        rules: kept for the next tick if ``persist=True``, dropped otherwise.
+        """
+        if proposal.persist:
+            self._pending[proposal.instinct_id] = proposal
+            self._pending_ages[proposal.instinct_id] = 0
+
     @property
     def handoff_proposals(self) -> dict[str, Proposal]:
         """Proposals parked for hand-off, keyed by instinct_id (read-only copy)."""

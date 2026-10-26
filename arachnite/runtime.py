@@ -787,7 +787,7 @@ class ArachniteRuntime:
     async def _loop(self) -> None:
         while self._running:
             if self._paused:
-                await asyncio.sleep(self._interval)
+                await self._sleep_or_stop(self._interval)
                 continue
 
             start = time.monotonic()
@@ -819,7 +819,18 @@ class ArachniteRuntime:
             else:
                 self._consecutive_overruns = 0
 
-            await asyncio.sleep(sleep)
+            await self._sleep_or_stop(sleep)
+
+    async def _sleep_or_stop(self, seconds: float) -> None:
+        """
+        Wait for the next tick, waking at once when stop() / emergency_stop()
+        sets the stop event, so shutdown does not lag by up to one period.
+        """
+        if seconds <= 0.0 or self._stop_event.is_set():
+            await asyncio.sleep(0)
+            return
+        with contextlib.suppress(asyncio.TimeoutError):
+            await asyncio.wait_for(self._stop_event.wait(), timeout=seconds)
 
     async def tick(self) -> None:
         """Execute one full pipeline cycle. Public for testing.
@@ -1051,18 +1062,23 @@ class ArachniteRuntime:
             stage_start = now
 
         # 6. Act — launch the selected proposals as tasks (not awaited: the
-        #    next tick runs while they execute). A proposal whose action or
-        #    resources are still owned — e.g. it just interrupted the owner,
-        #    which is unwinding — is parked for hand-off and retried.
+        #    next tick runs while they execute), highest priority first. A
+        #    proposal that interrupted an owner which is still unwinding is
+        #    parked for hand-off; one that merely lost a same-tick resource
+        #    conflict to a sibling falls back to the normal pending rules.
         best: dict[str, Proposal] = {}
         for p in to_dispatch:
             existing = best.get(p.action_id)
             if existing is None or p.priority > existing.priority:
                 best[p.action_id] = p
-        for p in best.values():
+        interrupting = {ir.new_proposal.instinct_id for ir in interrupts}
+        for p in sorted(best.values(), key=lambda q: (q.priority, q.urgency), reverse=True):
             outcome = self._action_master.launch(p, origin="decision")
             if outcome.status is LaunchStatus.BLOCKED:
-                self._decision_master.park(p)
+                if p.instinct_id in interrupting:
+                    self._decision_master.park(p)
+                else:
+                    self._decision_master.defer(p)
             elif outcome.status is LaunchStatus.NOT_FOUND:
                 self._logger.warning(
                     "Dispatch skipped: action not found",

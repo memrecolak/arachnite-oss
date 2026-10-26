@@ -113,7 +113,11 @@ class BaseActionNode(BaseNode):
         """
 
     async def _run_safe_stop(
-        self, proposal: Proposal, preempted_by: Proposal,
+        self,
+        proposal: Proposal,
+        preempted_by: Proposal,
+        *,
+        allow_rollback: bool = True,
     ) -> tuple[bool, BaseException | None]:
         """
         Run ``on_preempted()`` bounded by ``safe_stop_timeout_s``. A hook
@@ -560,11 +564,18 @@ class MultiStepActionNode(BaseActionNode):
         )
 
     async def _run_safe_stop(
-        self, proposal: Proposal, preempted_by: Proposal,
+        self,
+        proposal: Proposal,
+        preempted_by: Proposal,
+        *,
+        allow_rollback: bool = True,
     ) -> tuple[bool, BaseException | None]:
-        """Safe-stop hook, then the rollback walk if ``rollback_on_preempt``."""
+        """
+        Safe-stop hook, then the rollback walk if ``rollback_on_preempt``.
+        ``allow_rollback=False`` (shutdown / emergency_stop) skips the walk.
+        """
         rolled_back, error = await super()._run_safe_stop(proposal, preempted_by)
-        if self.rollback_on_preempt:
+        if self.rollback_on_preempt and allow_rollback:
             try:
                 await self._rollback_completed(self._completed_steps.copy())
                 rolled_back = True
@@ -1124,8 +1135,12 @@ class ActionMasterNode(FaultReportingMixin, BaseNode):
             except asyncio.CancelledError:
                 by = self._preempted_by.get(action_id)
                 preempted = by is not None
+                # Shutdown / emergency_stop cancels run the safe-stop only;
+                # rollback_on_preempt applies to reflex preemption.
                 rolled_back, error = await node._run_safe_stop(
-                    proposal, by if by is not None else _SHUTDOWN_PROPOSAL,
+                    proposal,
+                    by if by is not None else _SHUTDOWN_PROPOSAL,
+                    allow_rollback=preempted,
                 )
                 stopped_at: str | None = None
                 step_results: list[StepResult] = []
