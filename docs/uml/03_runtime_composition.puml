@@ -21,6 +21,8 @@ class RuntimeBuilder {
   + strategy(s): RuntimeBuilder
   + tick_rate(hz: float): RuntimeBuilder
   + reflex_conflict(policy: str): RuntimeBuilder
+  + reflex_mode(mode: str): RuntimeBuilder
+  + strict_resources(strict: bool): RuntimeBuilder
   + permissions(allowed: dict): RuntimeBuilder
   + build(): ArachniteRuntime
 }
@@ -34,6 +36,9 @@ class ArachniteRuntime {
   - _last_results: list<Result>
   - _context_observers: list<Callable>
   - _decision_observers: list<Callable>
+  - _reflex_mode: str
+  - _reflex_signal_ttl_s: float
+  - _reflex_eval_timeout_s: float
   --
   + start(): None
   + stop(): None
@@ -41,6 +46,8 @@ class ArachniteRuntime {
   + pause(): None
   + resume(): None
   + tick(): None
+  + wait_idle(timeout): bool
+  - _on_reflex_signal(signal): None
   + register_sense_live(node): None
   + register_instinct_live(node): None
   + register_action_live(node): None
@@ -69,6 +76,7 @@ class ContextNode {
   --
   + update(signals, result, action_state, ...): Context
   + snapshot(): Context
+  + reflex_view(signals): Context
   + get(key, default): Any
   + set(key, value): None
   + delete(key): None
@@ -78,7 +86,43 @@ class ContextNode {
 class SenseMasterNode
 class InstinctMasterNode
 class DecisionMasterNode
-class ActionMasterNode
+class ActionMasterNode {
+  + strict_resources: bool
+  - _running_nodes: dict<str, BaseActionNode>
+  - _origins: dict<str, str>
+  - _owners: dict<str, str>
+  - _claims: dict<str, str>
+  - _armed: dict<str, Proposal>
+  - _tasks: dict<str, Task>
+  - _completed: list<Result>
+  --
+  + launch(p, origin): LaunchOutcome
+  + launch_reflex(p, preemption): LaunchOutcome
+  + drain_completed(): list<Result>
+  + wait_idle(timeout): bool
+  + conflicting_owners(p): set<str>
+  + cancel_all(timeout): None
+  + dispatch(p, origin): Result
+}
+
+class LaunchOutcome <<dataclass>> {
+  + status: LaunchStatus
+  + action_id: str
+  + owners: frozenset<str>
+}
+
+class "Action task" as ActionTask <<asyncio.Task>> {
+  execute() with timeout and retries
+  on cancel: on_preempted() safe-stop
+}
+
+note right of ActionMasterNode
+  _owners: resource -> owning action_id
+  (at most one running owner per resource).
+  _claims: resource -> armed reflex; blocks
+  deliberative launches until it starts.
+  _origins: 'reflex' | 'decision' | 'direct'.
+end note
 
 ' ── Supervision / safety / shutdown ──────────────────────────
 class NodeSupervisor {
@@ -159,6 +203,9 @@ ArachniteRuntime "1" *-- "1" SenseMasterNode
 ArachniteRuntime "1" *-- "1" InstinctMasterNode
 ArachniteRuntime "1" *-- "1" DecisionMasterNode
 ArachniteRuntime "1" *-- "1" ActionMasterNode
+ArachniteRuntime ..> SignalBus                   : reflex lane subscribes (reflex_mode='event')
+ActionMasterNode "1" *-- "*" ActionTask          : running actions
+ActionMasterNode ..> LaunchOutcome               : returns
 ArachniteRuntime "1" *-- "4..*" NodeSupervisor   : one per master
 ArachniteRuntime "1" *-- "1" HealthMonitor
 ArachniteRuntime "1" o-- "*" BaseSafetyMonitor   : monitors
@@ -184,9 +231,12 @@ note bottom of ArachniteRuntime
     1. SENSE     – SenseMasterNode.read_all()
     2. CONTEXT   – ContextNode.update()
     3. REFLEX    – InstinctMasterNode.evaluate_reflexes()
+                   + ActionMasterNode.launch_reflex()
     4. INSTINCT  – InstinctMasterNode.evaluate_all()
     5. DECIDE    – DecisionMasterNode.on_new_proposals_many()
-    6. ACT       – ActionMasterNode.dispatch_many()
+    6. ACT       – ActionMasterNode.launch() (park() if BLOCKED)
+  Actions run as tasks across ticks; their Results are
+  drained into the next tick's ctx.last_results.
 end note
 
 @enduml

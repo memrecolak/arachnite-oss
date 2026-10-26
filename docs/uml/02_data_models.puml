@@ -48,6 +48,7 @@ class Result <<dataclass>> {
   + stopped_at_step: str | None
   + step_results: list<StepResult>
   + rolled_back: bool
+  + preempted: bool
 }
 
 ' ── Multi-step action models ─────────────────────────────────
@@ -67,6 +68,7 @@ class StepResult <<dataclass>> {
   + error: BaseException | None
   + duration_s: float
   + abort_sequence: bool
+  + interrupted: bool
 }
 
 class InterruptRequest <<dataclass>> {
@@ -74,6 +76,7 @@ class InterruptRequest <<dataclass>> {
   + requesting_instinct_id: str
   + reason: str
   + timestamp: float
+  + target_action_id: str | None
 }
 
 class ActionExecutionState <<dataclass>> {
@@ -89,6 +92,11 @@ enum InterruptPolicy {
   NEVER
   CHECKPOINT
   ROLLBACK
+}
+
+enum ReflexPreemption {
+  PREEMPT
+  WAIT_FOR_BLOCK
 }
 
 ' ── Supervisor / bus-level signals ───────────────────────────
@@ -206,6 +214,13 @@ note right of Proposal
   200+  reflex
   100-199  safety
   50-99   normal
+end note
+
+note right of Result
+  preempted=True: a reflex took the action's
+  resources mid-execution (implies interrupted;
+  never retried). Fed into the context of the
+  first tick after the action finished.
 end note
 
 @enduml

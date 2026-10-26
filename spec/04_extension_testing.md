@@ -23,6 +23,8 @@
 - Implement evaluate\(\)\. It must be synchronous in intent — no awaiting slow resources\.
 - Set priority above 100 to distinguish from normal instincts\. Use 200\+ for the most critical reflexes\.
 - Subscribe to 'supervisor' signals to build fault\-reactive reflexes\.
+- Set preemption \(ReflexPreemption\.PREEMPT, the default, or WAIT\_FOR\_BLOCK\) to decide what the reflex does to a running action that holds the actuators it needs \(§17\.12\)\.
+- Set trigger\_on\_signals so the reflex can run in the event\-driven lane \(reflex\_mode='event', §7\.2\.3\)\.
 
 ## __8\.4 Custom DecisionNode__
 
@@ -33,8 +35,10 @@
 ## __8\.5 Custom ActionNode__
 
 - Extend BaseActionNode\. Set node\_id to the value InstinctNodes will use in Proposal\.action\_id\.
-- Implement execute\(\)\. Always return a Result, even on failure\.
+- Implement execute\(\)\. Always return a Result, even on failure\. Make it cancellation\-safe: a reflex preemption or emergency stop arrives as asyncio\.CancelledError at an await\.
 - Set timeout\_s and max\_retries to protect against hardware hangs\.
+- Declare resources — every actuator the action commands — so the framework can enforce actuator exclusivity\.
+- Override on\_preempted\(\) with a forward safe\-stop \(brake, keep the grip\) that finishes within safe\_stop\_timeout\_s\.
 
 ## __8\.6 Custom MultiStepActionNode__
 
@@ -43,7 +47,8 @@
 - Implement execute\_step\(\) with a match/case on step\.name\. Always return a StepResult — never raise\.
 - Set interrupt\_policy to match the action’s safety requirements: ROLLBACK for physical state that must be undone, NEVER for sequences that must always complete once started\.
 - Provide rollback callables on non\-interruptible steps wherever possible\. A step without a rollback in a ROLLBACK policy action is a design smell — document why it’s safe to leave it unreversed\.
-- The bounded interrupt latency for your action is the sum of timeout\_s on all non\-interruptible steps\. Make this explicit in the class docstring so operators can reason about worst\-case response times\.
+- The longest a mandatory block can hold off a deliberative interrupt or a WAIT\_FOR\_BLOCK reflex is the sum of timeout\_s over the block \(plus safe\_stop\_timeout\_s for the reflex\); a PREEMPT reflex waits only for safe\_stop\_timeout\_s \(§17\.12\)\. Make this explicit in the class docstring so operators can reason about worst\-case response times\.
+- Set rollback\_on\_preempt=True only if undoing completed steps during a hazard is safe\.
 
 ## __8\.7 Configuring a NodeSupervisor__
 
@@ -156,29 +161,23 @@ async def test\_overheat\_instinct\(\):
 
 ## __9\.2 Testing Reflex Nodes__
 
-Reflex nodes can be tested identically to normal instinct nodes\. The key difference is verifying that the runtime dispatches them before the decision step\.
+Reflex nodes can be tested identically to normal instinct nodes\. The key difference is verifying that the runtime launches them before the decision step\. Because ``tick\(\)`` launches actions without waiting for them, wait for the action and run one more tick before reading its Result from the context\.
 
 async def test\_emergency\_stop\_reflex\_bypasses\_decision\(\):
 
-    runtime = build\_test\_runtime\(\)
+    runtime = build\_test\_runtime\(\)   \# a stub proximity sense node reads 0\.05
 
     await runtime\.start\(\)
 
-    \# Inject a proximity signal below safe threshold
+    await runtime\.pause\(\)            \# drive ticks manually
 
-    await runtime\.bus\.publish\(Signal\(
+    await runtime\.wait\_idle\(timeout=1\.0\)   \# settle background\-loop ticks
 
-        source='proximity', kind='proximity',
+    await runtime\.tick\(\)             \# reflex fires; action launched
 
-        value=0\.05, confidence=1\.0,
+    assert await runtime\.wait\_idle\(timeout=1\.0\)
 
-        timestamp=time\.monotonic\(\),
-
-    \)\)
-
-    await runtime\.tick\(\)
-
-    \# Verify the reflex action fired
+    await runtime\.tick\(\)             \# Result surfaces in this tick's ctx
 
     ctx = runtime\.context\.snapshot\(\)
 
@@ -216,21 +215,23 @@ async def test\_supervisor\_emits\_signal\_on\_fault\(\):
 
 ## __9\.4 Integration Testing with Manual Tick__
 
-The runtime exposes a tick\(\) method for step\-by\-step testing without a real clock loop\.
+The runtime exposes a tick\(\) method for step\-by\-step testing without a real clock loop\. tick\(\) launches actions as tasks and returns without waiting for them; use wait\_idle\(\) and one more tick to observe their Results\.
 
 async def test\_full\_pipeline\(\):
 
-    runtime = build\_test\_runtime\(\)
+    runtime = build\_test\_runtime\(\)   \# a stub thermal sense node reads 90\.0
 
     await runtime\.start\(\)
 
-    await runtime\.bus\.publish\(Signal\(source='mock', kind='thermal',
+    await runtime\.pause\(\)
 
-                               value=90\.0, confidence=1\.0,
+    await runtime\.wait\_idle\(timeout=1\.0\)
 
-                               timestamp=time\.monotonic\(\)\)\)
+    await runtime\.tick\(\)             \# instinct proposes; action launched
 
-    await runtime\.tick\(\)
+    assert await runtime\.wait\_idle\(timeout=1\.0\)
+
+    await runtime\.tick\(\)             \# Result surfaces in ctx
 
     result = runtime\.context\.snapshot\(\)\.last\_result
 
@@ -242,7 +243,7 @@ async def test\_full\_pipeline\(\):
 
 ## __9\.5 Testing MultiStepActionNode__
 
-MultiStepActionNode can be tested step\-by\-step using execute\_step\(\) directly, or end\-to\-end via the runtime\. Interrupt behaviour is tested by injecting a competing proposal mid\-execution\.
+MultiStepActionNode can be tested step\-by\-step using execute\_step\(\) directly, or end\-to\-end via the runtime\. Interrupt behaviour is tested by injecting a competing proposal mid\-execution\. When execute\(\) is called directly, it resets the interrupt flag on entry, so the interrupt must be requested after execute\(\) has started\.
 
 async def test\_interrupt\_stops\_at\_safe\_point\(\):
 
@@ -262,25 +263,31 @@ async def test\_interrupt\_stops\_at\_safe\_point\(\):
 
     await asyncio\.sleep\(0\.1\)   \# let move\_to\_object begin
 
-    \# Inject a higher\-priority interrupt
+    \# Inject a higher\-priority deliberative interrupt
 
     interrupt = InterruptRequest\(
 
-        new\_proposal=Proposal\(instinct\_id='collision', priority=200, \.\.\.\),
+        new\_proposal=Proposal\(instinct\_id='avoid', priority=120, \.\.\.\),
 
-        requesting\_instinct\_id='CollisionReflex',
+        requesting\_instinct\_id='ObstacleAvoidInstinct',
 
     \)
 
-    await node\.request\_interrupt\(interrupt\)
+    node\.request\_interrupt\(interrupt\)
 
     result = await task
 
-    \# Should have stopped at first interruptible step
+    \# The flag is held through the mandatory block \(lower, close, raise\)
+
+    \# and honoured at the first interruptible boundary after it; ROLLBACK
+
+    \# then undoes the block in reverse order\.
 
     assert result\.interrupted
 
-    assert result\.stopped\_at\_step == 'move\_to\_object'
+    assert result\.stopped\_at\_step == 'move\_to\_target'
+
+    assert result\.rolled\_back
 
 async def test\_mandatory\_block\_not\_interrupted\(\):
 
@@ -291,4 +298,6 @@ async def test\_mandatory\_block\_not\_interrupted\(\):
     \# Verify action completes raise\_gripper before yielding
 
     \# \.\.\.
+
+Reflex preemption is tested through ActionMasterNode: launch the action, then call launch\_reflex\(\) with a proposal whose action shares a resource, and assert the owner's Result has preempted=True, that on\_preempted\(\) ran, and that the reflex action started only afterwards\.
 

@@ -33,6 +33,7 @@ package "Sense" <<Rectangle>> {
     --
     + {abstract} read(): Signal | None
     + on_error(exc: Exception): Signal | None
+    + push(signal: Signal): None
   }
 
   class SenseMasterNode {
@@ -42,6 +43,7 @@ package "Sense" <<Rectangle>> {
     + register(node: BaseSenseNode): None
     + unregister(node_id: str): None
     + read_all(): list<Signal>
+    + returned_this_tick(signal): bool
     - _apply_merge(signals): list<Signal>
   }
 }
@@ -62,6 +64,7 @@ package "Instinct" <<Rectangle>> {
   abstract class BaseReflexInstinctNode {
     + reflex: bool = True
     + priority: int = 200
+    + preemption: ReflexPreemption = PREEMPT
   }
 
   class LLMInstinctNode {
@@ -82,7 +85,7 @@ package "Instinct" <<Rectangle>> {
     - _pre_evaluate_gate: Callable | None
     --
     + register(node: BaseInstinctNode): None
-    + evaluate_reflexes(ctx): list<Proposal>
+    + evaluate_reflexes(ctx, nodes): list<Proposal>
     + evaluate_all(ctx): list<Proposal>
     + set_pre_evaluate_gate(gate): None
     + notify_rejected(rejected): None
@@ -110,11 +113,15 @@ package "Decision" <<Rectangle>> {
 
   class DecisionMasterNode {
     + max_pending_ticks: int
+    + max_handoff_ticks: int
     - _strategy: BaseDecisionNode
     - _pending: dict<str, Proposal>
+    - _handoff: dict<str, Proposal>
     --
     + set_strategy(s: BaseDecisionNode): None
-    + on_new_proposals_many(...): tuple<list, list>
+    + on_new_proposals_many(..., conflicts): tuple<list, list>
+    + park(p: Proposal): None
+    + handoff_proposals: dict<str, Proposal>
     + clear_pending(instinct_id: str): None
   }
 }
@@ -124,35 +131,63 @@ package "Action" <<Rectangle>> {
   abstract class BaseActionNode {
     + timeout_s: float
     + max_retries: int
+    + resources: frozenset<str>
+    + safe_stop_timeout_s: float
     --
     + {abstract} execute(p: Proposal): Result
     + on_timeout(p: Proposal): Result
+    + on_preempted(p: Proposal, preempted_by: Proposal): None
   }
 
   abstract class MultiStepActionNode {
     + interrupt_policy: InterruptPolicy
+    + rollback_on_preempt: bool = False
     - _interrupt_requested: bool
+    - _reflex_preempt_by: Proposal | None
     - _current_step: ActionStep | None
     - _completed_steps: list<StepResult>
     --
     + {abstract} steps(): list<ActionStep>
     + {abstract} execute_step(step, p, completed): StepResult
     + on_interrupted(...): None
+    + on_aborted(completed, failed_step, p): bool
     + request_interrupt(req: InterruptRequest): None
+    + request_reflex_preempt(by: Proposal): None
+    + check_interrupt(): bool
     + is_interruptible(): bool
     + execution_state(): ActionExecutionState
   }
 
   class ActionMasterNode {
+    + strict_resources: bool
     - _nodes: dict<str, BaseActionNode>
     - _running_nodes: dict<str, BaseActionNode>
     - _running_proposals: dict<str, Proposal>
+    - _owners: dict<str, str>
+    - _armed: dict<str, Proposal>
     --
     + register(node: BaseActionNode): None
-    + dispatch(p: Proposal): Result
-    + dispatch_many(proposals): list<Result>
+    + launch(p, origin): LaunchOutcome
+    + launch_reflex(p, preemption): LaunchOutcome
+    + drain_completed(): list<Result>
+    + wait_idle(timeout): bool
+    + conflicting_owners(p): set<str>
+    + cancel(action_id, timeout): None
+    + cancel_all(timeout): None
+    + dispatch(p, origin): Result
+    + dispatch_many(proposals, origin): list<Result>
     + request_interrupt(req, action_id): None
+    + interrupt_all(req): None
     + running_action_ids(): set<str>
+  }
+
+  enum LaunchStatus {
+    LAUNCHED
+    BLOCKED
+    ARMED
+    DEDUPED
+    VETOED
+    NOT_FOUND
   }
 }
 
@@ -181,5 +216,6 @@ InstinctMasterNode "1" *-- "*" BaseReflexInstinctNode : registers
 DecisionMasterNode "1" *-- "1" BaseDecisionNode   : strategy
 ActionMasterNode   "1" *-- "*" BaseActionNode     : registers
 MultiStepActionNode "1" *-- "*" ActionStep        : steps()
+ActionMasterNode    ..> LaunchStatus              : LaunchOutcome.status
 
 @enduml

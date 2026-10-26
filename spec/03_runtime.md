@@ -28,13 +28,21 @@ class ArachniteRuntime:
 
         tick\_instrumenter: TickInstrumenter \| None = None,
 
+        reflex\_mode: str = 'tick',              \# 'tick' \| 'event' \(§7\.2\.3\)
+
+        reflex\_signal\_ttl\_s: float \| None = None,  \# None → one tick period
+
+        reflex\_eval\_timeout\_s: float = 0\.05,
+
     \): \.\.\.
 
         """The optional ``tick\_instrumenter`` parameter installs an observer
         that receives per\-stage wall\-clock timings on every tick\. Pass ``None``
         \(the default\) for zero instrumentation overhead\. The instrumenter MAY
         be attached or replaced after construction via ``set\_tick\_instrumenter\(\)``
-        \(see §7\.5\)\."""
+        \(see §7\.5\)\. ``reflex\_mode``, ``reflex\_signal\_ttl\_s`` and
+        ``reflex\_eval\_timeout\_s`` configure the event\-driven reflex lane
+        \(§7\.2\.3\); any other ``reflex\_mode`` raises ``ValueError``\."""
 
     @property
 
@@ -54,9 +62,23 @@ class ArachniteRuntime:
 
         """Gracefully stop the loop, stop supervisors, call teardown\(\)\."""
 
+    async def emergency\_stop\(self\) \-> None:
+
+        """Stop the loop and the reflex lane, cancel every running action
+
+        through its safe\-stop hook \(no rollback\), tear down\. See §15\.3\."""
+
     async def tick\(self\) \-> None:
 
-        """Execute one full pipeline cycle manually \(useful for testing\)\."""
+        """Execute one full pipeline cycle manually \(useful for testing\)\.
+
+        Launches actions but does not wait for them to finish\."""
+
+    async def wait\_idle\(self, timeout: float \| None = None\) \-> bool:
+
+        """Wait until no action is running or armed\. Returns False on
+
+        timeout\. The Results reach ctx\.last\_results on the next tick\."""
 
     @property
 
@@ -112,13 +134,15 @@ class ArachniteRuntime:
 
         """Unregister an ActionNode while the runtime is running\.
 
-        Calls teardown\(\), removes from the action master, and untracks
+        Cancels the action if it is running \(its safe\-stop hook runs\),
 
-        from the supervisor\."""
+        then calls teardown\(\), removes it from the action master, and
+
+        untracks it from the supervisor\."""
 
 ## __7\.2 Tick Loop__
 
-The runtime maintains a fixed tick rate\. Reflex evaluation happens first each tick before the normal pipeline\. If a tick takes longer than the interval, the next tick starts immediately\. A warning is logged when a tick overruns by more than `overrun_warn_pct` \(default 20%\) for `overrun_warn_consecutive` consecutive ticks \(default 3\); the consecutive counter resets on the first non\-overrunning tick\. The dual threshold mirrors `TickBudgetMonitor` \(which emits a `SafetyViolationSignal` after 3 consecutive overruns\) so the runtime warning and the safety signal agree on what counts as a real overrun rather than a transient schedule slip\. Pass `overrun_warn_consecutive=1` for legacy warn\-on\-every\-overrun behaviour\.
+The runtime maintains a fixed tick rate\. Reflex evaluation happens first each tick before the normal pipeline\. A tick never waits for an action: ``ActionMasterNode\.launch\(\)`` / ``launch\_reflex\(\)`` start ``execute\(\)`` as tracked tasks that run across later ticks, so sensing, reflex evaluation and deliberation continue while a long ``MultiStepActionNode`` executes \(ADR 0005\)\. If a tick takes longer than the interval, the next tick starts immediately\. A warning is logged when a tick overruns by more than `overrun_warn_pct` \(default 20%\) for `overrun_warn_consecutive` consecutive ticks \(default 3\); the consecutive counter resets on the first non\-overrunning tick\. The dual threshold mirrors `TickBudgetMonitor` \(which emits a `SafetyViolationSignal` after 3 consecutive overruns\) so the runtime warning and the safety signal agree on what counts as a real overrun rather than a transient schedule slip\. Pass `overrun_warn_consecutive=1` for legacy warn\-on\-every\-overrun behaviour\.
 
 async def \_loop\(self\):
 
@@ -150,57 +174,82 @@ async def tick\(self\) \-> None:
 
     \)
 
-    \# 1\. Sense — poll\_interval\_s is enforced per node; nodes whose
+    \# 1\. Drain — snapshot\-and\-clear the buffered supervisor / node\_fault and
 
-    \#    interval has not elapsed return None and are skipped\.
+    \#    bus\-published state\_update signals, and collect the Results of
+
+    \#    actions that finished since the previous tick \(completion order\)\.
+
+    buffered = self\.\_supervisor\_signal\_buffer \+ self\.\_state\_update\_buffer
+
+    completed = self\.\_action\_master\.drain\_completed\(\)
+
+    if completed:
+
+        self\.\_last\_results = completed
+
+        self\.\_last\_result  = completed\[0\]
+
+    \# 2\. Sense — poll\_interval\_s is enforced per node; nodes whose
+
+    \#    interval has not elapsed return None and are skipped\. Signals
+
+    \#    pushed since the last tick \(BaseSenseNode\.push\(\)\) are appended\.
+
+    \#    In reflex\_mode='event' the publish inside read\_all\(\) already
+
+    \#    runs the event\-driven reflex lane \(§7\.2\.3\)\.
 
     signals  = await self\.\_sense\_master\.read\_all\(\)
 
-    \# 2\. Drain buffered supervisor signals so instincts can observe
+    signals \+= buffered
 
-    \# node faults \(FAULTED, DEAD, RESTARTING\) in this tick\.
+    \# 3\. Context update — snapshot the completed Results and the
 
-    signals \+= self\.\_supervisor\_signal\_buffer
+    \#    execution state of every running action into ctx, then clear
 
-    self\.\_supervisor\_signal\_buffer\.clear\(\)
+    \#    the runtime\-side slots \(one\-tick lifetime, §7\.2\.1\)\.
 
-    \# 3\. Context update — snapshot the *previous* tick's results into
-    \#    ctx so instincts can react to outcomes \(``Result`` docstring:
-    \#    "Fed back into the next tick's Context"\)\. After the snapshot
-    \#    is taken, clear the runtime\-side slots so this tick's dispatch
-    \#    \(below\) writes into a clean buffer — bounding ``last\_results``
-    \#    to a one\-tick lifetime\. See §7\.2\.1\.
+    ctx = self\.\_context\.update\(signals, result=self\.\_last\_result,
 
-    ctx      = self\.\_context\.update\(signals, self\.\_last\_result\)
+                               action\_states=\[\.\.\.running actions\.\.\.\],
+
+                               results=self\.\_last\_results\)
 
     self\.\_last\_results = \[\]
     self\.\_last\_result  = None
 
-    \# 4\. Reflex pass — bypass decision if any reflex fires
+    \# 4\. Reflex pass — bypass decision\. In 'event' mode only reflex nodes
 
-    reflex\_proposals = await self\.\_instinct\_master\.evaluate\_reflexes\(ctx\)
+    \#    without trigger\_on\_signals are evaluated here\.
 
-    reflex\_results: list\[Result\] = \[\]
+    try:
 
-    for rp in reflex\_proposals:
+        reflex\_proposals = await self\.\_instinct\_master\.evaluate\_reflexes\(
 
-        try:
+            ctx, nodes=self\.\_tick\_reflex\_nodes\(\)\)
 
-            result = await self\.\_action\_master\.dispatch\(rp\)
+    except ReflexConflictError as exc:
 
-        except ActionNotFoundError:
+        \# reflex\_conflict='raise': logged at ERROR, never aborts the tick;
 
-            self\.\_logger\.warning\("Reflex dispatch skipped: action not found", \.\.\.\)
+        \# the conflicting reflexes are launched in priority order\.
 
-            continue
+        reflex\_proposals = exc\.proposals
 
-        reflex\_results\.append\(result\)
+    for rp in reflex\_proposals:            \# priority descending
 
-    if reflex\_results:
+        logger\.info\("Reflex fired", \.\.\.\)
 
-        self\.\_last\_results = reflex\_results
+        outcome = self\.\_action\_master\.launch\_reflex\(rp, node\.preemption\)
 
-        self\.\_last\_result = reflex\_results\[0\]
+        \# LAUNCHED / ARMED: the reflex owns or has claimed its resources
+
+        \# \(§17\.12\)\. DEDUPED: already running or armed as a reflex\.
+
+        \# NOT\_FOUND: logged at WARNING\.
+
+    await asyncio\.sleep\(0\)   \# if any launched: execute\(\) is entered now
 
     \# 5\. Normal instinct evaluation
 
@@ -208,7 +257,11 @@ async def tick\(self\) \-> None:
 
     evaluated\_ids = self\.\_instinct\_master\.last\_evaluated\_ids
 
-    \# 6\. Decision — select proposals to dispatch
+    \# 6\. Decision — select proposals; conflicts include shared resources
+
+    \#    and resources claimed by armed reflexes\. A reflex\-owned action
+
+    \#    is never reported interruptible\.
 
     to\_dispatch, interrupts = await self\.\_decision\_master\.on\_new\_proposals\_many\(
 
@@ -216,37 +269,19 @@ async def tick\(self\) \-> None:
 
         running\_proposals=self\.\_action\_master\.current\_proposals\(\),
 
-        running\_interruptible=\{\.\.\.interruptibility map\.\.\.\},
+        running\_interruptible=\{aid: origin \!= 'reflex' and is\_interruptible\(aid\)\},
 
         evaluated\_instinct\_ids=evaluated\_ids,
 
+        conflicts=self\.\_action\_master\.conflicting\_owners,
+
     \)
 
-    for interrupt\_req in interrupts:
+    \# Notify rejected instincts — MUST use last\_considered \(fresh \+
 
-        try:
+    \# carried\-forward pending and hand\-off proposals\) so that persistent
 
-            await self\.\_action\_master\.request\_interrupt\(interrupt\_req, \.\.\.\)
-
-        except MandatoryBlockViolation:
-
-            \# Expected when the target action is inside a mandatory
-
-            \# completion block\.  Logged as WARNING with action\_id and
-
-            \# detail fields — MUST NOT be silently suppressed\.
-
-            logger\.warning\("Interrupt deferred: mandatory block active", \.\.\.\)
-
-        except Exception:
-
-            \# Unexpected error — logged as ERROR with full context\.
-
-            logger\.error\("Interrupt dispatch failed", \.\.\.\)
-
-    \# 7\. Notify rejected instincts — MUST use last\_considered (fresh +
-    \#    carried\-forward pending proposals) so that persistent proposals
-    \#    that lost the decision also receive on\_proposal\_rejected\(\)\.
+    \# proposals that lost the decision also receive on\_proposal\_rejected\(\)\.
 
     dispatched\_ids = \{p\.instinct\_id for p in to\_dispatch\}
 
@@ -258,17 +293,47 @@ async def tick\(self\) \-> None:
 
         await self\.\_instinct\_master\.notify\_rejected\(rejected\)
 
-    \# 8\. Dispatch — merge reflex and normal results
+    for interrupt\_req in interrupts:
 
-    if to\_dispatch:
+        target = interrupt\_req\.target\_action\_id or interrupt\_req\.new\_proposal\.action\_id
 
-        results = await self\.\_action\_master\.dispatch\_many\(to\_dispatch\)
+        try:
 
-        self\.\_last\_results = reflex\_results \+ results
+            await self\.\_action\_master\.request\_interrupt\(interrupt\_req, action\_id=target\)
 
-        self\.\_last\_result = self\.\_last\_results\[0\]
+        except MandatoryBlockViolation:
 
-    \# 9\. Notify all leaf nodes that the tick has ended
+            \# The target entered a mandatory block since the decision\.
+
+            \# Logged as WARNING with action\_id and detail fields — MUST
+
+            \# NOT be silently suppressed\.
+
+            logger\.warning\("Interrupt blocked by mandatory step", \.\.\.\)
+
+        except Exception:
+
+            \# Unexpected error — logged as ERROR with full context\.
+
+            logger\.error\("Interrupt request failed", \.\.\.\)
+
+    \# 7\. Act — launch the selected proposals \(highest priority per
+
+    \#    action\_id\) as tasks; nothing is awaited\. A launch that is
+
+    \#    BLOCKED by a running owner — typically one that is unwinding
+
+    \#    from the interrupt just issued — is parked for hand\-off\.
+
+    for p in best\_per\_action\_id\(to\_dispatch\):
+
+        outcome = self\.\_action\_master\.launch\(p, origin='decision'\)
+
+        if outcome\.status is LaunchStatus\.BLOCKED:
+
+            self\.\_decision\_master\.park\(p\)
+
+    \# 8\. Notify all leaf nodes that the tick has ended
 
     tick\_duration = time\.monotonic\(\) \- tick\_start
 
@@ -286,21 +351,33 @@ async def tick\(self\) \-> None:
 
 The runtime's ``\_last\_results`` / ``\_last\_result`` slots carry action ``Result``s into exactly *one* subsequent tick, providing the feedback channel that ``Result``'s docstring promises and that ``LLMInstinctNode`` reads via ``ctx\.last\_results`` / ``ctx\.last\_result``\.
 
-Lifecycle per tick N\+1, given dispatch in tick N:
+Actions run as tasks, so a ``Result`` is produced whenever its action finishes — possibly many ticks after the launch\. ``ActionMasterNode`` appends each finished ``Result`` \(and each guard veto, at once\) to a completion buffer\. Lifecycle per tick N:
 
-1\. Tick N\+1 starts; ``self\.\_last\_results`` still holds tick N's results\.
+1\. Tick N starts; step 1 drains the completion buffer \(``drain\_completed\(\)``\) into ``self\.\_last\_results``, in completion order\. ``self\.\_last\_result`` is the first of them\.
 2\. Step 3 \(``\_context\.update``\) snapshots them into the new ``Context``\. Every instinct evaluated this tick — reflex or normal — observes them via ``ctx\.last\_results`` / ``ctx\.last\_result``\.
 3\. Immediately after the snapshot, the runtime clears ``self\.\_last\_results`` and ``self\.\_last\_result``\. The snapshot inside ``ctx`` is unaffected \(dataclass field copy\)\.
-4\. If reflex or normal dispatch fires this tick, the resulting ``Result``s are written back into ``self\.\_last\_results`` for tick N\+2 to carry forward\.
-5\. If neither reflex nor normal dispatch fires, the slots remain empty and tick N\+2's ``ctx\.last\_results`` is ``\[\]``\.
+4\. An action that finishes after tick N's drain lands in the buffer and surfaces at tick N\+1\. If nothing finishes, tick N\+1's ``ctx\.last\_results`` is ``\[\]``\.
 
-This bounds staleness to one tick: an instinct that fires once and then stops firing will see its own ``Result`` exactly once \(on the immediately following tick\), never repeatedly\.
+Each ``Result`` is therefore observed exactly once, on the first tick that starts after the action finished — never repeatedly\. ``tick\(\)`` returning does **not** imply that the actions it launched have finished: a caller that needs completion awaits ``ArachniteRuntime\.wait\_idle\(\)`` \(or ``ActionMasterNode\.wait\_idle\(\)``\) and then runs one more tick, or drives actions with the awaiting ``dispatch\(\)`` \(§7\.2\.2\)\. While an action runs, its ``ActionExecutionState`` appears in ``ctx\.action\_states`` on every tick\.
 
 ### __7\.2\.2 Using nodes without the runtime \(direct\-drive\)__
 
-``ArachniteRuntime`` and the tick loop are **optional**\. The node primitives — ``BaseSenseNode``, ``BaseActionNode``, ``ActionMasterNode`` — are usable standalone with a bare ``SignalBus``, driven on a loop the caller owns\. Construct the nodes, ``register\(\)`` actions on an ``ActionMasterNode``, and call ``read\(\)`` / ``evaluate\(\)`` / ``execute\(\)`` / ``await dispatch\(proposal\)`` directly\. No ``RuntimeBuilder``, no ``InstinctMaster``, no ``DecisionMaster``, no free\-running tick\.
+``ArachniteRuntime`` and the tick loop are **optional**\. The node primitives — ``BaseSenseNode``, ``BaseActionNode``, ``ActionMasterNode`` — are usable standalone with a bare ``SignalBus``, driven on a loop the caller owns\. Construct the nodes, ``register\(\)`` actions on an ``ActionMasterNode``, and call ``read\(\)`` / ``evaluate\(\)`` / ``execute\(\)`` / ``await dispatch\(proposal\)`` directly\. No ``RuntimeBuilder``, no ``InstinctMaster``, no ``DecisionMaster``, no free\-running tick\. ``dispatch\(\)`` / ``dispatch\_many\(\)`` await the ``Result`` and apply the same conflict check as ``launch\(\)``: a proposal whose ``action\_id`` or declared resources are owned by a running action gets ``Result\(success=False\)`` without ``execute\(\)`` running \(``ResourceConflictError`` for a shared resource\)\. With ``origin=None`` \(the default\) guards are bypassed only at ``priority >= 200`` \(§5\.7\)\.
 
 **When is the deliberative runtime warranted?** Only when **≥2 autonomous behaviors compete continuously on dynamic priority** — the robotics / edge control shape the ``InstinctMaster`` → ``DecisionMaster`` → tick pipeline is built for\. For a single agent, or a human\-in\-the\-loop application with a *static* priority order \(a coding cockpit, a one\-shot pipeline, a request\-driven service\), prefer direct dispatch \+ your own arbitration\. The direct\-drive pattern used in unit tests \(see ``04_extension_testing``\) is also a legitimate production deployment shape — it is not a test\-only affordance\.
+
+### __7\.2\.3 Event\-driven reflex lane \(``reflex\_mode='event'``\)__
+
+With the default ``reflex\_mode='tick'`` every reflex node is evaluated once per tick in step 4\. With ``ArachniteRuntime\(reflex\_mode='event'\)`` \(``RuntimeBuilder\.reflex\_mode\('event'\)``\), each reflex node that declares ``trigger\_on\_signals`` is moved to the **reflex lane**: the runtime subscribes to those signal kinds on the bus and evaluates the triggered reflexes the moment a matching signal is published, instead of waiting for the next tick:
+
+- A polled sense node's signal arrives during the sense stage \(``read\_all\(\)`` publishes it\), before the context update; the lane's work is charged to the ``sense`` stage\.
+- An event\-driven sense node calls ``await self\.push\(signal\)`` from a background task \(e\.g\. a GPIO or ToF interrupt listener started in ``setup\(\)``\)\. The lane evaluates the reflex before ``push\(\)`` returns, outside any tick, which removes tick quantisation from the reflex path\. The pushed signal also reaches the next tick's ``ctx\.signals`` once, for deliberation\.
+- The reflex sees ``ContextNode\.reflex\_view\(signals\)``: the freshest signal per ``\(source, kind\)`` of its trigger kinds received within ``reflex\_signal\_ttl\_s`` \(default: one tick period\), the current ``state``, results and action states, and an **empty** ``history``\.
+- Evaluation is bounded by ``reflex\_eval\_timeout\_s`` \(default 0\.05 s\)\. A timeout or exception is logged at ERROR and never propagates into the publisher; ``ReflexConflictError`` is handled as in step 4\.
+- Proposals go through the same ``launch\_reflex\(\)`` arbitration \(§17\.12\)\.
+- The lane stays live while the runtime is paused \(polled sensing and deliberation stop; a pushed hazard signal still gets its reflex\)\. ``stop\(\)`` and ``emergency\_stop\(\)`` detach it first\.
+
+Reflex nodes without ``trigger\_on\_signals`` remain in the tick's reflex stage in both modes\. In ``'tick'`` mode ``trigger\_on\_signals`` has no effect on reflex nodes\.
 
 ## __7\.3 Quick\-Start Example__
 
@@ -372,11 +449,13 @@ Pass node **classes** to auto\-instantiate with the builder's internal bus,
 or pre\-built **instances** for custom constructor arguments\.
 
 Chainable options: `\.strategy\(\)`, `\.tick\_rate\(\)`, `\.log\_sinks\(\)`,
-`\.reflex\_conflict\(\)`, `\.permissions\(\)`, `\.shutdown\(\)`, `\.overrun\_warn\(\)`,
+`\.reflex\_conflict\(\)`, `\.reflex\_mode\(\)`, `\.strict\_resources\(\)`,
+`\.permissions\(\)`, `\.shutdown\(\)`, `\.overrun\_warn\(\)`,
 `\.overrun\_warn\_consecutive\(\)`\.
 
 Defaults: `GreedyDecisionNode` strategy, 10\.0 Hz tick rate,
-`dispatch\_all` reflex conflict policy\.
+`dispatch\_all` reflex conflict policy, `'tick'` reflex mode,
+`strict\_resources=False`\.
 
 ## __7\.5 Tick Instrumentation \(optional\)__
 
@@ -412,12 +491,14 @@ are the elements of `TICK\_STAGE\_NAMES` and map to §7\.2 as follows:
 
 | \# | Stage name | Spans |
 |---|---|---|
-| 1 | `sense` | `notify\_tick\_start` gather \+ `SenseMasterNode\.read\_all\(\)` \+ supervisor\-signal\-buffer drain |
+| 1 | `sense` | `notify\_tick\_start` gather \+ buffer and completed\-result drain \+ `SenseMasterNode\.read\_all\(\)` \(in `'event'` mode including the reflex\-lane work it triggers\) |
 | 2 | `context` | `ContextNode\.update\(\)` \(includes action\-state assembly\) |
-| 3 | `reflex` | `evaluate\_reflexes\(\)` \+ the sequential reflex\-dispatch loop \(fused because the reflex arc bypasses decision; see §7\.2 step 4\) |
-| 4 | `instinct` | `InstinctMasterNode\.evaluate\_all\(ctx\)` \(evaluate only — proposals dispatch in `act`\) |
+| 3 | `reflex` | `evaluate\_reflexes\(\)` \+ the `launch\_reflex\(\)` loop \+ one event\-loop yield \(fused because the reflex arc bypasses decision; see §7\.2 step 4\) |
+| 4 | `instinct` | `InstinctMasterNode\.evaluate\_all\(ctx\)` \(evaluate only — proposals launch in `act`\) |
 | 5 | `decide` | Interruptibility\-map build \+ `on\_new\_proposals\_many` \+ `notify\_rejected` \+ interrupt issuing |
-| 6 | `act` | `ActionMasterNode\.dispatch\_many\(\)` \+ `notify\_tick\_end` gather |
+| 6 | `act` | `ActionMasterNode\.launch\(\)` per selected proposal \(\+ `park\(\)` on `BLOCKED`\) \+ `notify\_tick\_end` gather |
+
+The `reflex` and `act` stages measure **launch cost only**: `execute\(\)` runs in its own task, outside every stage, and its duration is not part of any tick\.
 
 After the six stages have fired, the runtime MUST invoke
 `on\_tick\_complete\(tick\_index, total\_s\)` exactly once, with `total\_s`
@@ -444,7 +525,7 @@ call `time\.monotonic\(\)` at stage boundaries and MUST NOT allocate
 per\-tick bookkeeping objects\. The only permitted cost is a single
 branch\-predicted `is not None` check per boundary\.
 
-__Error isolation \(ADR 0003\)\.__ Instrumenter implementations MAY raise\.
+__Error isolation \(instrumenter error\-isolation ADR\)\.__ Instrumenter implementations MAY raise\.
 The runtime MUST catch any exception raised from `on\_stage` or
 `on\_tick\_complete`, log it at WARNING with fields `stage` \(or `tick`\),
 `error`, and `error\_type`, and continue processing the current tick\. An
@@ -453,7 +534,7 @@ fail the tick, and MUST NOT affect downstream stages beyond the dropped
 sample for the failing call\. This behaviour is consistent with the
 framework's four other observational\-failure isolation sites
 \(`ContextNode` history I/O, the `\_loop` tick\-exception handler,
-`emergency\_stop` interrupt issuing, `NodeSupervisor` setup errors\) and
+the bounded safe\-stop hook `on\_preempted\(\)`, `NodeSupervisor` setup errors\) and
 with the architectural rules that `execute\(\)` and `evaluate\(\)` must
 never raise\.
 
@@ -464,7 +545,7 @@ Graceful shutdown is non\-trivial when actions may be mid\-execution, mandatory 
 
 ## __15\.1 Shutdown Phases__
 
-ArachniteRuntime\.stop\(\) triggers the following ordered phases:
+ArachniteRuntime\.stop\(\) first detaches the event\-driven reflex lane \(§7\.2\.3\), then triggers the following ordered phases:
 
 __Phase__
 
@@ -472,19 +553,19 @@ __What happens__
 
 __1\. Stop sensing__
 
-SenseMasterNode stops polling\. No new signals enter the pipeline\.
+The tick loop is told to stop \(``on\_shutdown\_action`` runs here if configured\)\. No new tick starts, so no new signals enter the pipeline\.
 
 __2\. Drain reflexes__
 
-Any reflex currently evaluating is allowed to complete\. No new ticks start\.
+The in\-flight tick, including its reflex stage, runs to completion \(bounded by ``teardown\_timeout\_s``, after which the loop task is cancelled\)\. Actions run as tasks outside the tick, so this wait is at most one tick long\.
 
 __3\. Complete mandatory block__
 
-If an action is mid\-mandatory\-block, it runs to the end of the block\. Timeout: sum of remaining mandatory step timeouts \+ 10%\.
+Every running multi\-step action receives an InterruptRequest with reason 'stop\(\) called' \(``ActionMasterNode\.interrupt\_all\(\)``\)\. Inside a mandatory block the interrupt is held, so the block runs to its end; the coordinator waits until no running action is inside a block\. Timeout: the longest remaining mandatory\-block time across running actions × ``mandatory\_block\_timeout\_multiplier`` \(default 1\.1\), or ``teardown\_timeout\_s`` when no action is in a block\. No new step starts after the block: each action stops at the first boundary its policy allows\.
 
 __4\. Interrupt remaining action__
 
-Any action still running receives an InterruptRequest with reason='shutdown'\. ROLLBACK policy runs\.
+The coordinator waits up to ``teardown\_timeout\_s`` for the interrupted actions to stop at their boundary — ROLLBACK actions run their rollback walk here\. Whatever is still running then \(single\-step actions, NEVER policy, overrunning steps\) is cancelled through its ``on\_preempted\(\)`` safe\-stop hook, bounded by ``safe\_stop\_timeout\_s``, without rollback\.
 
 __5\. Stop supervisors__
 
@@ -532,7 +613,13 @@ class ShutdownCoordinator:
 
 ## __15\.3 Emergency Shutdown__
 
-When runtime\.emergency\_stop\(\) is called \(e\.g\. from a signal handler on SIGTERM or SIGINT\), the coordinator skips phases 1–3 and jumps directly to phase 4\. Mandatory blocks are abandoned immediately\. Rollbacks still run where possible\. This is the only case where a mandatory completion block is forcibly interrupted\.
+When runtime\.emergency\_stop\(\) is called \(e\.g\. from a signal handler on SIGTERM or SIGINT\), the ShutdownCoordinator is bypassed:
+
+1\. The tick loop and the event\-driven reflex lane are stopped; an in\-flight tick is cancelled and awaited, so nothing new can be launched\.
+2\. Every running action is cancelled at its current ``await`` — inside a mandatory block too — and its ``on\_preempted\(\)`` safe\-stop hook runs, bounded by ``safe\_stop\_timeout\_s``\. Armed reflexes are dropped\. **No rollback runs**: reversing a physical operation during an emergency can itself be unsafe\.
+3\. All master nodes are torn down\.
+
+Emergency stop is a shutdown path\. Cutting into a mandatory block to *respond* to a hazard while the agent keeps running is the job of a ``ReflexPreemption\.PREEMPT`` reflex \(§17\.12\); the complete list of ways a mandatory block can end early is in §17\.5\.
 
 import signal, asyncio
 
@@ -556,7 +643,7 @@ async def main\(\):
 
 ## __15\.4 on\_pause and on\_resume__
 
-For power management on edge devices, the runtime supports pause and resume without a full shutdown\. All nodes receive on\_pause\(\) / on\_resume\(\) lifecycle hooks\. Supervisors continue monitoring during pause; sensing stops; the tick loop suspends\.
+For power management on edge devices, the runtime supports pause and resume without a full shutdown\. All nodes receive on\_pause\(\) / on\_resume\(\) lifecycle hooks\. Supervisors continue monitoring during pause; sensing stops; the tick loop suspends\. Actions already running keep running to completion \(pause launches nothing new and stops nothing\), and the event\-driven reflex lane \(§7\.2\.3\) stays live\.
 
 await runtime\.pause\(\)    \# triggers on\_pause\(\) on all nodes
 
@@ -607,9 +694,9 @@ __DecisionMasterNode\.decide\(\)__
 
 O\(P log P\) where P = number of proposals \(sort by priority\)\. Typically P << I\.
 
-__ActionMasterNode\.dispatch\(\)__
+__ActionMasterNode\.launch\(\) / launch\_reflex\(\)__
 
-O\(1\) lookup by node\_id\. Execution time is action\-defined\.
+O\(1\) lookup by node\_id \+ O\(r\) conflict check, r = declared resources of the action\. Execution time is action\-defined and runs in a task outside the tick\.
 
 __SignalBus\.publish\(\)__
 
@@ -687,11 +774,17 @@ Native InterruptPolicy\.NEVER
 
 Not modelled in any reviewed framework
 
-Bounded interrupt latency guarantee
+Bounded reflex admission
 
-Statically computable from step defs
+Derived from declared step and safe\-stop timeouts under stated assumptions \(§17\.12\); not a hard real\-time guarantee
 
 Not available
+
+Actuator resource exclusivity
+
+Declared per action, enforced by ActionMasterNode with reflex preemption
+
+ROS 2 \(ros2\_control\): exclusive command\-interface claiming per controller
 
 Multi\-step actions with rollback
 
@@ -748,7 +841,7 @@ The biological parallel is the fixed action pattern — a neural sequence that, 
 
 ## __17\.1 ActionStep__
 
-ActionStep is the atomic unit of a multi\-step action\. Each step declares its name, whether execution can safely pause after it completes, and an optional rollback callable to undo its effects if the action is interrupted mid\-block\.
+ActionStep is the atomic unit of a multi\-step action\. Each step declares its name, whether execution may stop at the boundary before it, and an optional rollback callable to undo its effects if the action is interrupted after a block\.
 
 @dataclass
 
@@ -756,7 +849,7 @@ class ActionStep:
 
     name: str                          \# human\-readable label for logging
 
-    interruptible: bool = True         \# safe to stop after this step?
+    interruptible: bool = True         \# may execution stop before this step?
 
     rollback: Callable\[\[\], Awaitable\[None\]\] | None = None
 
@@ -770,7 +863,7 @@ class ActionStep:
 
     metadata: dict = field\(default\_factory=dict\)
 
-Steps are declared as a flat list\. Consecutive non\-interruptible steps form an implicit atomic block — the framework will not interrupt execution inside such a block\. A step with interruptible=True is a safe stop point; the framework may pause there if an interrupt is requested\.
+Steps are declared as a flat list\. Consecutive non\-interruptible steps form an implicit mandatory block — no deliberative interrupt is honoured inside it \(§17\.5 lists the only ways it can end early\)\. The boundary before a step with interruptible=True is a safe stop point: a pending interrupt is honoured there, before the step starts\.
 
 ## __17\.2 StepResult__
 
@@ -802,9 +895,11 @@ class StepResult:
 
 A step that sets ``interrupted=True`` is surfaced by ``execute\(\)`` as ``Result\(interrupted=True, stopped\_at\_step=\.\.\.\)`` via the normal interrupt path — **not** as a ``StepAbortError`` failure\. This distinguishes "the step chose to stop because a higher\-priority action wants control" from "the step aborted the sequence due to an error" \(``abort\_sequence``\)\.
 
+**Aborts\.** A step aborts the sequence when it returns ``abort\_sequence=True``, when it exceeds its timeout \(default ``on\_step\_timeout\(\)``\), or when ``execute\_step\(\)`` raises — the exception is converted into an aborting ``StepResult`` and logged at ERROR\. Every abort goes through ``on\_aborted\(\)`` \(§17\.4\) and ``execute\(\)`` returns ``Result\(success=False, stopped\_at\_step=\.\.\., error=StepAbortError\)``, chained to the step's error, or ``error=RollbackError`` if the abort rollback failed\.
+
 ## __17\.3 InterruptPolicy__
 
-InterruptPolicy declares how a MultiStepActionNode responds when the ActionMasterNode receives an interrupt request while the action is executing\.
+InterruptPolicy declares how a MultiStepActionNode responds when the ActionMasterNode receives a deliberative interrupt request \(and the shutdown interrupt, §15\.1\) while the action is executing\. It does not govern reflexes: what a reflex does to a running action is declared by the reflex's ``ReflexPreemption`` \(§17\.12\)\.
 
 __Policy__
 
@@ -812,19 +907,19 @@ __Behaviour on interrupt request__
 
 __ALWAYS__
 
-Stop at the next step boundary where interruptible=True\. If the current step is interruptible, stop immediately after it completes\. Fast and simple\.
+Stop at the next step boundary before a step with interruptible=True\. If the next step is interruptible, stop as soon as the current step completes\. Fast and simple\.
 
 __NEVER__
 
-Run the entire sequence to completion regardless\. The interrupt request is queued; the new action starts after this one finishes\. Models the biological fixed action pattern\.
+Run the entire sequence to completion regardless\. The interrupt request is ignored; the interrupting proposal stays parked for hand\-off \(§17\.6\) and starts once this action releases its resources, if that happens within ``max\_handoff\_ticks``\. Models the biological fixed action pattern\.
 
 __CHECKPOINT__
 
-Stop only at steps explicitly flagged as checkpoints \(interruptible=True AND checkpoint=True\)\. More selective than ALWAYS\.
+Stop only at boundaries before steps explicitly flagged as checkpoints \(interruptible=True AND checkpoint=True\)\. More selective than ALWAYS\.
 
 __ROLLBACK__
 
-Stop at the next interruptible step, then call rollback\(\) on each completed non\-interruptible step in reverse order before yielding control\.
+Stop at the next interruptible boundary, then call rollback\(\) on each completed non\-interruptible step in reverse order before yielding control\. Every rollback is attempted even if an earlier one raises; failures are collected and raised as one ``RollbackError`` \(``failures`` lists each step\), which ``execute\(\)`` reports as ``Result\(interrupted=True, rolled\_back=False, error=RollbackError\)``\.
 
 class InterruptPolicy\(Enum\):
 
@@ -843,6 +938,14 @@ Extends BaseActionNode\. The developer declares the step sequence and implements
 class MultiStepActionNode\(BaseActionNode, ABC\):
 
     interrupt\_policy: InterruptPolicy = InterruptPolicy\.ALWAYS
+
+    rollback\_on\_preempt: bool = False   \# run the rollback walk after
+
+                                        \# on\_preempted\(\) when a reflex preempts
+
+    \# Inherited from BaseActionNode \(§5\.7\): resources, safe\_stop\_timeout\_s,
+
+    \# on\_preempted\(\)
 
     @abstractmethod
 
@@ -890,11 +993,51 @@ class MultiStepActionNode\(BaseActionNode, ABC\):
 
     \) \-> None:
 
-        """Called after the sequence stops due to an interrupt\.
+        """Called after the sequence stops due to an interrupt \(ROLLBACK
 
-        Default: call rollback\(\) on completed non\-interruptible steps
+        policy\)\. Default: call rollback\(\) on completed non\-interruptible
 
-        in reverse order\. Override for custom cleanup logic\."""
+        steps in reverse order, attempting all of them, then raise one
+
+        aggregated RollbackError if any failed\. Override for custom
+
+        cleanup logic\."""
+
+    async def on\_aborted\(
+
+        self,
+
+        completed: list\[StepResult\],
+
+        failed\_step: ActionStep,
+
+        proposal: Proposal,
+
+    \) \-> bool:
+
+        """Called when a step aborts the sequence \(abort\_sequence=True,
+
+        step timeout, or execute\_step\(\) raised\)\. Default: under ROLLBACK
+
+        run the same rollback walk and return True; under every other
+
+        policy do nothing and return False\. Returns whether a rollback ran\."""
+
+    def request\_interrupt\(self, request: InterruptRequest\) \-> None:
+
+        """Set the interrupt flag; honoured at the next boundary the
+
+        policy allows\. Called by ActionMasterNode\."""
+
+    def request\_reflex\_preempt\(self, by: Proposal\) \-> None:
+
+        """Called by ActionMasterNode for a WAIT\_FOR\_BLOCK reflex: stop at
+
+        the first interruptible boundary after the current mandatory
+
+        block, whatever the interrupt\_policy, run the safe\-stop, and
+
+        return Result\(preempted=True\)\."""
 
     async def on\_step\_timeout\(
 
@@ -914,9 +1057,17 @@ class MultiStepActionNode\(BaseActionNode, ABC\):
 
 __Cooperative mid\-step interrupt\.__ The framework checks for interrupts *between* steps\. A single long\-running step \(an LLM call, a long subprocess\) cannot be interrupted by the framework on its own\. To let such a step yield mid\-execution, ``execute\_step\(\)`` may poll ``check\_interrupt\(\)`` and, when it returns True, stop and return ``StepResult\(\.\.\., interrupted=True\)``\. ``check\_interrupt\(\)`` returns True only when an interrupt is pending AND the current step may honour it: it returns False inside a non\-interruptible \(mandatory\) step and under ``InterruptPolicy\.NEVER``, and under ``CHECKPOINT`` it is True only at a checkpoint step\. It therefore can **never** bypass a mandatory completion block — the ``MandatoryBlockMonitor`` invariant holds\. As defense\-in\-depth, ``execute\(\)`` ignores an ``interrupted=True`` result returned from a non\-interruptible step\. Polling ``check\_interrupt\(\)`` is optional; steps that never call it behave exactly as before\.
 
+__Cancellation safety\.__ Independently of the cooperative path, a ``PREEMPT`` reflex \(§17\.12\), ``emergency\_stop\(\)``, graceful\-shutdown phase 4 and the node\-level ``timeout\_s`` cancel ``execute\(\)`` at its current ``await`` by delivering ``asyncio\.CancelledError`` — inside a mandatory block too\. Step code must therefore be cancellation\-safe\. A hardware call running in ``asyncio\.to\_thread\(\)`` cannot be cancelled and completes in its thread; the ``on\_preempted\(\)`` safe\-stop hook must cope with such an in\-flight command\.
+
 ## __17\.5 Mandatory Completion Blocks__
 
-A mandatory completion block is a sequence of consecutive steps where every step has interruptible=False\. The framework will never interrupt execution inside such a block, even if a reflex fires\. The maximum latency before a reflex action executes is therefore bounded by the sum of the remaining mandatory step timeouts — a property that can be asserted statically from the step definitions\.
+A mandatory completion block is a sequence of consecutive steps where every step has interruptible=False\. "Mandatory block atomicity" is three separate properties \(ADR 0005\):
+
+1\. __Deliberative atomicity__ \(enforced\)\. No deliberative interrupt cuts into a block: ``ActionMasterNode\.request\_interrupt\(\)`` raises ``MandatoryBlockViolation``, the decision layer never selects an owner inside a block for interruption, ``check\_interrupt\(\)`` returns False there, and an interrupt flag set before the block \(e\.g\. the shutdown interrupt\) is held until the first interruptible boundary after it\.
+2\. __Resource exclusivity__ \(enforced for declared resources\)\. While the action runs, no other action can own any of its declared ``resources`` \(§17\.12\)\.
+3\. __Bounded reflex admission__ \(derived, not guaranteed\)\. A reflex whose action needs the owner's resources is admitted within a bound computed from declared timeouts — immediately after the owner's safe\-stop under ``PREEMPT``, after the remaining block under ``WAIT\_FOR\_BLOCK``\. The bounds and their assumptions are in §17\.12; they are not hard real\-time guarantees\.
+
+A block can end before its last step only through: a ``ReflexPreemption\.PREEMPT`` reflex \(owner cancelled, safe\-stop, no rollback unless ``rollback\_on\_preempt``\); ``emergency\_stop\(\)`` \(§15\.3\); a step timeout, ``abort\_sequence=True`` or a raising step \(``on\_aborted\(\)``, §17\.2\); the node\-level ``timeout\_s`` \(``execute\(\)`` is cancelled and ``on\_timeout\(\)`` runs, without safe\-stop or rollback\); and graceful\-shutdown phase 4 cancelling an action that overran its block timeouts \(§15\.1\)\.
 
 \# Example: valve control sequence\.
 
@@ -946,67 +1097,117 @@ def steps\(self\) \-> list\[ActionStep\]:
 
         ActionStep\('close\_valve',
 
-                   interruptible=True,    \# ← safe stop point
+                   interruptible=False,
 
                    timeout\_s=2\.0\),
 
         ActionStep\('verify\_closed',
 
-                   interruptible=True,
+                   interruptible=True,    \# ← safe stop point before it
 
                    timeout\_s=1\.0\),
 
     \]
 
-\# Maximum reflex delay for this action = 2\.0 \+ 10\.0 \+ 2\.0 = 14 seconds
+\# Worst\-case time until the action leaves its mandatory block
 
-\# \(worst case: interrupt arrives just after open\_valve starts\)
+\# = 2\.0 \+ 10\.0 \+ 2\.0 = 14 seconds \(just after open\_valve starts\)\.
 
-\# This bound is computable statically from the step definitions\.
+\# No deliberative interrupt takes effect earlier\. A WAIT\_FOR\_BLOCK reflex is admitted within
+
+\# 14 s \+ safe\_stop\_timeout\_s; a PREEMPT reflex within safe\_stop\_timeout\_s
+
+\# \(§17\.12\)\. Both are computed from the declared timeouts\.
 
 ## __17\.6 Interrupt Flow in ActionMasterNode__
 
-ActionMasterNode is updated to track the currently executing action and handle interrupt requests from DecisionMasterNode\. The full interrupt flow is:
+ActionMasterNode tracks every running action, the resources it owns \(§17\.12\) and its dispatch origin \(``'reflex'``, ``'decision'`` or ``'direct'``\)\. The deliberative interrupt flow under the runtime is:
 
-\# 1\. New high\-priority proposal arrives while action A is running\.
+\# 1\. Decide: a selected proposal P conflicts with running owners O —
 
-\#    DecisionMasterNode calls ActionMasterNode\.request\_interrupt\(new\_proposal\)\.
+\#    same action\_id, a shared declared resource, or a resource claimed by
 
-\# 2\. ActionMasterNode checks A\.interrupt\_policy:
+\#    an armed reflex \(ActionMasterNode\.conflicting\_owners\)\.
 
-\#    NEVER     → queue new\_proposal, A continues to completion
+\# 2\. If every owner in O is running, interruptible right now \(not inside
 
-\#    ALWAYS    → set interrupt flag; A stops at next interruptible step
+\#    a mandatory block\), not reflex\-owned, and of lower priority than P:
 
-\#    CHECKPOINT→ set interrupt flag; A stops at next checkpoint step
+\#    DecisionMasterNode emits one InterruptRequest per owner
 
-\#    ROLLBACK  → set interrupt flag; A stops \+ rolls back
+\#    \(target\_action\_id = owner\) and returns P for dispatch\.
 
-\# 3\. When A yields \(stopped or completed\):
+\#    Otherwise P is held: not dispatched, kept only under the persist
 
-\#    ActionMasterNode dispatches new\_proposal to its ActionNode\.
+\#    rules \(§5\.6\)\. Deliberation never cuts into a mandatory block\.
 
-\# 4\. If A was in a mandatory block when interrupt arrived:
+\# 3\. The runtime calls ActionMasterNode\.request\_interrupt\(req, target\)\.
 
-\#    Interrupt flag is held\. A completes the block first\.
+\#    Inside a mandatory block it raises MandatoryBlockViolation \(logged
 
-\#    Then interrupt is applied at the next interruptible step\.
+\#    at WARNING\)\. Otherwise it sets the owner's interrupt flag:
+
+\#    ALWAYS     → owner stops at the next interruptible boundary
+
+\#    CHECKPOINT → owner stops at the next checkpoint boundary
+
+\#    ROLLBACK   → owner stops at the next interruptible boundary and
+
+\#                 rolls back
+
+\#    NEVER      → flag ignored; owner runs to completion
+
+\#    A single\-step BaseActionNode has no boundary and runs to completion\.
+
+\# 4\. Act: launch\(P\) is BLOCKED while an owner still holds the action or
+
+\#    its resources, so P is parked for hand\-off
+
+\#    \(DecisionMasterNode\.park\(\)\)\. Every tick the parked P re\-enters the
+
+\#    decision pool until it launches — immediately after the owners
+
+\#    release —, its instinct makes a new proposal \(which supersedes it\),
+
+\#    or max\_handoff\_ticks \(default 100\) pass\.
 
 \# Interface additions:
 
 class ActionMasterNode\(BaseNode\):
 
-    async def request\_interrupt\(self, new\_proposal: Proposal\) \-> None: \.\.\.
+    async def request\_interrupt\(
 
-    def current\_action\(self\) \-> BaseActionNode | None: \.\.\.
+        self, request: InterruptRequest, action\_id: str \| None = None,
 
-    def current\_step\(self\) \-> ActionStep | None: \.\.\.
+    \) \-> None:
 
-    def is\_interruptible\(self\) \-> bool:
+        """Target action\_id, else request\.target\_action\_id, else the
 
-        """True if the running action can be stopped right now\.
+        highest\-priority running action\. Raises MandatoryBlockViolation
 
-        False if inside a mandatory completion block\."""
+        inside a mandatory block\."""
+
+    def interrupt\_all\(self, request: InterruptRequest\) \-> None:
+
+        """Deliver request to every running multi\-step action, bypassing
+
+        the mandatory\-block gate \(the flag is held until the block
+
+        ends\)\. Used by graceful shutdown\."""
+
+    def current\_action\(self\) \-> BaseActionNode \| None: \.\.\.
+
+    def current\_step\(self, action\_id: str \| None = None\) \-> ActionStep \| None: \.\.\.
+
+    def is\_interruptible\(self, action\_id: str \| None = None\) \-> bool:
+
+        """True if the given \(or every\) running action can be stopped
+
+        right now\. False if inside a mandatory completion block\."""
+
+    def remaining\_mandatory\_s\(self\) \-> float:
+
+        """Longest remaining mandatory\-block time across running actions\."""
 
 ## __17\.7 InterruptRequest__
 
@@ -1024,15 +1225,57 @@ class InterruptRequest:
 
     timestamp: float = field\(default\_factory=time\.monotonic\)
 
+    target\_action\_id: str \| None = None   \# running action to stop; None →
+
+                                          \# new\_proposal\.action\_id
+
+Reflexes never issue InterruptRequests; they act through ``ReflexPreemption`` \(§17\.12\)\.
+
 ## __17\.8 DecisionMasterNode — Updated Behaviour__
 
-DecisionMasterNode now compares incoming proposals against the currently executing action\. If a new proposal has higher priority and the running action is interruptible, it issues an InterruptRequest rather than waiting for the next tick\.
+DecisionMasterNode compares the selected proposals against the running actions they conflict with and issues InterruptRequests per §17\.6\. It also holds the hand\-off pool of proposals that were selected but could not start yet\.
 
 class DecisionMasterNode\(BaseNode\):
 
-    async def decide\(self, proposals: list\[Proposal\]\) \-> Proposal | None:
+    def \_\_init\_\_\(self, bus, strategy=None, \.\.\., max\_pending\_ticks: int = 50,
+
+                 max\_handoff\_ticks: int = 100\): \.\.\.
+
+    async def decide\(self, proposals: list\[Proposal\]\) \-> Proposal \| None:
 
         """Existing behaviour: select from proposals\."""
+
+    async def on\_new\_proposals\_many\(
+
+        self,
+
+        proposals: list\[Proposal\],
+
+        running\_proposals: dict\[str, Proposal\],
+
+        running\_interruptible: dict\[str, bool\],
+
+        evaluated\_instinct\_ids: set\[str\] \| None = None,
+
+        conflicts: Callable\[\[Proposal\], set\[str\]\] \| None = None,
+
+    \) \-> tuple\[list\[Proposal\], list\[InterruptRequest\]\]:
+
+        """Entry point used by the runtime \(§17\.6\)\. ``conflicts`` maps a
+
+        proposal to the running action\_ids it conflicts with; the runtime
+
+        passes ActionMasterNode\.conflicting\_owners\. Without it only a
+
+        running action with the same action\_id conflicts\."""
+
+    def park\(self, proposal: Proposal\) \-> None:
+
+        """Hold a selected proposal for hand\-off \(§17\.6 step 4\)\."""
+
+    @property
+
+    def handoff\_proposals\(self\) \-> dict\[str, Proposal\]: \.\.\.
 
     async def on\_new\_proposals\(
 
@@ -1040,19 +1283,17 @@ class DecisionMasterNode\(BaseNode\):
 
         proposals: list\[Proposal\],
 
-        current\_action: BaseActionNode | None,
+        current\_proposal: Proposal \| None,
 
-        current\_proposal: Proposal | None,
+        action\_is\_interruptible: bool,
 
-    \) \-> Proposal | None:
+    \) \-> tuple\[Proposal \| None, InterruptRequest \| None\]:
 
-        """Extended entry point\. If a proposal outranks the running
+        """Single\-action form for runtime\-less callers: if the chosen
 
-        action and the action reports is\_interruptible\(\), emit an
+        proposal outranks current\_proposal and the action is
 
-        InterruptRequest to ActionMasterNode and return the new proposal\.
-
-        Otherwise return decide\(proposals\) as normal\."""
+        interruptible, also return an InterruptRequest\."""
 
 ## __17\.9 Context — Action Execution State__
 
@@ -1070,7 +1311,17 @@ class ActionExecutionState:
 
     interruptible: bool             \# True if safe to interrupt right now
 
-    mandatory\_block\_remaining\_s: float  \# worst\-case time to next safe stop
+    mandatory\_block\_remaining\_s: float  \# worst\-case remaining time of the
+
+                                        \# block the action is in now: the
+
+                                        \# current step plus the contiguous
+
+                                        \# non\-interruptible steps after it
+
+                                        \# \(0 outside a block; later blocks
+
+                                        \# are not counted\)
 
 \# Added to Context:
 
@@ -1082,15 +1333,23 @@ class Context:
 
     action\_state: ActionExecutionState | None = None
 
+    action\_states: list\[ActionExecutionState\]   \# every running multi\-step
+
+                                                \# action, refreshed each tick
+
 ## __17\.10 Example: Robotic Arm Pick\-and\-Place__
 
-A complete example showing a five\-step action with one mandatory block, ROLLBACK interrupt policy, and a reflex interaction\.
+A complete example showing a six\-step action with one mandatory block, ROLLBACK interrupt policy, declared resources, a safe\-stop hook, and a reflex interaction\.
 
 class PickAndPlaceActionNode\(MultiStepActionNode\):
 
     node\_id = 'PickAndPlaceActionNode'
 
     interrupt\_policy = InterruptPolicy\.ROLLBACK
+
+    resources = frozenset\(\{'arm', 'gripper'\}\)
+
+    safe\_stop\_timeout\_s = 0\.5
 
     def steps\(self\) \-> list\[ActionStep\]:
 
@@ -1158,13 +1417,22 @@ class PickAndPlaceActionNode\(MultiStepActionNode\):
 
             \# \.\.\. remaining steps \.\.\.
 
+    async def on\_preempted\(self, proposal, preempted\_by\):
+
+        await self\.\_arm\.brake\(\)          \# hold position, keep the grip
+
     async def \_raise\_gripper\(self\):  await self\.\_arm\.raise\_\(\)
 
     async def \_open\_gripper\(self\):   await self\.\_arm\.open\(\)
 
     async def \_lower\_gripper\(self\):  await self\.\_arm\.lower\(\)
 
-If a CollisionReflex fires while the arm is mid\-block \(steps 2–4\), the interrupt is held until step 4 completes\. Then ROLLBACK runs: open\_gripper, lower\_gripper \(in reverse\), then control passes to EmergencyStopActionNode\. Maximum interrupt latency for this scenario: 1\.5 \+ 2\.0 = 3\.5 seconds — bounded and statically computable\.
+Assume a CollisionReflex whose action ``EmergencyRetractActionNode`` declares ``resources = frozenset\(\{'arm'\}\)``, and that it fires while the arm is mid\-block \(steps 2–4\):
+
+- **``preemption = ReflexPreemption\.PREEMPT``** \(default\): the pick is cancelled at its current ``await``, ``on\_preempted\(\)`` brakes the arm, the pick's Result has ``preempted=True`` and no rollback runs; then the retract starts\. Admission delay ≤ ``safe\_stop\_timeout\_s`` = 0\.5 s\.
+- **``preemption = ReflexPreemption\.WAIT\_FOR\_BLOCK``**: the reflex is armed and claims ``arm``; the block runs to its end; at the boundary before ``move\_to\_target`` the pick stops — regardless of ROLLBACK — runs ``on\_preempted\(\)``, releases, and the retract starts\. Admission delay ≤ remaining block \+ ``safe\_stop\_timeout\_s``; worst case \(just after ``lower\_gripper`` starts\) 2\.0 \+ 1\.5 \+ 2\.0 \+ 0\.5 = 6\.0 s\.
+
+A **deliberative** proposal for the same resources \(say a priority\-120 obstacle\-avoidance instinct\) is held while the pick is in the block\. Once the block has ended and the pick is in an interruptible step, the decision layer interrupts it; the pick stops at the next interruptible boundary and ROLLBACK walks the completed block in reverse: ``\_lower\_gripper`` \(undoes raise\_gripper\), ``\_open\_gripper`` \(undoes close\_gripper\), ``\_raise\_gripper`` \(undoes lower\_gripper\)\. The proposal is parked meanwhile and launches as soon as the pick releases\.
 
 ## __17\.11 Directory Structure — Additions__
 
@@ -1174,9 +1442,80 @@ arachnite/
 
         action\.py       \# BaseActionNode, MultiStepActionNode,  ← updated
 
-                        \# ActionMasterNode
+                        \# ActionMasterNode, LaunchStatus, LaunchOutcome
 
     models\.py           \# \+ ActionStep, StepResult, InterruptPolicy,  ← updated
 
-                        \#   InterruptRequest, ActionExecutionState
+                        \#   InterruptRequest, ActionExecutionState,
+
+                        \#   ReflexPreemption
+
+## __17\.12 Reflex–Action Arbitration__
+
+Actions run as tasks \(§7\.2\), so a reflex can fire while another action is executing — including inside its mandatory block\. This section defines what happens when the reflex's action needs something the running action holds \(ADR 0005\)\.
+
+__Resources and conflicts\.__ ``BaseActionNode\.resources`` names the actuators an action commands\. A proposal **conflicts** with a running action when they share the ``action\_id`` or any declared resource\. ActionMasterNode reserves the action and all its resources synchronously, before ``execute\(\)`` is started as a task, and releases them when the task ends\. This gives **actuator exclusivity**: at most one running action owns a given resource at any time\. An action with no declared resources conflicts only on its own ``action\_id``; ``ActionMasterNode\(strict\_resources=True\)`` rejects such actions at registration\. A deliberative launch that conflicts returns ``LaunchStatus\.BLOCKED`` and is not started\.
+
+class ReflexPreemption\(Enum\):
+
+    PREEMPT        = 'preempt'          \# default
+
+    WAIT\_FOR\_BLOCK = 'wait\_for\_block'
+
+class BaseReflexInstinctNode\(BaseInstinctNode\):
+
+    preemption: ReflexPreemption = ReflexPreemption\.PREEMPT
+
+class BaseActionNode\(BaseNode\):
+
+    resources: frozenset\[str\] = frozenset\(\)
+
+    safe\_stop\_timeout\_s: float = 1\.0
+
+    async def on\_preempted\(self, proposal: Proposal,
+
+                           preempted\_by: Proposal\) \-> None:
+
+        """Forward safe\-stop \("brake, keep the grip"\)\. Default: no\-op\."""
+
+__Arbitration\.__ The runtime launches every reflex proposal with ``ActionMasterNode\.launch\_reflex\(proposal, node\.preemption\)``\. When the reflex must wait, it is **armed**: it claims its resources, so ``conflicting\_owners\(\)`` reports the claim and no deliberative proposal can launch on them meanwhile\. The armed reflex starts the moment its last owner releases — from the owner's task, before any later tick — and armed reflexes are admitted in priority order\. To **preempt** an owner, its task is cancelled at its current ``await`` \(even inside a mandatory block\), ``on\_preempted\(\)`` runs bounded by ``safe\_stop\_timeout\_s`` \(a hook that raises or overruns is logged and abandoned\), and the rollback walk runs only if the owner sets ``rollback\_on\_preempt = True``\. The owner's Result has ``preempted=True`` and ``interrupted=True`` and is never retried\.
+
+__Decision table\.__ T\_admit is the time from ``launch\_reflex\(\)`` to the reflex action's ``execute\(\)`` being entered\. With several owners each is handled by its row, and T\_admit is the maximum\.
+
+| Holder of the reflex action's action\_id or resources | ``preemption`` | Outcome \(``LaunchStatus``\) | T\_admit upper bound |
+|---|---|---|---|
+| none, or only disjoint resources | any | ``LAUNCHED`` — starts now, concurrently with other actions | one event\-loop turn |
+| deliberative or direct action, not inside a mandatory block | any | ``ARMED`` — owner preempted now | ``safe\_stop\_timeout\_s`` \(\+ rollback walk if ``rollback\_on\_preempt``\) |
+| deliberative or direct action, inside a mandatory block | ``PREEMPT`` | ``ARMED`` — owner preempted now; the block is cut | ``safe\_stop\_timeout\_s`` \(\+ rollback walk if ``rollback\_on\_preempt``\) |
+| deliberative or direct action, inside a mandatory block | ``WAIT\_FOR\_BLOCK`` | ``ARMED`` — the block finishes; the owner stops at the first interruptible boundary after it, whatever its ``InterruptPolicy``, runs ``on\_preempted\(\)`` and releases | R\_block \+ ``safe\_stop\_timeout\_s`` \(\+ rollback walk if ``rollback\_on\_preempt``\), R\_block = owner's ``mandatory\_block\_remaining\_s`` when the reflex was armed |
+| a running reflex action \(shared resource\) | any | ``ARMED`` — a reflex never preempts a reflex; waits for it to finish | remaining run of that action, ≤ \(``max\_retries`` \+ 1\) × ``timeout\_s`` |
+| the same ``action\_id`` already running or armed as a reflex | any | ``DEDUPED`` — already being handled | — |
+| no ActionNode with that ``action\_id`` | any | ``NOT\_FOUND`` — logged at WARNING | — |
+
+A deliberative proposal is never admitted this way: it is dispatched, interrupts lower\-priority interruptible owners, or is held \(§17\.6\)\. Reflex dispatches \(``origin='reflex'``\) bypass ActionGuards; deliberative ones never do, whatever their priority\.
+
+__Enforced by the framework\.__
+
+- Actuator exclusivity for declared resources; armed reflexes' claims block deliberative launches\.
+- Deliberative atomicity of mandatory blocks \(§17\.5\)\.
+- Preemption, arming, reflex\-over\-reflex waiting and de\-duplication as in the table\.
+- The ``safe\_stop\_timeout\_s`` bound on ``on\_preempted\(\)`` and the ``reflex\_eval\_timeout\_s`` bound on event\-lane evaluation\.
+- No retry after a run that was interrupted, was preempted, or ended with a ``RollbackError``\.
+
+__Delegated to the application\.__
+
+- Declaring ``resources`` completely\. Actuator access that is not declared, or that happens outside an ActionNode, is invisible to the framework\.
+- Cancellation\-safe step code, and an ``on\_preempted\(\)`` that brings the hardware to a safe hold within ``safe\_stop\_timeout\_s`` and copes with a command still running in ``asyncio\.to\_thread\(\)``\.
+- Choosing ``PREEMPT`` or ``WAIT\_FOR\_BLOCK`` per reflex, and ``rollback\_on\_preempt`` per action\.
+- Bounding rollback callables, ``read\(\)`` and reflex ``evaluate\(\)``: the framework has no timeout on them \(event\-lane evaluation excepted\)\.
+- Co\-locating a reflex with its action and with the sense nodes that feed it \(§10\.4\)\.
+- Certified or hard real\-time safety functions, which belong in a separate safety controller \(process or MCU\)\.
+
+__Timing: bound vs\. measurement\.__ From stimulus to reflex action, T\_reflex = T\_detect \+ T\_eval \+ T\_admit, with upper bounds:
+
+- T\_detect, until a signal carrying the stimulus is published\. Polled sensor \(either mode\): ≤ max\(1/tick\_rate\_hz, poll\_interval\_s\) \+ the slowest ``read\(\)`` of the sense stage \+ any overrun of the tick in progress\. Pushed signal \(``reflex\_mode='event'``, ``push\(\)``\): ≈ 0, the lane runs inside ``push\(\)``\.
+- T\_eval\. ``'tick'`` mode: context update \+ reflex ``evaluate\(\)`` \(no framework timeout\)\. Event lane: ≤ ``reflex\_eval\_timeout\_s``\.
+- T\_admit: the decision table\.
+
+Summing these bounds gives a **deterministic worst case derived from declared timeouts** — under four assumptions: \(A1\) no node code blocks the event loop, since any synchronous segment delays every tick, lane and safe\-stop by its length; \(A2\) the stimulus persists for at least one sampling period, or is pushed — a shorter, unpushed stimulus can be missed; \(A3\) ``read\(\)``, reflex ``evaluate\(\)``, hooks and rollback callables are bounded and reach an ``await`` so their timeouts can take effect; \(A4\) GC pauses, OS scheduling, GIL contention from worker threads and transport latency are not modelled\. These bounds are not hard real\-time guarantees\. The latencies reported by the benchmarks \(§22\.3\) are **empirical** statistics of one host and load: their P99 includes the effects excluded by A4, and is not a bound\.
 

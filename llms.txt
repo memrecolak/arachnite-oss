@@ -450,7 +450,7 @@ await rt.register_sense_live(CameraSenseV2(bus=rt.bus))
 
 Opt-in hook delivering wall-clock duration of each pipeline stage per tick. Zero cost when
 not installed (one branch-predicted null check per stage). Errors from the instrumenter are
-caught, logged at WARNING, and never fail the tick (ADR 0003).
+caught, logged at WARNING, and never fail the tick.
 
 - `TickInstrumenter` — `@runtime_checkable` `typing.Protocol` with `on_stage(stage: str, duration_s: float) -> None` and `on_tick_complete(tick_index: int, total_s: float) -> None`.
 - `TICK_STAGE_NAMES: tuple[str, ...] = ("sense", "context", "reflex", "instinct", "decide", "act")` — six stages in pipeline order.

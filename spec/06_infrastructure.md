@@ -193,15 +193,24 @@ The framework automatically emits the following LogEvents without any developer 
 | Event              | Level   | Message                              | Trigger / data                                                                                  |
 |--------------------|---------|--------------------------------------|--------------------------------------------------------------------------------------------------|
 | `tick.overrun`     | WARNING | `"Tick overrun"`                     | Tick took longer than `interval × (1 + overrun_warn_pct)` for `overrun_warn_consecutive` consecutive ticks \(default 3\)\. Data: `tick`, `overrun_ms`, `elapsed_ms`, `interval_ms`, `consecutive`\. |
-| `reflex.fired`     | INFO    | `"Reflex fired"`                     | Each `ReflexInstinctNode` activation, before dispatch\. Data: `instinct_id`, `action_id`, `priority`, `urgency`\. |
-| `action.dispatched`| INFO    | `"Dispatching action"`               | `ActionMasterNode._dispatch_one()` starts execution\. Data: `action_id`, `priority`\.            |
-| `action.completed` | INFO    | `"Action complete"`                  | `ActionNode.execute()` returned a `Result`\. Data: `action_id`, `success`, `duration_ms`\.       |
-| `action.interrupted`| INFO   | `"Action interrupted"`               | An `InterruptRequest` was honoured\. Data: `action_id`, `step_name`\.                            |
+| `reflex.fired`     | INFO    | `"Reflex fired"`                     | Each `ReflexInstinctNode` activation, before `launch_reflex()`\. Data: `instinct_id`, `action_id`, `priority`, `urgency`\. |
+| `reflex.armed`     | INFO    | `"Reflex armed; taking resources from running action(s)"` | `launch_reflex()` returned `ARMED`\. Data: `action_id`, `owners`, `preemption`\. |
+| `reflex.not_found` | WARNING | `"Reflex dispatch skipped: action not found"` | A reflex proposal names no registered action\. Data: `action_id`, `instinct_id`\. |
+| `reflex.conflict`  | ERROR   | `"Reflex priority conflict; dispatching all in priority order"` | `reflex_conflict='raise'` and equal top priorities; the reflexes are still launched\. Data: `priority`, `instinct_ids`\. |
+| `reflex.lane_failed` | ERROR | `"Event-lane reflex evaluation timed out"` / `"Event-lane reflex evaluation failed"` | Event\-lane evaluation exceeded `reflex_eval_timeout_s` or raised\. Data: `signal_kind` and `timeout_s` or `error`\. |
+| `action.dispatched`| INFO    | `"Dispatching action"`               | `ActionMasterNode` reserved an action and started its task \(`launch()`, `launch_reflex()`, `dispatch()`\)\. Data: `action_id`, `priority`, `origin`\. |
+| `action.preempting`| INFO    | `"Preempting action for reflex"`     | A reflex cancels a running owner\. Data: `action_id`, `reflex_action`, `reflex`\.               |
+| `action.preempt_after_block` | INFO | `"Reflex armed; owner preempted after its mandatory block"` | `WAIT_FOR_BLOCK` reflex armed against an owner inside a block\. Data: `action_id`, `owner`\. |
+| `action.preempted_at_boundary` | INFO | `"Action preempted by reflex at step boundary"` | The owner reached the boundary after its block and hands over\. Data: `stopped_at`, `reflex`\. |
+| `action.safe_stop_failed` | ERROR | `"Safe-stop hook timed out"` / `"Safe-stop hook raised"` | `on_preempted()` overran `safe_stop_timeout_s` or raised; the reflex is not held back\. |
+| `action.cancelled` | INFO    | `"Action cancelled; safe-stop complete"` | An action was cancelled by `emergency_stop()`, shutdown or `cancel()`, after its safe\-stop\. Data: `action_id`, `stopped_at`\. |
+| `action.completed` | INFO    | `"Action complete"`                  | An action's task finished with a `Result`\. Data: `action_id`, `success`, `preempted`, `duration_ms`\. |
+| `action.interrupted`| INFO   | `"Action interrupted"`               | An `InterruptRequest` was honoured\. Data: `stopped_at`, `policy`\.                              |
+| `interrupt.blocked`| WARNING | `"Interrupt blocked by mandatory step"` | A deliberative interrupt targeted an action inside a mandatory block \(`MandatoryBlockViolation`\)\. Data: `action_id`, `detail`\. |
 | `step.completed`   | DEBUG   | `"Step complete"`                    | `MultiStepActionNode` finished one `ActionStep`\. Data: `step`, `duration_ms`\.                   |
 | `transport.connected` | INFO | `"Transport connected"`              | `BaseTransport.connect()` succeeded\. Data: `transport` \(class name\)\.                          |
 | `transport.disconnected` | INFO | `"Transport disconnected"`        | `BaseTransport.disconnect()` called\. Data: `transport` \(class name\)\.                          |
-| `emergency_stop.initiated` | INFO | `"Emergency stop initiated"`    | `ArachniteRuntime.emergency_stop()` called, before the interrupt\-delivery loop\.                 |
-| `emergency_stop.interrupt_delivered` | INFO | `"Emergency interrupt delivered"` | One running action received the emergency interrupt\. Data: `action_id`\.                    |
+| `emergency_stop.initiated` | INFO | `"Emergency stop initiated"`    | `ArachniteRuntime.emergency_stop()` called, before the tick loop is cancelled and running actions are safe\-stopped\. |
 
 __High\-frequency events are not auto\-emitted by design\.__ The following are intentionally *not* emitted by the framework on every occurrence, because doing so would add per\-tick or per\-signal overhead in the hot path\. Users who need them opt in:
 

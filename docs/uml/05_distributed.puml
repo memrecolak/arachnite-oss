@@ -169,7 +169,9 @@ note right of DeploymentManifest
   Co-location invariant:
   every ReflexInstinctNode must run on
   the same AgentNode as its target
-  ActionNode (validated at startup).
+  ActionNode (validated at startup)
+  and as the SenseNodes that feed it
+  (deployment rule, not validated).
 end note
 
 @enduml

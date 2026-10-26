@@ -84,7 +84,7 @@ Let t₀ be the `time.perf_counter()` reading immediately before `tick()` is cal
 
 L_tick = t₁ − t₀
 
-This excludes `asyncio.sleep()` scheduling overhead from the tick loop. The metric captures only the time spent inside the pipeline: sense → context → reflex → instinct → decide → act.
+This excludes `asyncio.sleep()` scheduling overhead from the tick loop. The metric captures only the time spent inside the pipeline: sense → context → reflex → instinct → decide → act. Since ADR 0005 the `act` stage launches actions as tasks and does not wait for them, so `L_tick` covers launch cost only; `execute()` runs outside the measured interval.
 
 ### 22\.2\.2 Protocol
 
@@ -110,7 +110,7 @@ The theoretical per-tick complexity of the pipeline is:
 | InstinctMasterNode.evaluate_reflexes() | O(R) concurrent |
 | InstinctMasterNode.evaluate_all() | O(I) concurrent |
 | DecisionMasterNode.decide() | O(P log P) where P = proposals |
-| ActionMasterNode.dispatch() | O(1) lookup by node_id |
+| ActionMasterNode.launch() / launch_reflex() | O(1) lookup by node_id + O(r) conflict check over r declared resources |
 | SignalBus.publish() | O(K) where K = subscribers |
 
 Total: O(S + R + I + P log P + K), dominated by the number of leaf nodes.
@@ -133,7 +133,7 @@ This covers the latency introduced by:
 
 - `ContextNode.update()` — integrating the signal into the context snapshot
 - `InstinctMasterNode.evaluate_reflexes()` — evaluating all reflex nodes
-- `ActionMasterNode.dispatch()` — looking up and calling the target action
+- `ActionMasterNode.launch_reflex()` — lookup, conflict check, resource reservation and task creation, plus the one event-loop yield after which the reflex action's `execute()` is entered
 
 It excludes hardware I/O latency (sensor read time and actuator write time), which are hardware-dependent and not attributable to the framework.
 
@@ -153,15 +153,27 @@ Each trial consists of two ticks: a prime tick (no collision) followed by a fire
 
 ### 22\.3\.3 Bounded Worst-Case
 
-For a reflex that fires when no MultiStepActionNode is running, the worst-case framework latency is one tick interval plus the reflex evaluation time:
+The measured T_reflex is an **empirical** distribution: its median and P99 describe one host under one load and include GC pauses, OS scheduling and other effects that no analytic bound covers. The P99 is not a bound. The analytic worst case below is **derived from declared timeouts** under the assumptions of §17.12 (no node code blocks the event loop; the stimulus persists for at least one sampling period or is pushed; reads, reflex evaluation, hooks and rollbacks are bounded; GC/OS pauses excluded). It is not a hard real-time guarantee.
 
-T_worst = 1/tick_rate_hz + T_evaluate_reflexes + T_dispatch
+From stimulus to reflex action, with no other action holding the reflex action's `action_id` or resources:
 
-When a MultiStepActionNode with a mandatory completion block is running, the worst-case is bounded by:
+T_worst = T_detect + T_eval + T_launch
 
-T_worst_mandatory = T_remaining_mandatory + T_evaluate_reflexes + T_dispatch
+- T_detect ≤ max(1/tick_rate_hz, poll_interval_s) + the slowest `read()` + any overrun of the tick in progress, for a polled sensor; ≈ 0 for a signal delivered with `BaseSenseNode.push()` under `reflex_mode='event'`.
+- T_eval = `ContextNode.update()` + `evaluate_reflexes()` in `'tick'` mode; ≤ `reflex_eval_timeout_s` in the event lane.
+- T_launch = `launch_reflex()` + one event-loop turn.
 
-where T_remaining_mandatory = Σ timeout_s for all remaining non-interruptible steps. This bound is statically computable from the step definitions (see §17.5).
+When a running action holds the reflex action's `action_id` or a shared declared resource, the reflex is armed and an admission term is added:
+
+T_worst_conflict = T_detect + T_eval + T_admit
+
+where T_admit, per the decision table of §17.12, is:
+
+- `safe_stop_timeout_s` of the owner under `PREEMPT`, or under `WAIT_FOR_BLOCK` when the owner is outside a mandatory block;
+- R_block + `safe_stop_timeout_s` under `WAIT_FOR_BLOCK` with the owner inside a block, where R_block = Σ timeout_s of the current step and the non-interruptible steps contiguous with it (the owner's `mandatory_block_remaining_s`);
+- the remaining run of the owner, ≤ (max_retries + 1) × timeout_s, when the owner is itself a reflex action.
+
+A rollback walk (`rollback_on_preempt=True`) adds its own duration, which the framework does not bound. The deliberative counterpart — the time before a deliberative interrupt can take effect, at most R_block — is probed by §22.12.
 
 ### 22\.3\.4 Source
 
@@ -253,7 +265,7 @@ __Expected behaviour:__ Throughput should be approximately constant across subsc
 
 ### 22\.6\.2 Concurrent Action Dispatch
 
-__Metric:__ Tick latency when the `DecisionMasterNode` selects multiple proposals for concurrent dispatch via `dispatch_many()`.
+__Metric:__ Tick latency when the `DecisionMasterNode` selects multiple proposals and the runtime launches each one with `ActionMasterNode.launch()`. The actions run as tasks, so the metric covers selection and launch cost, not execution.
 
 __Protocol:__
 
@@ -314,7 +326,7 @@ Per-stage samples are fed through `DescriptiveStats.from_runs(medians, samples, 
 
 ### 22\.7\.4 `TickInstrumenter` Notes
 
-The `reflex` stage fuses reflex evaluation and reflex dispatch: the reflex arc is a decision-bypass arc, so `evaluate_reflexes()` and the sequential dispatch loop execute as one logical stage, and the stage label in the output sub-table SHOULD be annotated "reflex (evaluate + dispatch)" to avoid asymmetry with the `instinct` stage, which measures `evaluate_all()` only (normal instinct proposals dispatch in the `act` stage). The `sense` stage charges the `notify_tick_start` gather and supervisor-signal-buffer drain; the `act` stage charges the `notify_tick_end` gather. Instrumenter exceptions are caught, logged at WARNING, and do not fail the tick; see §7.5 for the error-isolation contract (ADR 0003). Samples for failing stages may be dropped from the collector but the tick continues.
+The `reflex` stage fuses reflex evaluation and reflex launch: the reflex arc is a decision-bypass arc, so `evaluate_reflexes()` and the `launch_reflex()` loop execute as one logical stage, and the stage label in the output sub-table SHOULD be annotated "reflex (evaluate + launch)" to avoid asymmetry with the `instinct` stage, which measures `evaluate_all()` only (normal instinct proposals launch in the `act` stage). Both `reflex` and `act` measure launch cost only; action execution runs in tasks outside every stage. In `reflex_mode='event'`, reflexes with `trigger_on_signals` are evaluated inside `read_all()` and are charged to the `sense` stage. The `sense` stage charges the `notify_tick_start` gather and supervisor-signal-buffer drain; the `act` stage charges the `notify_tick_end` gather. Instrumenter exceptions are caught, logged at WARNING, and do not fail the tick; see §7.5 for the error-isolation contract. Samples for failing stages may be dropped from the collector but the tick continues.
 
 ### 22\.7\.5 Source
 
@@ -456,7 +468,7 @@ For publication-grade results, run on a quiet system with minimal background pro
 
 ## __22\.12 Multi-Step Action Latency__
 
-Measures interrupt and rollback latency on `MultiStepActionNode` across the framework's three interrupt policies (`InterruptPolicy.ALWAYS`, `CHECKPOINT`, `ROLLBACK`) and empirically probes the `T_worst_mandatory` bound declared in §22.3.3 by firing `request_interrupt()` inside a non-interruptible block. The benchmark does NOT exercise `ArachniteRuntime.emergency_stop()` end-to-end: that method tears down all four master nodes synchronously with interrupt delivery, so wall-clock at the call site is dominated by teardown, not by interrupt-delivery semantics; isolating the two would require a framework-level hook.
+Measures interrupt and rollback latency on `MultiStepActionNode` across the framework's three interrupt policies (`InterruptPolicy.ALWAYS`, `CHECKPOINT`, `ROLLBACK`) and empirically probes the deliberative mandatory-block bound R_block of §22.3.3 by firing `request_interrupt()` on the node inside a non-interruptible block. It calls `execute()` directly, without the runtime, so it measures the node's interrupt semantics, not the `ActionMasterNode` gate or reflex arbitration. The benchmark does NOT exercise `ArachniteRuntime.emergency_stop()` end-to-end: that method cancels the tick loop, safe-stops every running action and tears down all four master nodes, so wall-clock at the call site is dominated by teardown, not by interrupt-delivery semantics; isolating the two would require a framework-level hook.
 
 ### 22\.12\.1 Formal Definition
 
@@ -478,9 +490,9 @@ is the same shape as the previous two. The per-completed-step rollback overhead 
 
 where N_rolled_back is the number of rollback callables that fired. Direct timing of the rollback walk isolates pure rollback cost from setup overhead (interrupt-task wait, post-step check, `_handle_interrupt` entry), which would inflate the per-step metric if computed from the outer wall-clock.
 
-__Mandatory-block worst-case.__ The action contains three steps, the middle one flagged `interruptible=False`. `request_interrupt(...)` is fired via the node's public setter while the mandatory step is in flight. The benchmark records the wall-clock of the mandatory block itself plus a boolean probe asserting (i) the mandatory step completes (not preempted), (ii) the interrupt is honoured at the next interruptible boundary, and (iii) the post-mandatory `finish` step is skipped. The sample is the empirical analogue of the formal bound §22.3.3:
+__Mandatory-block worst-case.__ The action contains three steps, the middle one flagged `interruptible=False`. `request_interrupt(...)` is fired via the node's public setter while the mandatory step is in flight. The benchmark records the wall-clock of the mandatory block itself plus a boolean probe asserting (i) the mandatory step completes (not preempted), (ii) the interrupt is honoured at the next interruptible boundary, and (iii) the post-mandatory `finish` step is skipped. The sample is the empirical analogue of the derived bound of §22.3.3:
 
-> T_worst_mandatory ≥ Σ timeout_s for all remaining non-interruptible steps
+> measured block duration ≤ R_block = Σ timeout_s for the remaining non-interruptible steps of the block
 
 ### 22\.12\.2 Protocol
 
@@ -488,7 +500,7 @@ __Mandatory-block worst-case.__ The action contains three steps, the middle one 
 |-----------|-------|
 | Actions | 4 benchmark-private `MultiStepActionNode` subclasses (one per scenario) |
 | Step busy time | `asyncio.sleep(0.0005)` per step (interruptible); 10 inner awaits inside the mandatory block |
-| Interrupt scheduler | `asyncio.create_task()` fired *after* `execute()` is entered (`execute()` resets `_interrupt_requested = False` on entry, so early scheduling is discarded) |
+| Interrupt scheduler | `asyncio.create_task()` fired *after* `execute()` is entered (a direct `execute()` call resets `_interrupt_requested = False` on entry, so early scheduling is discarded) |
 | Iterations per run | 500 (default) |
 | Default runs | 5 (publication runs use 30 per §22.1.1) |
 | Timer | `time.perf_counter()` |

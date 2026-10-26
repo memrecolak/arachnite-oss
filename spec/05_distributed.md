@@ -171,7 +171,7 @@ class AgentNode:
 
 Reflex instinct nodes must be co\-located with the action nodes they trigger\. A reflex that detects a collision on a Raspberry Pi but dispatches to an EmergencyStopActionNode running on a cloud server would have its response time dominated by network latency — defeating the entire purpose of the reflex arc\.
 
-Arachnite enforces this at startup via the co\-location validator\. When a DeploymentManifest is loaded, the validator checks every ReflexInstinctNode against its target action\_id and raises CoLocationError if the action node is assigned to a different AgentNode\.
+Arachnite enforces this at startup via the co\-location validator\. When a DeploymentManifest is loaded, the validator checks every ReflexInstinctNode against its target action\_id \(the manifest ``action\_id`` key\) and raises ManifestValidationError — carrying a CoLocationError message — if the action node is assigned to a different AgentNode, or if the reflex declares no action\_id or names an action that no AgentNode registers\.
 
 \# Co\-location rule \(enforced at manifest load time\):
 
@@ -188,6 +188,8 @@ Arachnite enforces this at startup via the co\-location validator\. When a Deplo
 \# Normal InstinctNodes have no co\-location constraint —
 
 \# their proposals travel over the bus to any AgentNode\.
+
+The constraint covers the reflex's **inputs** as well, but the validator checks only the reflex → action edge\. A reflex in the tick's reflex stage sees ``ctx\.signals``, which hold the signals returned by the **local** SenseMasterNode \(plus buffered supervisor, node\_fault and state\_update signals\); a sense signal arriving from another AgentNode over the transport never enters ``ctx\.signals``, so a reflex fed only by a remote sensor never fires\. In ``reflex\_mode='event'`` the reflex lane subscribes on the bus and would also receive transport\-delivered signals, but then network latency is on the reflex path\. The SenseNodes that feed a reflex MUST therefore be assigned to the reflex's AgentNode — a deployment rule the manifest author is responsible for\.
 
 ## __10\.5 Signal Routing__
 
@@ -341,6 +343,10 @@ agents:
 
           priority: 200
 
+          action\_id: EmergencyStopActionNode   \# required for reflexes
+
+                                               \# \(co\-location target\)
+
         \- kind: OverheatInstinct
 
           priority: 100
@@ -419,7 +425,9 @@ manifest = DeploymentManifest\.from\_yaml\('arachnite\-manifest\.yaml'\)
 
 \#   \- all referenced node classes are importable
 
-\#   \- every reflex node is co\-located with its target action node
+\#   \- every reflex node declares its target action\_id and is co\-located
+
+\#     with that action node \(the sense nodes feeding it are not checked\)
 
 \#   \- no duplicate node\_ids within an AgentNode
 
@@ -455,7 +463,7 @@ class NodeAssignment:
 
     is\_reflex: bool = False
 
-    co\_location\_target: str | None = None  \# action\_id for reflex nodes
+    reflex\_action\_id: str | None = None  \# manifest action\_id of a reflex node
 
 ### __11\.3\.1 Permission Whitelist__
 
@@ -519,6 +527,8 @@ class MeshRuntime:
         Remote agent health is inferred from their SupervisorSignals\."""
 
 ## __11\.5 Deployment Topology Examples__
+
+The examples below are abbreviated: each reflex entry also needs the ``action\_id`` key shown in §11\.1, and every reflex shares its AgentNode with its action and with the sense nodes that feed it \(§10\.4\)\.
 
 ### __Single Edge Device__
 

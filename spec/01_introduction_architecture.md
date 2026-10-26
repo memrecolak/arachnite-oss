@@ -96,7 +96,7 @@ Monitor, restart, and report node health
 
 ## __2\.1 Execution Pipeline__
 
-Each runtime tick of an Arachnite agent executes the following pipeline\. Reflex instincts are evaluated first and short\-circuit the decision layer if triggered:
+Each runtime tick of an Arachnite agent executes the following pipeline\. Reflex instincts are evaluated first and short\-circuit the decision layer if triggered\. Actions are launched as tasks and run across later ticks; the tick never waits for them \(ADR 0005\):
 
 SenseMasterNode\.read\_all\(\)
 
@@ -112,21 +112,29 @@ InstinctMasterNode\.evaluate\_reflexes\(context\)   ← NEW
 
     └─ each ReflexInstinctNode\.evaluate\(ctx\) → Proposal | None
 
-    └─ if any reflex fires → dispatch immediately, skip decision step
+    └─ if any reflex fires → ActionMasterNode\.launch\_reflex\(proposal\),
+
+       skipping the decision step; takes actuators from running actions
+
+       per the reflex's ReflexPreemption \(§17\.12\)
 
 InstinctMasterNode\.evaluate\_all\(context\)
 
     └─ each InstinctNode\.evaluate\(ctx\) → Proposal | None
 
-DecisionMasterNode\.decide\(proposals\)
+DecisionMasterNode\.on\_new\_proposals\_many\(proposals, \.\.\.\)
 
-    └─ DecisionNode\.decide\(proposals\) → Proposal
+    └─ DecisionNode\.decide\_many\(proposals\) → list\[Proposal\]
 
-ActionMasterNode\.dispatch\(proposal\)
+    └─ conflicts with running actions → InterruptRequest or hold \(§17\.6\)
 
-    └─ ActionNode\.execute\(proposal\) → Result
+ActionMasterNode\.launch\(proposal\)
 
-        └─ Result fed back to ContextNode
+    └─ ActionNode\.execute\(proposal\) runs as a task → Result
+
+        └─ Result fed back to ContextNode on the next tick after it completes
+
+With ArachniteRuntime\(reflex\_mode='event'\), reflexes that declare trigger\_on\_signals are evaluated when a matching signal is published — during read\_all\(\) or via BaseSenseNode\.push\(\) between ticks — instead of in the reflex stage \(§7\.2\.3\)\.
 
 ## __2\.2 Directory Structure__
 
@@ -200,7 +208,9 @@ arachnite/
 
                         \# ActionStep, StepResult, InterruptPolicy,
 
-                        \# InterruptRequest, ActionExecutionState
+                        \# InterruptRequest, ActionExecutionState,
+
+                        \# ReflexPreemption
 
     media\.py            \# MediaStore \(on\-disk storage for large signal payloads\)
 
@@ -248,13 +258,15 @@ class Context:
 
     state: dict\[str, Any\]           \# mutable key\-value store
 
-    last\_result: Result | None      \# outcome of the previous action
+    last\_result: Result | None      \# first of last\_results, or None
 
     timestamp: float
 
     action\_state: ActionExecutionState | None  \# singular, backward compat
 
-    last\_results: list\[Result\]      \# all results from concurrent dispatch
+    last\_results: list\[Result\]      \# results of actions that completed since
+
+                                    \# the previous tick, in completion order
 
     action\_states: list\[ActionExecutionState\]  \# all running action states
 
@@ -298,7 +310,7 @@ Custom DecisionNode strategies can inspect ``proposal\.evidence`` to make contex
 
 ## __3\.4 Result__
 
-Returned by ActionNodes\. Fed back into the ContextNode for the next tick\. Extended fields support MultiStepActionNode outcomes\.
+Returned by ActionNodes\. Fed back into the ContextNode on the first tick that starts after the action finished \(§7\.2\.1\)\. Extended fields support MultiStepActionNode outcomes and reflex preemption\.
 
 @dataclass
 
@@ -318,11 +330,19 @@ class Result:
 
     interrupted: bool = False           \# True if stopped by InterruptRequest
 
+                                        \# or preempted
+
     stopped\_at\_step: str | None = None  \# step name where execution paused
 
     step\_results: list\[StepResult\] = field\(default\_factory=list\)
 
-    rolled\_back: bool = False           \# True if ROLLBACK policy ran
+    rolled\_back: bool = False           \# True if a rollback walk completed
+
+    preempted: bool = False             \# True if a reflex took the action's
+
+                                        \# resources mid\-execution \(§17\.12\);
+
+                                        \# implies interrupted; never retried
 
 # __4\. SignalBus__
 

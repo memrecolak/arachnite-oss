@@ -154,6 +154,24 @@ class BaseSenseNode\(BaseNode, ABC\):
 
         Override to handle sensor failures, trigger fallback signals, etc\."""
 
+    async def push\(self, signal: Signal\) \-> None:
+
+        """Emit an event\-driven observation now, outside the tick\.
+
+        Publishes the signal on the bus immediately — an event\-mode reflex
+
+        whose trigger\_on\_signals includes its kind is evaluated before
+
+        push\(\) returns \(§7\.2\.3\) — and queues it so the next read\_all\(\)
+
+        also hands it to the ContextNode, once\. Call it from a background
+
+        task started in setup\(\)\. A bus subscriber that raises is logged,
+
+        not propagated\. A StateUpdateSignal is published only \(the runtime
+
+        already buffers it, §5\.3\)\."""
+
 ### __SenseMasterNode__
 
 Owns a collection of BaseSenseNode instances\. On each tick it calls read\(\) on all of them concurrently, publishes the resulting signals to the bus, and hands the signal list to the ContextNode\.
@@ -214,6 +232,7 @@ Kinds without a configured policy default to `ALL`\. Single signals of a configu
 - Set signal\_kind to a string that other nodes can subscribe to\.
 - Set poll\_interval\_s to match the sensor's actual read rate \(default 0\.1 s\)\. Set to `0\.0` for virtual or very fast sensors\.
 - Never cache state in read\(\) — each call should be a fresh observation\.
+- For interrupt\-driven hardware \(GPIO edge, ToF threshold\), additionally call push\(\) from a background task so an event\-mode reflex sees the stimulus without waiting for the next tick\.
 
 ### __Example__
 
@@ -243,7 +262,7 @@ class TemperatureSenseNode\(BaseSenseNode\):
 
 __5\.3  ContextNode__
 
-The ContextNode is the working memory of the agent\. It receives all signals from the current tick and assembles a Context snapshot that is passed to every InstinctNode\. It also stores the Result of the previous action, giving instincts access to feedback\.
+The ContextNode is the working memory of the agent\. It receives all signals from the current tick and assembles a Context snapshot that is passed to every InstinctNode\. It also stores the Results of the actions that completed since the previous tick \(§7\.2\.1\), giving instincts access to feedback\.
 
 **Snapshot isolation:** Each `Context` returned by `update()` or `snapshot()` MUST be an independent copy\. The history deque and each inner signal list are shallow\-copied before inclusion in the snapshot, so that subsequent calls to `_apply_history_config()` do not mutate previously returned `Context` objects\. Instincts MAY hold references to a `Context` across await points without risk of concurrent modification\.
 
@@ -267,15 +286,31 @@ class ContextNode\(BaseNode\):
 
     \): \.\.\.
 
-    def update\(self, signals: list\[Signal\], result: Result | None\) \-> Context:
+    def update\(self, signals: list\[Signal\], result: Result | None = None,
 
-        """Merge this tick’s signals and last result into a new Context\.
+               action\_state: ActionExecutionState | None = None,
 
-        StateUpdateSignals in the signal list are applied to \_state
+               results: list\[Result\] | None = None,
 
-        before the snapshot is built, so instincts see updated state
+               action\_states: list\[ActionExecutionState\] | None = None\) \-> Context:
 
-        in the same tick the signal was emitted\."""
+        """Merge this tick’s signals, completed results and running action
+
+        states into a new Context\. StateUpdateSignals in the signal list
+
+        are applied to \_state before the snapshot is built, so instincts
+
+        see updated state in the same tick the signal was emitted\."""
+
+    def reflex\_view\(self, signals: list\[Signal\]\) \-> Context:
+
+        """Lightweight Context for the event\-driven reflex lane \(§7\.2\.3\):
+
+        the given signals, the current state, results and action states,
+
+        and an empty history \(no per\-event history copy\)\. Never raises,
+
+        does not mutate the node\."""
 
     def get\(self, key: str, default: Any = None\) \-> Any:
 
@@ -385,7 +420,13 @@ class BaseInstinctNode\(BaseNode, ABC\):
 
                                     \# Enforced by InstinctMasterNode\.evaluate\_all\(\)\.
 
-                                    \# Does NOT apply to reflex nodes\.
+                                    \# On a reflex node it is not a gate: with
+
+                                    \# ArachniteRuntime\(reflex\_mode='event'\) it
+
+                                    \# moves the reflex to the event\-driven lane
+
+                                    \# \(§7\.2\.3\); in 'tick' mode it is ignored\.
 
     @abstractmethod
 
@@ -536,7 +577,7 @@ __Normal InstinctNode vs ReflexInstinctNode__
 __Pipeline position__
 
 Normal: evaluated with all instincts, result passed to DecisionNode\.
-Reflex: evaluated before all instincts, dispatched immediately if triggered\.
+Reflex: evaluated before all instincts \(or, in reflex\_mode='event', the moment a trigger signal arrives\), launched immediately if triggered\.
 
 __Decision layer__
 
@@ -550,7 +591,12 @@ Reflex: still run after the reflex fires; their proposals are evaluated by Decis
 
 __Conflicts__
 
-Multiple reflexes can fire in one tick\. They are dispatched in priority order, all before the decision step\.
+Multiple reflexes can fire in one tick\. They are launched in priority order, all before the decision step\.
+
+__Running actions__
+
+Normal: a conflicting running action is interrupted only if it is interruptible, not reflex\-owned and of lower priority; never inside a mandatory block \(§17\.6\)\.
+Reflex: takes the actuators it needs from a running action according to its ``preemption`` mode, even inside a mandatory block under ``PREEMPT`` \(§17\.12\)\.
 
 __Use cases__
 
@@ -564,9 +610,9 @@ class BaseReflexInstinctNode\(BaseInstinctNode, ABC\):
 
     A ReflexInstinctNode bypasses the DecisionNode entirely\.
 
-    If evaluate\(\) returns a Proposal, InstinctMasterNode dispatches
+    If evaluate\(\) returns a Proposal, the runtime launches it directly
 
-    it directly via ActionMasterNode before the normal instinct pass\.
+    via ActionMasterNode\.launch\_reflex\(\) before the normal instinct pass\.
 
     """
 
@@ -576,6 +622,18 @@ class BaseReflexInstinctNode\(BaseInstinctNode, ABC\):
 
                                  \# if multiple reflexes trigger same tick
 
+    preemption: ReflexPreemption = ReflexPreemption\.PREEMPT
+
+                                 \# what to do when the target action needs
+
+                                 \# a resource a running action owns \(§17\.12\)
+
+    trigger\_on\_signals: list\[str\] | None = None
+
+                                 \# reflex\_mode='event': evaluate on arrival
+
+                                 \# of these signal kinds \(§7\.2\.3\)
+
     @abstractmethod
 
     async def evaluate\(self, ctx: Context\) \-> Proposal | None:
@@ -584,9 +642,11 @@ class BaseReflexInstinctNode\(BaseInstinctNode, ABC\):
 
         Return a Proposal to trigger the reflex; return None to pass\.
 
-        Keep this method extremely fast — it runs synchronously before
+        Keep this method extremely fast — it runs before the rest of the
 
-        the rest of the pipeline\. No LLM calls, no blocking I/O\."""
+        pipeline \(or inside the publisher, in the event lane\)\. No LLM
+
+        calls, no blocking I/O\."""
 
 ### __InstinctMasterNode — Updated Interface__
 
@@ -604,11 +664,25 @@ class InstinctMasterNode\(BaseNode\):
 
     def unregister\(self, node\_id: str\) \-> None: \.\.\.
 
-    async def evaluate\_reflexes\(self, ctx: Context\) \-> list\[Proposal\]:
+    async def evaluate\_reflexes\(
 
-        """Evaluate all ReflexInstinctNodes concurrently\.
+        self, ctx: Context,
 
-        Returns non\-None proposals sorted by priority descending\.
+        nodes: Sequence\[BaseReflexInstinctNode\] | None = None,
+
+    \) \-> list\[Proposal\]:
+
+        """Evaluate the enabled ReflexInstinctNodes concurrently — all of
+
+        them, or only ``nodes`` \(the tick stage's or the event lane's
+
+        subset\)\. Returns non\-None proposals sorted by priority descending\.
+
+        With reflex\_conflict='raise', equal top priorities raise
+
+        ReflexConflictError carrying every proposal; the runtime logs it
+
+        at ERROR and still launches them in priority order\.
 
         Called by the runtime before evaluate\_all\(\)\."""
 
@@ -621,10 +695,12 @@ class InstinctMasterNode\(BaseNode\):
 ### __Developer Contract__
 
 - Extend BaseReflexInstinctNode instead of BaseInstinctNode for emergency or safety\-critical responses\.
-- Keep evaluate\(\) as fast as possible\. It is called every tick before anything else\. No I/O, no network calls, no model inference\.
+- Keep evaluate\(\) as fast as possible\. It is called every tick before anything else, or on every arriving trigger signal in the event lane\. No I/O, no network calls, no model inference\.
 - A reflex node with priority 200\+ will always fire before a reflex node with priority 100\.
 - Do not use reflex nodes for goal\-directed or exploratory behaviour\. They are exclusively for situations requiring sub\-tick response\.
-- A reflex action that fires does not prevent normal instincts from also producing proposals for DecisionNode in the same tick\.
+- A reflex action that fires does not prevent normal instincts from also producing proposals for DecisionNode in the same tick\. Those proposals cannot take the reflex action's resources: they are blocked or held while the reflex owns or has claimed them\.
+- Choose ``preemption``: ``PREEMPT`` \(default\) when the hazard outweighs finishing the running action's mandatory block; ``WAIT\_FOR\_BLOCK`` when interrupting the block is the greater hazard\. Give the target action ``resources`` so the arbitration can see the conflict\.
+- Set ``trigger\_on\_signals`` when the runtime uses ``reflex\_mode='event'``\.
 
 ### __Example__
 
@@ -708,7 +784,7 @@ Selects proposals by minimising expected free energy \(EFE\), trading off pragma
 
 BaseDecisionNode also exposes decide\_many\(\), which selects the best proposal per unique action\_id for concurrent dispatch\. The default implementation iterates proposals by priority descending and picks one per action\_id, skipping those already running\. All built\-in strategies inherit this default\.
 
-DecisionMasterNode\.on\_new\_proposals\_many\(\) extends this further: it calls decide\_many\(\) to select proposals, checks whether any outrank currently running actions \(issuing InterruptRequests where applicable\), and filters out proposals for action\_ids that are running and not being interrupted\.
+DecisionMasterNode\.on\_new\_proposals\_many\(\) extends this further: it calls decide\_many\(\) to select proposals, then checks each selected proposal against the running actions it conflicts with — same action\_id, shared declared resources, or resources claimed by an armed reflex \(the runtime passes ``conflicts=ActionMasterNode\.conflicting\_owners``\)\. A proposal with no conflict is dispatched\. If every conflicting owner is running, interruptible, not reflex\-owned and of lower priority, an InterruptRequest is issued to each owner \(``target\_action\_id``\) and the proposal is dispatched; otherwise it is held \(§17\.6\)\.
 
 ### __Proposal Persistence__
 
@@ -724,6 +800,10 @@ Supersession rules:
 - When an instinct is unregistered at runtime via ``unregister\_instinct\_live()``, ``DecisionMasterNode.clear\_pending(instinct\_id)`` removes its pending proposal and age tracking entry, preventing orphaned state from accumulating over long runs\.
 
 The ``evaluated\_instinct\_ids`` set is populated by InstinctMasterNode during evaluate\_all\(\) and passed to on\_new\_proposals\_many\(\) by the runtime\.  This distinguishes "instinct said no" \(clear pending\) from "instinct wasn't asked" \(keep pending\)\.
+
+### __Hand\-off Pool__
+
+A dispatched proposal whose launch is ``BLOCKED`` — typically because it just interrupted an owner that is still unwinding — is handed back with ``DecisionMasterNode\.park\(proposal\)``\. Parked proposals \(``handoff\_proposals``\) re\-enter the decision pool every tick, regardless of ``persist``, until they launch\. A parked proposal is superseded only by a new proposal \(persist or not\) from the same instinct — an instinct that goes quiet does not cancel it — and is dropped after ``max\_handoff\_ticks`` \(default 100\)\. ``clear\_pending\(\)`` also removes it\.
 
 ### __Developer Contract__
 
@@ -745,6 +825,18 @@ class BaseActionNode\(BaseNode, ABC\):
 
     max\_retries: int = 0       \# automatic retries on transient failure
 
+    resources: frozenset\[str\] = frozenset\(\)
+
+                               \# actuators this action commands, e\.g\.
+
+                               \# frozenset\(\{'arm', 'gripper'\}\) \(§17\.12\)
+
+    safe\_stop\_timeout\_s: float = 1\.0
+
+                               \# bound on on\_preempted\(\); an overrun is
+
+                               \# logged and abandoned
+
     @abstractmethod
 
     async def execute\(self, proposal: Proposal\) \-> Result:
@@ -753,7 +845,11 @@ class BaseActionNode\(BaseNode, ABC\):
 
         Read parameters from proposal\.parameters\.
 
-        Always return a Result — never raise unless unrecoverable\."""
+        Always return a Result — never raise unless unrecoverable\.
+
+        Must be cancellation\-safe: a reflex preemption, emergency\_stop\(\)
+
+        or shutdown arrives as asyncio\.CancelledError at an await\."""
 
     async def on\_timeout\(self, proposal: Proposal\) \-> Result:
 
@@ -761,13 +857,65 @@ class BaseActionNode\(BaseNode, ABC\):
 
         Default: return Result\(success=False, \.\.\.\)\. Override to clean up\."""
 
+    async def on\_preempted\(self, proposal: Proposal,
+
+                           preempted\_by: Proposal\) \-> None:
+
+        """Safe\-stop hook, run before the resources are released when a
+
+        reflex \(preempted\_by\) preempts this action — after cancelling
+
+        execute\(\), or at the boundary after a block under WAIT\_FOR\_BLOCK
+
+        — and when emergency\_stop\(\), shutdown or cancel\(\) cancels it\.
+
+        Bring the actuators to a safe hold — do not undo work\.
+
+        Default: no\-op\."""
+
 ### __ActionMasterNode__
 
-Routes Proposals to the correct ActionNode by matching proposal\.action\_id to the registered node’s node\_id\. Enforces timeout and retry logic transparently\.
+Routes Proposals to the correct ActionNode by matching proposal\.action\_id to the registered node’s node\_id\. Enforces timeout and retry logic transparently, and arbitrates actuator resources \(§17\.12\)\.
 
-Supports concurrent dispatch: different ActionNodes can execute in parallel via dispatch\_many\(\)\. The same ActionNode MUST NOT run twice concurrently\. This invariant is enforced at two levels: dispatch\_many\(\) pre\-filters proposals whose action\_id is already in the running set, and \_dispatch\_one\(\) performs an atomic check\-and\-set against the \_running\_nodes set before execution begins\. The atomic guard in \_dispatch\_one\(\) prevents a TOCTOU race where concurrent dispatch calls \(e\.g\. a reflex and a normal proposal in the same tick\) could both pass the pre\-filter before either registers\. If the action\_id is already running, \_dispatch\_one\(\) MUST return Result\(success=False\) immediately without invoking execute\(\)\.
+Two dispatch styles share one reservation path\. ``launch\(\)`` / ``launch\_reflex\(\)`` — used by ArachniteRuntime — perform the action lookup, conflict check, guards and resource reservation synchronously, start ``execute\(\)`` as a tracked task and return a ``LaunchOutcome`` at once; finished Results are collected with ``drain\_completed\(\)``\. ``dispatch\(\)`` / ``dispatch\_many\(\)`` await the Result \(runtime\-less use, §7\.2\.2\)\.
+
+A proposal conflicts with a running action when they share the action\_id or a declared resource\. At most one running action owns a resource at any time, and the same ActionNode MUST NOT run twice concurrently\. Because the check and the reservation happen with no ``await`` in between, two launches or dispatches in the same tick cannot both pass the check\. A conflicting deliberative launch returns ``LaunchStatus\.BLOCKED``; a conflicting ``dispatch\(\)`` returns ``Result\(success=False\)`` without invoking execute\(\) — ``error=ResourceConflictError`` for a shared resource\. ``dispatch\_many\(\)`` additionally keeps only the highest\-priority proposal per action\_id and skips running ones\. Retries \(``max\_retries``\) stop on an interrupted or preempted Result and on a ``RollbackError``\.
+
+class LaunchStatus\(Enum\):
+
+    LAUNCHED  = 'launched'    \# execute\(\) started as a tracked task
+
+    BLOCKED   = 'blocked'     \# conflicts with a running owner; not started
+
+    ARMED     = 'armed'       \# reflex waits for its owners to release
+
+    DEDUPED   = 'deduped'     \# reflex is already being handled
+
+    VETOED    = 'vetoed'      \# an ActionGuard denied the proposal
+
+    NOT\_FOUND = 'not\_found'   \# no ActionNode with that action\_id
+
+@dataclass\(frozen=True\)
+
+class LaunchOutcome:
+
+    status: LaunchStatus
+
+    action\_id: str
+
+    owners: frozenset\[str\] = frozenset\(\)  \# running/armed action\_ids it
+
+                                          \# conflicted with
 
 class ActionMasterNode\(BaseNode\):
+
+    def \_\_init\_\_\(self, bus, \.\.\., guards: list\[ActionGuard\] | None = None,
+
+                 strict\_resources: bool = False\): \.\.\.
+
+                 \# strict\_resources: register\(\) raises NodeRegistrationError
+
+                 \# for an action that declares no resources
 
     def register\(self, node: BaseActionNode\) \-> None: \.\.\.
 
@@ -775,9 +923,43 @@ class ActionMasterNode\(BaseNode\):
 
     def unregister\(self, node\_id: str\) \-> None: \.\.\.
 
-    async def dispatch\(self, proposal: Proposal\) \-> Result: \.\.\.
+    \# Non\-blocking launch \(runtime\):
 
-    async def dispatch\_many\(self, proposals: list\[Proposal\]\) \-> list\[Result\]: \.\.\.
+    def launch\(self, proposal: Proposal, \*, origin: str = 'decision'\) \-> LaunchOutcome: \.\.\.
+
+    def launch\_reflex\(self, proposal: Proposal,
+
+                      preemption: ReflexPreemption = ReflexPreemption\.PREEMPT\) \-> LaunchOutcome: \.\.\.
+
+    def drain\_completed\(self\) \-> list\[Result\]: \.\.\.     \# completion order
+
+    async def wait\_idle\(self, timeout: float | None = None\) \-> bool: \.\.\.
+
+    async def cancel\(self, action\_id: str, timeout: float | None = None\) \-> None: \.\.\.
+
+    async def cancel\_all\(self, timeout: float | None = None\) \-> None: \.\.\.
+
+                 \# cancel \+ safe\-stop, no rollback; drops armed reflexes
+
+    def interrupt\_all\(self, request: InterruptRequest\) \-> None: \.\.\.
+
+    \# Awaiting dispatch \(runtime\-less\):
+
+    async def dispatch\(self, proposal: Proposal, \*, origin: str | None = None\) \-> Result: \.\.\.
+
+    async def dispatch\_many\(self, proposals: list\[Proposal\], \*,
+
+                            origin: str | None = None\) \-> list\[Result\]: \.\.\.
+
+    \# Introspection:
+
+    def conflicting\_owners\(self, proposal: Proposal\) \-> set\[str\]: \.\.\.
+
+    def resource\_owners\(self\) \-> dict\[str, str\]: \.\.\.     \# resource → action\_id
+
+    def armed\_reflexes\(self\) \-> dict\[str, Proposal\]: \.\.\.
+
+    def origin\_of\(self, action\_id: str\) \-> str | None: \.\.\.  \# 'reflex' | 'decision' | 'direct'
 
     def current\_actions\(\) \-> dict\[str, BaseActionNode\]: \.\.\.
 
@@ -793,9 +975,9 @@ class ActionMasterNode\(BaseNode\):
 
     \# Pre\-dispatch guards \(optional\):
 
-    def \_\_init\_\_\(self, bus, \.\.\., guards: list\[ActionGuard\] | None = None\): \.\.\.
-
     def register\_guard\(self, guard: ActionGuard\) \-> None: \.\.\.
+
+Deliberative interrupts \(``request\_interrupt\(\)``, ``is\_interruptible\(\)``, ``current\_step\(\)``\) are specified in §17\.6\.
 
 ### __Pre\-dispatch Guards__
 
@@ -811,13 +993,13 @@ class ActionGuard\(Protocol\):
 
     def \_\_call\_\_\(self, proposal: Proposal\) \-> GuardVerdict: \.\.\.
 
-Guards run in ``\_dispatch\_one\(\)`` after the not\-found and already\-running checks, **before** ``execute\(\)`` and **outside** the retry loop\. Semantics:
+Guards run in ``launch\(\)`` and ``dispatch\(\)`` after the not\-found and conflict checks, **before** ``execute\(\)`` and **outside** the retry loop\. Semantics:
 
-- On deny, ``dispatch\(\)`` returns ``Result\(success=False, error=ActionVetoed\(reason\)\)`` with **no side effect**: ``execute\(\)`` is never called and no retry runs\. ``dispatch\_many\(\)`` honours guards identically\.
+- On deny, ``dispatch\(\)`` returns ``Result\(success=False, error=ActionVetoed\(reason\)\)`` with **no side effect**: ``execute\(\)`` is never called and no retry runs\. ``dispatch\_many\(\)`` honours guards identically; ``launch\(\)`` returns ``LaunchStatus\.VETOED`` and buffers the same Result for the next tick's ``ctx\.last\_results``\.
 - Guards MUST be **synchronous, bounded, and perform no I/O** \(a reflex\-class contract\)\. A coroutine function is rejected at ``register\_guard\(\)``\.
 - Guards run in registration order; the **first deny wins** \(remaining guards are skipped\)\.
 - A guard that **raises fails closed** \(treated as a deny\)\. This deliberately differs from ``InstinctMasterNode\.set\_pre\_evaluate\_gate``, which fails open — a safety veto layer must not fail open\.
-- **Reflex/safety proposals \(``priority >= 200``\) bypass all guards\.** Reflex dispatch flows through the same ``ActionMaster`` path, and silently vetoing a reflex would break the reflex\-always\-fires guarantee \(``ReflexDispatchMonitor``\)\.
+- **The reflex path bypasses all guards\.** Bypass is keyed on the dispatch origin, not on priority: ``launch\_reflex\(\)`` and ``dispatch\(\.\.\., origin='reflex'\)`` skip guards, because silently vetoing a reflex would break the reflex\-always\-fires guarantee \(``ReflexDispatchMonitor``\); a deliberative proposal \(``origin='decision'``\) is checked whatever its priority\. Runtime\-less callers that pass no origin \(``origin=None``\) keep the legacy rule: ``priority >= 200`` bypasses\.
 
 ### __Developer Contract__
 
@@ -825,6 +1007,8 @@ Guards run in ``\_dispatch\_one\(\)`` after the not\-found and already\-running 
 - Read action parameters from proposal\.parameters\. Define a schema and validate at the top of execute\(\)\.
 - Return Result\(success=False, error=exc\) instead of raising for expected failure modes\.
 - Use timeout\_s and max\_retries to guard against hardware hangs without custom retry logic\.
+- Declare ``resources`` for every actuator the action commands; set ``strict\_resources=True`` on ActionMasterNode to make an undeclared action a registration error\.
+- Write execute\(\) to be cancellation\-safe, and override ``on\_preempted\(\)`` with a forward safe\-stop if a reflex may take this action's resources mid\-execution\.
 
 ### __Example__
 
@@ -1068,7 +1252,7 @@ class NodeFaultReflex\(BaseReflexInstinctNode\):
 
 ## __6\.5 Runtime Safety Monitors__
 
-The safety monitor subsystem provides continuous runtime verification of the safety properties formalised in the UPPAAL model\. Monitors are lightweight checkers that verify invariants after each tick and emit `SafetyViolationSignal` on the `SignalBus` when an invariant is breached\. The runtime does not run them automatically: build a `SafetyMonitorRegistry`, and call `check_all\(tick, state\)` from your run loop after each tick \(see the safety\-monitors tutorial\)\. `check_all\(\)` returns the violations directly; violations are also published on the bus but are not injected into `ctx\.signals`\.
+The safety monitor subsystem provides continuous runtime verification of the safety properties formalised in the CSP models under ``formal/``\. Monitors are lightweight checkers that verify invariants after each tick and emit `SafetyViolationSignal` on the `SignalBus` when an invariant is breached\. The runtime does not run them automatically: build a `SafetyMonitorRegistry`, and call `check_all\(tick, state\)` from your run loop after each tick \(see the safety\-monitors tutorial\)\. `check_all\(\)` returns the violations directly; violations are also published on the bus but are not injected into `ctx\.signals`\.
 
 ### __BaseSafetyMonitor__
 
@@ -1096,6 +1280,8 @@ Manages a set of monitors\. `SafetyMonitorRegistry\.default\(bus\)` creates all 
 | `ReflexDispatchMonitor` | reflex\_fired ⟹ action\_dispatched | CRITICAL |
 | `ReflexAvailabilityMonitor` | all reflex nodes available | WARNING |
 | `TickBudgetMonitor` | 3\+ consecutive tick overruns | WARNING |
+
+The caller fills ``MonitorState`` with these meanings: ``decision\_entered`` — the **reflex proposal** passed through the decision layer \(the decide stage itself runs on every tick, after the reflex stage\); ``interrupt\_accepted\_during\_block`` — a **deliberative** interrupt took effect inside a mandatory block \(a ``PREEMPT`` reflex or ``emergency\_stop\(\)`` ending a block is declared behaviour, §17\.5, not a violation\); ``reflex\_action\_dispatched`` — ``launch\_reflex\(\)`` returned ``LAUNCHED``, ``ARMED`` or ``DEDUPED``\.
 
 Violations are published as `SafetyViolationSignal` \(kind `"safety_violation"`\) with `monitor_id`, `severity`, `property_name`, and `details`\. Reflex instincts can subscribe and trigger compensating actions\.
 

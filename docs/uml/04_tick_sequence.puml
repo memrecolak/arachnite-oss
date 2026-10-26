@@ -1,10 +1,10 @@
 @startuml tick_sequence
-title Arachnite — One Runtime Tick
+title Arachnite — One Runtime Tick (actions run as tasks, ADR 0005)
 
 skinparam sequenceMessageAlign center
 skinparam responseMessageBelowArrow true
 
-actor "Event loop" as loop
+actor "Event loop" as EL
 participant "ArachniteRuntime" as RT
 participant "SenseMasterNode"    as SM
 participant "BaseSenseNode\n(many)"        as SN
@@ -16,50 +16,68 @@ participant "BaseInstinctNode\n(many)"      as NI
 participant "DecisionMasterNode" as DM
 participant "BaseDecisionNode\n(strategy)"  as DS
 participant "ActionMasterNode"   as AM
-participant "BaseActionNode\n(targets)"     as AN
+participant "Action tasks\n(execute())"    as AT
 
-loop -> RT : tick()
+EL -> RT : tick()
 activate RT
 
 == 1 · SENSE ==
+RT -> AM : drain_completed()
+AM --> RT : list<Result>\n(finished since last tick, completion order)
 RT -> SM : read_all()
 activate SM
-SM -> SN : read()  (concurrent per kind)
+SM -> SN : read()  (concurrent, per poll_interval_s)
 SN --> SM : Signal | None
 SM -> SM : _apply_merge(signals)\n(MergePolicy per kind)
-SM --> RT : list<Signal>
+SM -> BUS : publish_many(signals)
+note right of BUS
+  reflex_mode='event': the reflex lane is a
+  bus subscriber; it evaluates reflexes that
+  declare trigger_on_signals here (and on
+  BaseSenseNode.push() between ticks) and
+  calls launch_reflex() at once.
+end note
+SM --> RT : list<Signal>  (+ signals pushed since last tick)
 deactivate SM
-RT -> BUS : publish_many(signals)
+RT -> RT : append buffered supervisor /\nnode_fault / state_update signals
 
 == 2 · CONTEXT ==
-RT -> CTX : update(signals, last_results,\n         action_states)
+RT -> CTX : update(signals, result, results,\n         action_states of running actions)
 activate CTX
 CTX -> CTX : push to rolling history\napply StateUpdateSignals
 CTX --> RT : Context
 deactivate CTX
 RT -> RT : notify context_observers(ctx)
 
-== 3 · REFLEX  (blocks decision layer) ==
-RT -> IM : evaluate_reflexes(ctx)
+== 3 · REFLEX  (bypasses the decision layer) ==
+RT -> IM : evaluate_reflexes(ctx, nodes)\n(event mode: only reflexes\n without trigger_on_signals)
 activate IM
 IM -> RI : evaluate(ctx)  (concurrent)
 RI --> IM : Proposal | None
-IM --> RT : list<Proposal>  (priority ≥ 200)
+IM --> RT : list<Proposal>  (priority desc)
 deactivate IM
 
 alt reflex proposals present
   loop for each reflex proposal
-    RT -> AM : dispatch(proposal)
+    RT -> AM : launch_reflex(proposal, node.preemption)
     activate AM
-    AM -> AN : execute(proposal)
-    AN --> AM : Result
-    AM --> RT : Result
+    alt no conflicting owner
+      AM -> AM : reserve action_id + resources
+      AM ->> AT : create_task(execute)
+    else conflicts with running owner(s)
+      AM -> AM : arm reflex, claim its resources
+      AM ->> AT : PREEMPT: cancel owner task\nWAIT_FOR_BLOCK in a block:\n preempt at first boundary after it
+      note right of AT
+        Owner runs on_preempted() safe-stop
+        (<= safe_stop_timeout_s), then releases;
+        the armed reflex starts on release.
+        A running reflex is never preempted.
+      end note
+    end
+    AM --> RT : LaunchOutcome\n(LAUNCHED / ARMED / DEDUPED / NOT_FOUND)
     deactivate AM
   end
-  note over RT
-    Reflexes bypass DecisionMaster
-    by design (safety guarantee).
-  end note
+  RT -> RT : await asyncio.sleep(0)\n(reflex execute() is entered now)
 end
 
 == 4 · INSTINCT ==
@@ -71,42 +89,48 @@ IM --> RT : list<Proposal>
 deactivate IM
 
 == 5 · DECIDE ==
-RT -> DM : on_new_proposals_many(\n   proposals,\n   running_proposals,\n   running_interruptible,\n   evaluated_instinct_ids)
+RT -> DM : on_new_proposals_many(\n   proposals, running_proposals,\n   running_interruptible,\n   evaluated_instinct_ids,\n   conflicts=conflicting_owners)
 activate DM
-DM -> DM : merge with pending\n(persist=True carry-over)
-DM -> DS : decide_many(pool, running_ids)
+DM -> DM : merge with pending (persist=True)\nand parked hand-off proposals
+DM -> DS : decide_many(pool)
 DS --> DM : list<Proposal> selected
-DM -> DM : detect interrupts\n(new.priority > running.priority\n & is_interruptible)
+DM -> DM : per proposal, conflicting owners?\nnone: dispatch\nall interruptible, non-reflex, lower priority:\n InterruptRequest per owner + dispatch\notherwise: hold
 DM --> RT : (to_dispatch, interrupt_requests)
 deactivate DM
 RT -> IM : notify_rejected(rejected)
-RT -> RT : notify decision_observers(\n   DecisionEvent)
 
 alt interrupt_requests not empty
   loop for each InterruptRequest
-    RT -> AM : request_interrupt(req, action_id)
-    AM -> AN : request_interrupt(req)\n(checked at next ActionStep boundary)
+    RT -> AM : request_interrupt(req, target_action_id)
+    AM ->> AT : set interrupt flag\n(honoured at next allowed boundary;\nMandatoryBlockViolation inside a block)
   end
 end
+RT -> RT : notify decision_observers(\n   DecisionEvent)
 
-== 6 · ACT ==
-RT -> AM : dispatch_many(to_dispatch)
-activate AM
-AM -> AM : dedupe by action_id\nskip already-running
-AM -> AN : execute(proposal)  (concurrent)
-note right of AN
-  MultiStepActionNode loops through
-  steps(); checks _interrupt_requested
-  at each interruptible boundary.
-end note
-AN --> AM : Result
-AM --> RT : list<Result>
-deactivate AM
+== 6 · ACT  (launch only, nothing awaited) ==
+loop for each selected proposal (best per action_id)
+  RT -> AM : launch(proposal, origin="decision")
+  activate AM
+  AM -> AM : conflict check, guards,\nreserve action_id + resources
+  alt LAUNCHED
+    AM ->> AT : create_task(execute)
+    AM --> RT : LaunchOutcome(LAUNCHED)
+  else BLOCKED (owner still unwinding)
+    AM --> RT : LaunchOutcome(BLOCKED)
+    RT -> DM : park(proposal)  (hand-off)
+  end
+  deactivate AM
+end
 
-RT -> RT : _last_results = reflex_results + dispatch_results
 RT -> RT : on_tick_end(tick, duration_s)  on all nodes
 
-RT --> loop : (sleep until next tick)
+RT --> EL : (sleep until next tick)
 deactivate RT
+
+note over AT
+  Action tasks run across later ticks. On completion they
+  release their resources, admit armed reflexes and buffer
+  the Result, which the next tick drains into ctx.last_results.
+end note
 
 @enduml
