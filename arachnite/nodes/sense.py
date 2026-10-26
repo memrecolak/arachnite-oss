@@ -14,7 +14,7 @@ from collections.abc import Sequence
 
 from arachnite.bus import SignalBus
 from arachnite.config import NodeConfig
-from arachnite.exceptions import NodeRegistrationError
+from arachnite.exceptions import NodeRegistrationError, SignalBusError
 from arachnite.logging import BaseLogSink
 from arachnite.models import MergePolicy, Signal, StateUpdateSignal
 from arachnite.nodes.base import BaseNode, FaultReportingMixin
@@ -234,9 +234,19 @@ class SenseMasterNode(FaultReportingMixin, BaseNode):
             self._returned_signals = list(signals)
             self._returned_signal_ids = frozenset(id(s) for s in signals)
 
-        # Publish all signals to the bus concurrently
+        # Publish all signals to the bus concurrently. A failing subscriber
+        # (dashboard, logging hook, transport) must not cost this tick its
+        # reflexes and deliberation: every callback has already run when
+        # publish_many() re-raises, so log the failure and carry on.
         if signals:
-            await self.bus.publish_many(signals)
+            try:
+                await self.bus.publish_many(signals)
+            except SignalBusError as exc:
+                self.logger.error(
+                    "Bus subscriber raised while publishing sensed signals",
+                    error=str(exc),
+                    cause=repr(exc.cause),
+                )
 
         # Signals pushed since the last tick (BaseSenseNode.push) were already
         # published when they happened; they join the returned list only, so

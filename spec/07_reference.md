@@ -172,7 +172,7 @@ BaseActionNode\.on\_preempted\(\): brings the actuators to a safe hold when the 
 
 __LaunchStatus / LaunchOutcome__
 
-The synchronous result of ActionMasterNode\.launch\(\) / launch\_reflex\(\): LAUNCHED, BLOCKED, ARMED, DEDUPED, VETOED or NOT\_FOUND, plus the conflicting owners\.
+The synchronous result of ActionMasterNode\.launch\(\) / launch\_reflex\(\): LAUNCHED, BLOCKED, ARMED, DEDUPED, VETOED, NOT\_FOUND or CLOSED \(the master was closed by ``close\(\)`` / ``cancel\_all\(\)`` for shutdown\), plus the conflicting owners\.
 
 __Hand\-off__
 

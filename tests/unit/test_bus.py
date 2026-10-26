@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 
 from arachnite import SignalBus
@@ -105,6 +107,24 @@ class TestSignalBus:
         signals = [make_signal("thermal"), make_signal("visual"), make_signal("thermal")]
         await bus.publish_many(signals)
         assert len(received) == 3
+
+    @pytest.mark.asyncio
+    async def test_publish_many_finishes_every_publish_before_raising(self) -> None:
+        bus      = SignalBus()
+        received = []
+
+        async def bad(sig):  # type: ignore[no-untyped-def]
+            raise ValueError("boom")
+
+        async def slow(sig):  # type: ignore[no-untyped-def]
+            await asyncio.sleep(0.01)
+            received.append(sig)
+
+        bus.subscribe("thermal", bad)
+        bus.subscribe("visual", slow)
+        with pytest.raises(SignalBusError):
+            await bus.publish_many([make_signal("thermal"), make_signal("visual")])
+        assert len(received) == 1
 
     @pytest.mark.asyncio
     async def test_publish_many_empty_is_noop(self) -> None:

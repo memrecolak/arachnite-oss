@@ -682,6 +682,7 @@ reservation all happen synchronously, then `execute()` starts as a tracked task 
 | `DEDUPED` | that reflex action is already running or armed as a reflex |
 | `VETOED` | an `ActionGuard` denied it (a failed `ActionVetoed` Result is buffered) |
 | `NOT_FOUND` | no ActionNode registered under that action_id |
+| `CLOSED` | the master is shutting down (`close()` / `cancel_all()`); nothing new starts until `setup()` |
 
 Results of launched actions are collected with `drain_completed()` (the runtime does
 this each tick). `await action_master.wait_idle(timeout)` / `await runtime.wait_idle(timeout)`
@@ -872,8 +873,10 @@ class ToFSense(BaseSenseNode):
   4. Actions stop at their next boundary, so ROLLBACK actions unwind. Whatever is still
      running is then cancelled through its safe-stop.
   5–7. Supervisors stop, nodes tear down, the transport disconnects.
-- **`await rt.emergency_stop()`** stops the loop and the reflex lane, then cancels every
-  action. Each one runs its `on_preempted()` safe-stop (bounded); **no rollback** runs.
+- **`await rt.emergency_stop()`** closes the action master (launches return `CLOSED`),
+  stops the loop and the reflex lane, then cancels every action. Each one runs its
+  `on_preempted()` safe-stop (bounded; one already running is waited for); **no rollback** runs.
+  Called from inside a tick, it returns at once and finishes after that tick.
   Then the nodes tear down. This is a *shutdown* path, not a hazard response: to cut
   into a mandatory block and keep the agent running, use a PREEMPT reflex.
 

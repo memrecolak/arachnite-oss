@@ -506,3 +506,217 @@ class TestReflexStageAttribution:
         await rt.wait_idle(1.0)
         await rt.stop()
         assert probe.at_reflex_end is True
+
+
+# ── Reflex-path review regressions (docs/audits 2026-10-26) ───────────────────
+
+class _LoggedAct(BaseActionNode):
+    """Logs execute() and teardown() into a shared list."""
+
+    def __init__(self, bus: SignalBus, node_id: str, log: list[str]) -> None:
+        self.node_id = node_id  # type: ignore[misc]
+        super().__init__(bus)
+        self.log = log
+
+    async def teardown(self) -> None:
+        self.log.append(f"teardown {self.node_id}")
+
+    async def execute(self, proposal: Proposal) -> Result:
+        self.log.append(f"execute {self.node_id}")
+        await asyncio.sleep(0.02)
+        return Result(action_id=self.node_id, success=True)
+
+
+class _EventProximity(BaseSenseNode):
+    """Event-driven sensor: never polled, pushes on demand."""
+    node_id = "EventProximity"
+    signal_kind = "proximity"
+
+    async def read(self) -> Signal | None:
+        return None
+
+
+class _SlowEventReflex(BaseReflexInstinctNode):
+    """Event-lane reflex whose evaluation takes 100 ms."""
+    node_id = "SlowEventReflex"
+    priority = 250
+    trigger_on_signals = ["proximity"]
+
+    async def evaluate(self, ctx: Context) -> Proposal | None:
+        await asyncio.sleep(0.1)
+        if any(s.kind == "proximity" and s.value < 0.1 for s in ctx.signals):
+            return Proposal(instinct_id=self.node_id, action_id="Act",
+                            priority=self.priority, urgency=1.0)
+        return None
+
+
+class _CallsEmergencyStop(BaseReflexInstinctNode):
+    """Calls emergency_stop() from inside its evaluate() on tick 2."""
+    node_id = "CallsEmergencyStop"
+    priority = 300
+
+    def __init__(self, bus: SignalBus, log: list[str]) -> None:
+        super().__init__(bus)
+        self.log = log
+        self.runtime: ArachniteRuntime | None = None
+
+    async def evaluate(self, ctx: Context) -> Proposal | None:
+        if self.runtime is not None and self.runtime.tick_count == 2:
+            await self.runtime.emergency_stop()
+            self.log.append("emergency_stop() returned")
+        return None
+
+
+class _ProposesOnTick2(BaseReflexInstinctNode):
+    node_id = "ProposesOnTick2"
+    priority = 250
+
+    def __init__(self, bus: SignalBus, action_id: str) -> None:
+        super().__init__(bus)
+        self.action_id = action_id
+        self.runtime: ArachniteRuntime | None = None
+
+    async def evaluate(self, ctx: Context) -> Proposal | None:
+        await asyncio.sleep(0)
+        if self.runtime is not None and self.runtime.tick_count == 2:
+            return Proposal(instinct_id=self.node_id, action_id=self.action_id,
+                            priority=self.priority, urgency=1.0)
+        return None
+
+
+class _GoalOnTick2(BaseInstinctNode):
+    node_id = "GoalOnTick2"
+    priority = 60
+
+    def __init__(self, bus: SignalBus) -> None:
+        super().__init__(bus)
+        self.runtime: ArachniteRuntime | None = None
+
+    async def evaluate(self, ctx: Context) -> Proposal | None:
+        if self.runtime is not None and self.runtime.tick_count == 2:
+            return Proposal(instinct_id=self.node_id, action_id="GoalAct",
+                            priority=self.priority, urgency=1.0)
+        return None
+
+
+class _NearSense(BaseSenseNode):
+    node_id = "NearSense"
+    signal_kind = "proximity"
+    poll_interval_s = 0.0
+
+    async def read(self) -> Signal:
+        return Signal(source=self.node_id, kind=self.signal_kind, value=0.01,
+                      confidence=1.0, timestamp=time.monotonic())
+
+
+class _NearReflex(BaseReflexInstinctNode):
+    node_id = "NearReflex"
+    priority = 250
+
+    async def evaluate(self, ctx: Context) -> Proposal | None:
+        if any(s.kind == "proximity" and s.value < 0.1 for s in ctx.signals):
+            return Proposal(instinct_id=self.node_id, action_id="Act",
+                            priority=self.priority, urgency=1.0)
+        return None
+
+
+class TestReviewRegressionsRuntime:
+    @pytest.mark.parametrize("how", ["stop", "emergency_stop"])
+    @pytest.mark.asyncio
+    async def test_lane_evaluation_in_flight_at_shutdown_launches_nothing(
+        self, how: str,
+    ) -> None:
+        """R07: an event-lane evaluation still running at stop() never launches afterwards"""
+        log: list[str] = []
+        bus = SignalBus()
+        sm = SenseMasterNode(bus=bus)
+        sensor = _EventProximity(bus)
+        sm.register(sensor)
+        im = InstinctMasterNode(bus=bus)
+        im.register(_SlowEventReflex(bus))
+        am = ActionMasterNode(bus=bus)
+        am.register(_LoggedAct(bus, "Act", log))
+        rt = ArachniteRuntime(
+            sense_master=sm, context=ContextNode(), instinct_master=im,
+            decision_master=DecisionMasterNode(bus=bus), action_master=am,
+            bus=bus, tick_rate_hz=TICK_HZ, reflex_mode="event",
+            reflex_eval_timeout_s=0.5,
+        )
+        await rt.start()
+        push = asyncio.ensure_future(sensor.push(Signal(
+            source=sensor.node_id, kind="proximity", value=0.05,
+            confidence=1.0, timestamp=time.monotonic(),
+        )))
+        await asyncio.sleep(0.02)                     # evaluation in flight
+        await (rt.stop() if how == "stop" else rt.emergency_stop())
+        log.append("shutdown returned")
+        await push
+        await asyncio.sleep(0.15)
+        assert "execute Act" not in log
+
+    @pytest.mark.asyncio
+    async def test_emergency_stop_from_inside_a_tick_launches_nothing_after(self) -> None:
+        """R10: emergency_stop() called inside a tick stops that tick's later launches"""
+        log: list[str] = []
+        bus = SignalBus()
+        im = InstinctMasterNode(bus=bus)
+        estop = _CallsEmergencyStop(bus, log)
+        other = _ProposesOnTick2(bus, "ReflexAct")
+        goal = _GoalOnTick2(bus)
+        for node in (estop, other, goal):
+            im.register(node)
+        am = ActionMasterNode(bus=bus)
+        am.register(_LoggedAct(bus, "ReflexAct", log))
+        am.register(_LoggedAct(bus, "GoalAct", log))
+        rt = ArachniteRuntime(
+            sense_master=SenseMasterNode(bus=bus), context=ContextNode(),
+            instinct_master=im,
+            decision_master=DecisionMasterNode(bus=bus, strategy=GreedyDecisionNode(bus=bus)),
+            action_master=am, bus=bus, tick_rate_hz=TICK_HZ,
+        )
+        estop.runtime = other.runtime = goal.runtime = rt
+        # Before the fix the in-tick stop could also cancel the loop task
+        # that was running it, recursing until the loop logged a RecursionError.
+        loop_errors: list[dict[str, object]] = []
+        asyncio.get_running_loop().set_exception_handler(
+            lambda loop, context: loop_errors.append(context)
+        )
+        try:
+            await rt.start()
+            await asyncio.sleep(0.3)
+        finally:
+            asyncio.get_running_loop().set_exception_handler(None)
+        assert "emergency_stop() returned" in log
+        assert not rt.is_running
+        assert [e for e in log if e.startswith("execute")] == []
+        assert {"teardown ReflexAct", "teardown GoalAct"} <= set(log)
+        assert loop_errors == []
+
+    @pytest.mark.asyncio
+    async def test_raising_bus_subscriber_does_not_cost_the_reflex_stage(self) -> None:
+        """R09: a subscriber raising on a sensed kind no longer aborts the tick"""
+        log: list[str] = []
+        bus = SignalBus()
+        sm = SenseMasterNode(bus=bus)
+        sm.register(_NearSense(bus))
+        im = InstinctMasterNode(bus=bus)
+        im.register(_NearReflex(bus))
+        am = ActionMasterNode(bus=bus)
+        am.register(_LoggedAct(bus, "Act", log))
+        rt = ArachniteRuntime(
+            sense_master=sm, context=ContextNode(), instinct_master=im,
+            decision_master=DecisionMasterNode(bus=bus), action_master=am,
+            bus=bus, tick_rate_hz=TICK_HZ,
+        )
+
+        async def broken_dashboard(signal: Signal) -> None:
+            raise ValueError("dashboard bug")
+
+        bus.subscribe("proximity", broken_dashboard)
+        await rt.start()
+        await rt.pause()
+        for _ in range(3):
+            await rt.tick()
+            await rt.wait_idle(1.0)
+        await rt.stop()
+        assert log.count("execute Act") == 3

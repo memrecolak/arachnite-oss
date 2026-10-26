@@ -212,7 +212,8 @@ class ReflexDispatchMonitor(BaseSafetyMonitor):
 
     Launched, armed (waiting for a preempted owner's safe-stop or for a
     WAIT_FOR_BLOCK block) and de-duplicated outcomes all count as reaching
-    the action; a reflex whose action cannot be found is a dead end.
+    the action; a reflex whose action cannot be found is a dead end. A launch
+    refused because the runtime is shutting down (CLOSED) is not a dead end.
     """
 
     monitor_id = "ReflexDispatchMonitor"

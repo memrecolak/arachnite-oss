@@ -375,7 +375,7 @@ With the default ``reflex\_mode='tick'`` every reflex node is evaluated once per
 - The reflex sees ``ContextNode\.reflex\_view\(signals\)``: the freshest signal per ``\(source, kind\)`` of its trigger kinds received within ``reflex\_signal\_ttl\_s`` \(default: one tick period\), the current ``state``, results and action states, and an **empty** ``history``\.
 - Evaluation is bounded by ``reflex\_eval\_timeout\_s`` \(default 0\.05 s\)\. A timeout or exception is logged at ERROR and never propagates into the publisher; ``ReflexConflictError`` is handled as in step 4\.
 - Proposals go through the same ``launch\_reflex\(\)`` arbitration \(§17\.12\)\.
-- The lane stays live while the runtime is paused \(polled sensing and deliberation stop; a pushed hazard signal still gets its reflex\)\. ``stop\(\)`` and ``emergency\_stop\(\)`` detach it first\.
+- The lane stays live while the runtime is paused \(polled sensing and deliberation stop; a pushed hazard signal still gets its reflex\)\. ``stop\(\)`` and ``emergency\_stop\(\)`` detach it first; an evaluation still in flight then launches nothing\.
 
 Reflex nodes without ``trigger\_on\_signals`` remain in the tick's reflex stage in both modes\. In ``'tick'`` mode ``trigger\_on\_signals`` has no effect on reflex nodes\.
 
@@ -615,8 +615,8 @@ class ShutdownCoordinator:
 
 When runtime\.emergency\_stop\(\) is called \(e\.g\. from a signal handler on SIGTERM or SIGINT\), the ShutdownCoordinator is bypassed:
 
-1\. The tick loop and the event\-driven reflex lane are stopped; an in\-flight tick is cancelled and awaited, so nothing new can be launched\.
-2\. Every running action is cancelled at its current ``await`` — inside a mandatory block too — and its ``on\_preempted\(\)`` safe\-stop hook runs, bounded by ``safe\_stop\_timeout\_s``\. Armed reflexes are dropped\. **No rollback runs**: reversing a physical operation during an emergency can itself be unsafe\.
+1\. The action master is closed at once — ``launch\(\)`` / ``launch\_reflex\(\)`` return ``LaunchStatus\.CLOSED`` until the next ``setup\(\)`` — and the tick loop and the event\-driven reflex lane are stopped; an in\-flight tick is cancelled and awaited\. Called from inside a tick \(e\.g\. by a reflex's ``evaluate\(\)``\), it closes the master, returns, and finishes steps 1–3 in a task once that tick has unwound; the rest of that tick launches nothing\.
+2\. Every running action is cancelled at its current ``await`` — inside a mandatory block too — and its ``on\_preempted\(\)`` safe\-stop hook runs, bounded by ``safe\_stop\_timeout\_s``; a safe\-stop already running for a reflex preemption is waited for, not cut short\. Armed reflexes are dropped\. **No rollback runs**: reversing a physical operation during an emergency can itself be unsafe\.
 3\. All master nodes are torn down\.
 
 Emergency stop is a shutdown path\. Cutting into a mandatory block to *respond* to a hazard while the agent keeps running is the job of a ``ReflexPreemption\.PREEMPT`` reflex \(§17\.12\); the complete list of ways a mandatory block can end early is in §17\.5\.
@@ -1478,7 +1478,7 @@ class BaseActionNode\(BaseNode\):
 
         """Forward safe\-stop \("brake, keep the grip"\)\. Default: no\-op\."""
 
-__Arbitration\.__ The runtime launches every reflex proposal with ``ActionMasterNode\.launch\_reflex\(proposal, node\.preemption\)``\. When the reflex must wait, it is **armed**: it claims its resources, so ``conflicting\_owners\(\)`` reports the claim and no deliberative proposal can launch on them meanwhile\. The armed reflex starts the moment its last owner releases — from the owner's task, before any later tick — and armed reflexes are admitted in priority order\. To **preempt** an owner, its task is cancelled at its current ``await`` \(even inside a mandatory block\), ``on\_preempted\(\)`` runs bounded by ``safe\_stop\_timeout\_s`` \(a hook that raises or overruns is logged and abandoned\), and the rollback walk runs only if the owner sets ``rollback\_on\_preempt = True``\. The owner's Result has ``preempted=True`` and ``interrupted=True`` and is never retried\.
+__Arbitration\.__ The runtime launches every reflex proposal with ``ActionMasterNode\.launch\_reflex\(proposal, node\.preemption\)``\. When the reflex must wait, it is **armed**: it claims its resources, so ``conflicting\_owners\(\)`` reports the claim and no deliberative proposal can launch on them meanwhile\. The armed reflex starts the moment its last owner releases — from the owner's task, before any later tick — and armed reflexes are admitted in priority order: a lower\-priority armed reflex is not admitted on a resource that a higher\-priority armed reflex still waits for, and every armed reflex keeps its claim until it starts or is cancelled\. Cancelling an armed reflex \(``ActionMasterNode\.cancel\(\)``\) withdraws it: an owner that was only waiting to hand over to it carries on\. To **preempt** an owner, its task is cancelled at its current ``await`` \(even inside a mandatory block\), ``on\_preempted\(\)`` runs bounded by ``safe\_stop\_timeout\_s`` \(a hook that raises or overruns is logged and abandoned\), and the rollback walk runs only if the owner sets ``rollback\_on\_preempt = True``\. The safe\-stop \(with that walk\) runs at most once per run: it is shielded, so a later cancel — a second reflex, ``emergency\_stop\(\)``, shutdown — waits for it instead of cutting it short, and a ``WAIT\_FOR\_BLOCK`` hand\-off runs it in the master's task, outside the action's ``timeout\_s``\. The cancel is also recorded on the node, so a step that completes in the same event\-loop turn cannot swallow it \(``asyncio\.wait\_for`` on Python 3\.10\)\. The owner's Result has ``preempted=True`` and ``interrupted=True`` and is never retried; an awaited ``dispatch\(\)`` preempted before its first step returns that Result rather than raising\.
 
 __Decision table\.__ T\_admit is the time from ``launch\_reflex\(\)`` to the reflex action's ``execute\(\)`` being entered\. With several owners each is handled by its row, and T\_admit is the maximum\.
 
@@ -1500,7 +1500,7 @@ __Enforced by the framework\.__
 - Deliberative atomicity of mandatory blocks \(§17\.5\)\.
 - Preemption, arming, reflex\-over\-reflex waiting and de\-duplication as in the table\.
 - The ``safe\_stop\_timeout\_s`` bound on ``on\_preempted\(\)`` and the ``reflex\_eval\_timeout\_s`` bound on event\-lane evaluation\.
-- No retry after a run that was interrupted, was preempted, or ended with a ``RollbackError``\.
+- No retry after a run that was interrupted, was preempted, or ended with a ``RollbackError``; nor while a cancel, a reflex preemption or an interrupt is pending on the node, or a reflex is armed on any of its resources\.
 
 __Delegated to the application\.__
 

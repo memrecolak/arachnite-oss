@@ -188,7 +188,7 @@ class SenseMasterNode\(BaseNode\):
 
     def returned\_this\_tick\(self, signal: Signal\) \-> bool: \.\.\.
 
-`returned_this_tick()` reports whether a signal is one of the objects the most recent `read_all()` returned \(and published\), by identity\. A bus subscriber that defers what it receives to a later tick uses it to skip this tick’s own sense output — see **StateUpdateSignal** below\.
+`read_all()` never lets a raising bus subscriber \(a dashboard, a logging hook, a transport\) abort the tick: every publish completes, the `SignalBusError` is logged at ERROR, and the reflex and deliberation stages run as usual\. `returned_this_tick()` reports whether a signal is one of the objects the most recent `read_all()` returned \(and published\), by identity\. A bus subscriber that defers what it receives to a later tick uses it to skip this tick’s own sense output — see **StateUpdateSignal** below\.
 
 ### __Signal Merge Policies__
 
@@ -894,6 +894,8 @@ class LaunchStatus\(Enum\):
     VETOED    = 'vetoed'      \# an ActionGuard denied the proposal
 
     NOT\_FOUND = 'not\_found'   \# no ActionNode with that action\_id
+
+    CLOSED    = 'closed'      \# master closed \(shutdown\); nothing new starts
 
 @dataclass\(frozen=True\)
 

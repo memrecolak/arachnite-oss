@@ -235,11 +235,17 @@ class SignalBus:
         Publish a batch of signals concurrently.
 
         Each signal is published independently; errors in one signal's
-        subscribers do not prevent others from being delivered.
+        subscribers do not prevent others from being delivered. Every publish
+        completes before the first SignalBusError (if any) is re-raised.
         """
         if not signals:
             return
-        await asyncio.gather(*(self.publish(s) for s in signals))
+        outcomes = await asyncio.gather(
+            *(self.publish(s) for s in signals), return_exceptions=True
+        )
+        for outcome in outcomes:
+            if isinstance(outcome, BaseException):
+                raise outcome
 
     # ── Introspection ─────────────────────────────────────────────────────────
 

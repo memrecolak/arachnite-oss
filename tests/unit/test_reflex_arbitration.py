@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from collections.abc import Callable
 
 import pytest
 
@@ -902,3 +903,234 @@ class TestReflexAdmission:
         # names put the running reflex ahead of a deliberative owner.
         for round_no in range(8):
             await _preempt_beside_running_reflex(round_no)
+
+
+# ── Reflex-path review regressions (docs/audits 2026-10-26) ───────────────────
+
+class _Braking(Gated):
+    """Gated action whose safe-stop takes ``stop_s`` and logs begin/end."""
+
+    def __init__(
+        self, bus: SignalBus, node_id: str, resources: set[str], log: list[str],
+        stop_s: float = 0.0,
+    ) -> None:
+        super().__init__(bus, node_id, resources, log=log)
+        self.events = log
+        self.stop_s = stop_s
+
+    async def on_preempted(self, proposal: Proposal, preempted_by: Proposal) -> None:
+        self.events.append(f"{self.node_id} brake begin")
+        await asyncio.sleep(self.stop_s)
+        self.events.append(f"{self.node_id} brake end")
+
+
+class _BlockOwner(MultiStepActionNode):
+    """s0 → [b1, b2] (mandatory, undoable) → s3; logs steps, safe-stops, undos."""
+    node_id   = "Owner"
+    resources = frozenset({"arm"})
+    timeout_s = 10.0
+
+    def __init__(self, bus: SignalBus, log: list[str], step_s: float = 0.05) -> None:
+        super().__init__(bus)
+        self.log = log
+        self.step_s = step_s
+        self.run = 0
+        self.fail_b2_on_run: int | None = None
+        self.brake_s = 0.0
+        self.after_step: Callable[[str], None] | None = None
+
+    def _undo(self, name: str):  # type: ignore[no-untyped-def]
+        async def _rollback() -> None:
+            self.log.append(f"undo {name}")
+            await asyncio.sleep(self.step_s)
+        return _rollback
+
+    def steps(self) -> list[ActionStep]:
+        return [
+            ActionStep("s0"),
+            ActionStep("b1", interruptible=False, rollback=self._undo("b1")),
+            ActionStep("b2", interruptible=False, rollback=self._undo("b2")),
+            ActionStep("s3"),
+        ]
+
+    async def execute_step(
+        self, step: ActionStep, proposal: Proposal, completed: list[StepResult]
+    ) -> StepResult:
+        if step.name == "s0":
+            self.run += 1
+        self.log.append(f"run{self.run} {step.name}")
+        await asyncio.sleep(self.step_s)
+        if self.after_step is not None:
+            self.after_step(step.name)
+        if step.name == "b2" and self.run == self.fail_b2_on_run:
+            return StepResult(step_name="b2", success=False, abort_sequence=True)
+        return StepResult(step_name=step.name, success=True)
+
+    async def on_preempted(self, proposal: Proposal, preempted_by: Proposal) -> None:
+        self.log.append(f"brake begin ({preempted_by.action_id})")
+        await asyncio.sleep(self.brake_s)
+        self.log.append(f"brake end ({preempted_by.action_id})")
+
+
+def _block_master(step_s: float = 0.05) -> tuple[ActionMasterNode, _BlockOwner, list[str]]:
+    am = ActionMasterNode(bus=SignalBus())
+    log: list[str] = []
+    owner = _BlockOwner(am.bus, log, step_s)
+    am.register(owner)
+    for node_id in ("R_wait", "R_now"):
+        _gated(am, node_id, {"arm"}, hold=False, log=log)
+    return am, owner, log
+
+
+class TestReviewRegressions:
+    @pytest.mark.asyncio
+    async def test_higher_priority_claim_survives_a_lower_reflex_admission(self) -> None:
+        """R01: admitting a lower armed reflex keeps a higher armed reflex's claim and order"""
+        log: list[str] = []
+        am = ActionMasterNode(bus=SignalBus())
+        d_arm = _Braking(am.bus, "D_arm", {"arm"}, log)
+        d_grip = _Braking(am.bus, "D_grip", {"gripper"}, log, stop_s=0.2)
+        am.register(d_arm)
+        am.register(d_grip)
+        _gated(am, "R_low", {"arm"}, hold=False, log=log)
+        _gated(am, "R_high", {"arm", "gripper"}, hold=False, log=log)
+        _gated(am, "D3", {"arm"}, hold=False, log=log)
+        am.launch(_p("D_arm"))
+        am.launch(_p("D_grip"))
+        await d_arm.started.wait()
+        await d_grip.started.wait()
+        assert am.launch_reflex(_p("R_low", 210)).status is LaunchStatus.ARMED
+        assert am.launch_reflex(_p("R_high", 250)).status is LaunchStatus.ARMED
+        await _until(lambda: "D_arm brake end" in log)
+        # D_grip is still braking: R_high waits, R_low must not jump it, and
+        # R_high's claim on the arm keeps deliberation off it.
+        assert set(am.armed_reflexes()) == {"R_high", "R_low"}
+        blocked = am.launch(_p("D3", 60))
+        assert blocked.status is LaunchStatus.BLOCKED
+        assert "R_high" in blocked.owners
+        assert await am.wait_idle(2.0)
+        assert "D3" not in log
+        assert log.index("R_high") < log.index("R_low")
+
+    @pytest.mark.asyncio
+    async def test_preempt_landing_as_a_step_finishes_stops_the_owner(self) -> None:
+        """R02: a preempt in the turn a step completes is not swallowed (Python 3.10 wait_for)"""
+        am, owner, log = _block_master(step_s=0.02)
+
+        def arm_reflex(step: str) -> None:
+            if step == "s0":
+                asyncio.get_running_loop().call_soon(
+                    lambda: log.append(am.launch_reflex(_p("R_now", 250)).status.name)
+                )
+
+        owner.after_step = arm_reflex
+        am.launch(_p("Owner"))
+        assert await am.wait_idle(2.0)
+        armed_at = log.index("ARMED")
+        assert [e for e in log[armed_at:] if e.startswith("run")] == []
+        assert _results_by_id(am)["Owner"].preempted is True
+
+    @pytest.mark.asyncio
+    async def test_preempt_during_a_hand_off_does_not_safe_stop_or_undo_twice(self) -> None:
+        """R03: a PREEMPT reflex during a WAIT_FOR_BLOCK hand-off reuses the running safe-stop"""
+        am, owner, log = _block_master()
+        owner.rollback_on_preempt = True
+        am.launch(_p("Owner"))
+        await _until(lambda: "run1 b1" in log)
+        am.launch_reflex(_p("R_wait", 240), ReflexPreemption.WAIT_FOR_BLOCK)
+        await _until(lambda: "undo b2" in log)                 # hand-off walk running
+        am.launch_reflex(_p("R_now", 250))
+        assert await am.wait_idle(2.0)
+        assert log.count("undo b1") == 1 and log.count("undo b2") == 1
+        assert sum(e.startswith("brake begin") for e in log) == 1
+        assert _results_by_id(am)["Owner"].preempted is True
+
+    @pytest.mark.asyncio
+    async def test_failed_run_is_not_retried_while_a_reflex_waits(self) -> None:
+        """R04: a retry never restarts the owner while a reflex is armed on its resources"""
+        am, owner, log = _block_master()
+        owner.max_retries = 1
+        owner.fail_b2_on_run = 1
+        am.launch(_p("Owner"))
+        await _until(lambda: "run1 b1" in log)
+        am.launch_reflex(_p("R_wait", 240), ReflexPreemption.WAIT_FOR_BLOCK)
+        assert await am.wait_idle(2.0)
+        assert not any(e.startswith("run2") for e in log)
+        assert "R_wait" in log
+
+    @pytest.mark.asyncio
+    async def test_hand_off_safe_stop_is_outside_the_action_timeout(self) -> None:
+        """R05: the hand-off safe-stop is bounded by safe_stop_timeout_s, not timeout_s"""
+        am, owner, log = _block_master(step_s=0.1)
+        owner.timeout_s = 0.45            # s0+b1+b2 fit; the 0.3 s brake would not
+        owner.safe_stop_timeout_s = 1.0
+        owner.max_retries = 1
+        owner.brake_s = 0.3
+        am.launch(_p("Owner"))
+        await _until(lambda: "run1 b1" in log)
+        am.launch_reflex(_p("R_wait", 240), ReflexPreemption.WAIT_FOR_BLOCK)
+        assert await am.wait_idle(3.0)
+        assert "brake end (R_wait)" in log
+        assert not any(e.startswith("run2") for e in log)
+        result = _results_by_id(am)["Owner"]
+        assert result.preempted is True and result.error is None
+
+    @pytest.mark.asyncio
+    async def test_cancel_all_lets_a_running_safe_stop_finish(self) -> None:
+        """R06: cancel_all() (emergency_stop, shutdown) does not cut an owner's safe-stop"""
+        log: list[str] = []
+        am = ActionMasterNode(bus=SignalBus())
+        owner = _Braking(am.bus, "Owner", {"arm"}, log, stop_s=0.15)
+        owner.safe_stop_timeout_s = 1.0
+        am.register(owner)
+        _gated(am, "Retract", {"arm"}, hold=False, log=log)
+        am.launch(_p("Owner"))
+        await owner.started.wait()
+        am.launch_reflex(_p("Retract", 250))
+        await _until(lambda: "Owner brake begin" in log)
+        await am.cancel_all(timeout=2.0)
+        assert "Owner brake end" in log
+        assert log.count("Owner brake begin") == 1
+        assert _results_by_id(am)["Owner"].preempted is True
+
+    @pytest.mark.asyncio
+    async def test_closed_master_refuses_new_work_until_setup(self) -> None:
+        """cancel_all()/close() close the master: launches return CLOSED until setup()"""
+        am, _, _, _ = _master()
+        await am.cancel_all()
+        assert am.launch(_p("Retract")).status is LaunchStatus.CLOSED
+        assert am.launch_reflex(_p("Retract", 250)).status is LaunchStatus.CLOSED
+        assert (await am.dispatch(_p("Retract"))).success is False
+        await am.setup()
+        assert am.launch(_p("Retract")).status is LaunchStatus.LAUNCHED
+        assert await am.wait_idle(1.0)
+        am.close()
+        assert am.launch(_p("Retract")).status is LaunchStatus.CLOSED
+
+    @pytest.mark.asyncio
+    async def test_dispatch_preempted_before_start_returns_a_result(self) -> None:
+        """R08: an awaited dispatch() preempted before its first step returns, not raises"""
+        am = ActionMasterNode(bus=SignalBus())
+        _gated(am, "Direct", {"arm"})
+        _gated(am, "Retract", {"arm"}, hold=False)
+        task = asyncio.ensure_future(am.dispatch(_p("Direct"), origin="direct"))
+        await asyncio.sleep(0)                 # dispatch awaits the unstarted task
+        assert am.launch_reflex(_p("Retract", 250)).status is LaunchStatus.ARMED
+        result = await asyncio.wait_for(task, 1.0)
+        assert result.preempted is True and result.success is False
+        assert await am.wait_idle(1.0)
+
+    @pytest.mark.asyncio
+    async def test_cancelling_an_armed_reflex_withdraws_its_hand_off(self) -> None:
+        """R11: cancel() of an armed WAIT_FOR_BLOCK reflex lets the owner run on"""
+        am, _, log = _block_master()
+        am.launch(_p("Owner"))
+        await _until(lambda: "run1 b1" in log)
+        am.launch_reflex(_p("R_wait", 240), ReflexPreemption.WAIT_FOR_BLOCK)
+        await am.cancel("R_wait")
+        assert am.armed_reflexes() == {}
+        assert await am.wait_idle(2.0)
+        result = _results_by_id(am)["Owner"]
+        assert result.success is True and result.preempted is False
+        assert "run1 s3" in log
+        assert not any(e.startswith("brake") for e in log)

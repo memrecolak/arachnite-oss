@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import contextvars
 import time
 from collections.abc import Callable
 from typing import Protocol, runtime_checkable
@@ -50,6 +51,13 @@ from arachnite.nodes.sense import BaseSenseNode, SenseMasterNode
 from arachnite.safety_monitor import MonitorState
 from arachnite.shutdown import ShutdownCoordinator
 from arachnite.supervisor import NodeSupervisor
+
+# True inside tick() and in every task it starts (node calls, launched
+# actions): emergency_stop() called from there must not await the tick that
+# is awaiting its caller.
+_IN_TICK: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "arachnite_in_tick", default=False,
+)
 
 # ── Tick-stage instrumentation protocol ──────────────────────────────────────
 #
@@ -183,6 +191,7 @@ class ArachniteRuntime:
         self._last_results: list[Result]  = []
         self._shutdown_phase = ShutdownPhase.NOT_STARTED
         self._loop_task: asyncio.Task[None] | None = None
+        self._emergency_task: asyncio.Task[None] | None = None
         self._teardown_timeout_s: float = 5.0
         self._shutdown_coordinator = shutdown_coordinator or ShutdownCoordinator(
             teardown_timeout_s=self._teardown_timeout_s,
@@ -424,12 +433,27 @@ class ArachniteRuntime:
         ``on_preempted()`` safe-stop hook runs (bounded), no rollback. This is
         a shutdown path; cutting into a mandatory block to *respond* to a
         hazard is the job of a PREEMPT reflex (ADR 0005).
+
+        Called from node code inside a tick, or from an action the tick
+        launched, the rest of the shutdown is handed to a separate task and
+        this call returns at once: finishing it here would cancel the tick
+        that is awaiting the caller. Nothing new can start meanwhile.
         Spec reference: Section 15.3.
         """
         self._running = False
         self._stop_event.set()
         self._stop_reflex_lane()
+        self._action_master.close()
         self._logger.info("Emergency stop initiated")
+        if _IN_TICK.get():
+            self._emergency_task = asyncio.get_running_loop().create_task(
+                self._finish_emergency_stop(), name="arachnite-emergency-stop",
+            )
+            return
+        await self._finish_emergency_stop()
+
+    async def _finish_emergency_stop(self) -> None:
+        """Cancel the tick loop, then every action (safe-stop), then teardown."""
         # Cancel and await the tick loop BEFORE stopping actions and tearing
         # masters down, so no tick can launch anything new or race node
         # teardown. Skipped when called from within the loop itself
@@ -734,15 +758,19 @@ class ArachniteRuntime:
                 error_type=type(exc).__name__,
             )
             return
+        if not self._lane_active or not self._running:
+            return  # stop() / emergency_stop() began during the evaluation
         await self._launch_reflexes(proposals)
 
     async def _launch_reflexes(self, reflex_proposals: list[Proposal]) -> None:
         """
         Launch reflex proposals (priority order) through the action master's
-        arbitration, then yield once so a started reflex action enters
-        ``execute()`` now rather than after the rest of the tick.
+        arbitration, then yield a few loop turns so a started reflex action
+        enters ``execute()``, and a preempted owner starts its safe-stop
+        (which runs in a shielded inner task), now rather than after the rest
+        of the tick.
 
-        On Python < 3.12 one yield is not always enough: the reflex action's
+        On Python < 3.12 these turns are not always enough: the reflex action's
         first slice (and a preempted owner's safe-stop) may run after the
         reflex stage instead. The reflex is still launched, and its resources
         claimed, before deliberation; only the stage it is charged to differs.
@@ -784,6 +812,12 @@ class ArachniteRuntime:
                 )
             elif outcome.status is LaunchStatus.LAUNCHED:
                 started = True
+            elif outcome.status is LaunchStatus.CLOSED:
+                self._logger.debug(
+                    "Reflex dropped: action master closed (shutting down)",
+                    action_id=rp.action_id,
+                    instinct_id=rp.instinct_id,
+                )
             else:
                 self._logger.debug(
                     "Reflex already being handled",
@@ -791,7 +825,10 @@ class ArachniteRuntime:
                     instinct_id=rp.instinct_id,
                 )
         if started:
-            await asyncio.sleep(0)
+            # One turn starts the reflex / owner task; the next lets a
+            # shielded safe-stop's inner task run its first slice.
+            for _ in range(3):
+                await asyncio.sleep(0)
 
     async def wait_idle(self, timeout: float | None = None) -> bool:
         """
@@ -921,6 +958,14 @@ class ArachniteRuntime:
         ``await wait_idle()`` before asserting on their effects; their
         Results appear in the next tick's ``ctx.last_results``.
         """
+        token = _IN_TICK.set(True)
+        try:
+            await self._run_tick()
+        finally:
+            _IN_TICK.reset(token)
+
+    async def _run_tick(self) -> None:
+        """Pipeline body of :meth:`tick`."""
         self._tick_count += 1
         tick_start = time.monotonic()
 
