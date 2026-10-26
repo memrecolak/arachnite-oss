@@ -144,6 +144,7 @@ SITES: tuple[Site, ...] = (
                 (
                     "ActionMasterNode._run",
                     "ActionMasterNode._execute_with_retry",
+                    "ActionMasterNode._retry_blocked",
                     "ActionMasterNode.dispatch",
                     "ActionMasterNode.dispatch_many",
                     "ActionMasterNode._dispatch_one",
@@ -195,6 +196,9 @@ SITES: tuple[Site, ...] = (
                     "ActionMasterNode._start",
                     "ActionMasterNode._release",
                     "ActionMasterNode._on_task_done",
+                    "ActionMasterNode._redirect_handoffs",
+                    "ActionMasterNode.cancel",
+                    "ActionMasterNode.close",
                 ),
             ),
         ),
@@ -214,10 +218,12 @@ SITES: tuple[Site, ...] = (
             (
                 "arachnite/nodes/action.py",
                 (
+                    "_run_shielded",
                     "BaseActionNode._run_safe_stop",
                     "MultiStepActionNode.request_reflex_preempt",
                     "MultiStepActionNode._run_safe_stop",
                     "MultiStepActionNode._handle_reflex_preempt",
+                    "ActionMasterNode.cancel_all",
                 ),
             ),
         ),
