@@ -1,7 +1,7 @@
 """
 benchmarks/safety_site_mutation.py
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-Coverage and mutation-testing evidence for the six safety enforcement sites.
+Coverage and mutation-testing evidence for the safety enforcement sites.
 
 Motivation (revision experiment E7, referee point R2-D): Table 6 of the paper
 backs each safety property with file-level test counts only — no line/branch
@@ -30,6 +30,13 @@ Each site is exercised by the same test modules Table 6 lists for it, so the
 mutation score answers "would the tests the paper cites notice a defect in
 the enforcement code?" — the referee's actual question.
 
+v0.13 (ADR 0005) moved action totality into the task body
+(``ActionMasterNode._run``) and added two sites: actuator exclusivity
+(resource ownership and reflex arbitration) and the preemption safe-stop.
+Every surviving mutant is also written to a CSV (one row per mutant, with
+its source line and diff) for manual classification; rows whose source
+line is a logger call are pre-labelled ``log-only`` as a hint.
+
 cosmic-ray mutates source files IN PLACE during ``exec`` (and restores them
 afterwards). The tool therefore refuses to run the mutation mode on a dirty
 working copy of a target module unless ``--allow-dirty`` is given.
@@ -46,6 +53,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+import csv
 import datetime as _dt
 import json
 import platform
@@ -83,10 +91,16 @@ SITES: tuple[Site, ...] = (
         prop="Reflex responsiveness",
         targets=(
             ("arachnite/nodes/instinct.py", ("InstinctMasterNode.evaluate_reflexes",)),
+            (
+                "arachnite/runtime.py",
+                ("ArachniteRuntime._launch_reflexes", "ArachniteRuntime._on_reflex_signal"),
+            ),
         ),
         tests=(
             "tests/unit/test_instinct.py",
             "tests/integration/test_framework_contracts.py",
+            "tests/integration/test_reflex_arbitration_runtime.py",
+            "tests/integration/test_reflex_event_lane.py",
         ),
     ),
     Site(
@@ -117,6 +131,7 @@ SITES: tuple[Site, ...] = (
         ),
         tests=(
             "tests/unit/test_action.py",
+            "tests/unit/test_reflex_arbitration.py",
             "tests/integration/test_interrupt_policies.py",
         ),
     ),
@@ -126,13 +141,23 @@ SITES: tuple[Site, ...] = (
         targets=(
             (
                 "arachnite/nodes/action.py",
-                ("ActionMasterNode.dispatch", "ActionMasterNode.dispatch_many"),
+                (
+                    "ActionMasterNode._run",
+                    "ActionMasterNode._execute_with_retry",
+                    "ActionMasterNode.dispatch",
+                    "ActionMasterNode.dispatch_many",
+                    "ActionMasterNode._dispatch_one",
+                ),
             ),
         ),
         tests=(
             "tests/unit/test_action.py",
+            "tests/unit/test_reflex_arbitration.py",
             "tests/integration/test_framework_contracts.py",
         ),
+        note="v0.13: actions run as tasks, so execute() is wrapped by the task "
+             "body _run (which turns a preemption cancel into a Result) and "
+             "_execute_with_retry (timeout / exception -> Result).",
     ),
     Site(
         key="supervisor_bounded_restart",
@@ -152,6 +177,58 @@ SITES: tuple[Site, ...] = (
             ("arachnite/distributed/permissions.py", ("validate_permissions",)),
         ),
         tests=("tests/unit/test_permissions.py",),
+    ),
+    Site(
+        key="actuator_exclusivity",
+        prop="Actuator exclusivity",
+        targets=(
+            (
+                "arachnite/nodes/action.py",
+                (
+                    "ActionMasterNode._running_conflicts",
+                    "ActionMasterNode._claim_conflicts",
+                    "ActionMasterNode.conflicting_owners",
+                    "ActionMasterNode.launch",
+                    "ActionMasterNode.launch_reflex",
+                    "ActionMasterNode._preempt",
+                    "ActionMasterNode._admit_armed",
+                    "ActionMasterNode._start",
+                    "ActionMasterNode._release",
+                    "ActionMasterNode._on_task_done",
+                ),
+            ),
+        ),
+        tests=(
+            "tests/unit/test_reflex_arbitration.py",
+            "tests/integration/test_reflex_arbitration_runtime.py",
+            "tests/integration/test_runtime_monitor_state.py",
+        ),
+        note="ADR 0005: at most one running action owns a resource; a "
+             "conflicting reflex preempts (PREEMPT) or is armed until the "
+             "block ends (WAIT_FOR_BLOCK); armed reflexes claim resources.",
+    ),
+    Site(
+        key="preemption_safe_stop",
+        prop="Preemption safe-stop",
+        targets=(
+            (
+                "arachnite/nodes/action.py",
+                (
+                    "BaseActionNode._run_safe_stop",
+                    "MultiStepActionNode.request_reflex_preempt",
+                    "MultiStepActionNode._run_safe_stop",
+                    "MultiStepActionNode._handle_reflex_preempt",
+                ),
+            ),
+        ),
+        tests=(
+            "tests/unit/test_action.py",
+            "tests/unit/test_reflex_arbitration.py",
+            "tests/integration/test_reflex_arbitration_runtime.py",
+        ),
+        note="The preempted owner's on_preempted() runs (bounded) before the "
+             "reflex starts; rollback only with rollback_on_preempt, never "
+             "restarting a walk already in progress.",
     ),
 )
 
@@ -370,7 +447,8 @@ def _prune_session(
         con.close()
 
 
-def _read_outcomes(session: Path, ranges: dict[str, tuple[int, int]]) -> dict[str, object]:
+def _read_outcomes(session: Path, ranges: dict[str, tuple[int, int]],
+                   source_lines: list[str] | None = None) -> dict[str, object]:
     def qual_of(line: int) -> str | None:
         for qual, (lo, hi) in ranges.items():
             if lo <= line <= hi:
@@ -381,7 +459,7 @@ def _read_outcomes(session: Path, ranges: dict[str, tuple[int, int]]) -> dict[st
     try:
         rows = con.execute(
             "SELECT ms.job_id, ms.operator_name, ms.start_pos_row, "
-            "       wr.worker_outcome, wr.test_outcome "
+            "       wr.worker_outcome, wr.test_outcome, wr.diff "
             "FROM mutation_specs ms "
             "LEFT JOIN work_results wr ON wr.job_id = ms.job_id"
         ).fetchall()
@@ -390,7 +468,7 @@ def _read_outcomes(session: Path, ranges: dict[str, tuple[int, int]]) -> dict[st
 
     counts = {"killed": 0, "killed_by_timeout": 0, "survived": 0, "incompetent": 0, "unexecuted": 0}
     survivors: list[dict[str, object]] = []
-    for job_id, operator, line, worker, test in rows:
+    for job_id, operator, line, worker, test, diff in rows:
         worker = (worker or "").upper()
         test = (test or "").upper()
         if worker == "TIMEOUT":
@@ -399,9 +477,13 @@ def _read_outcomes(session: Path, ranges: dict[str, tuple[int, int]]) -> dict[st
             counts["killed"] += 1
         elif test == "SURVIVED":
             counts["survived"] += 1
+            src = ""
+            if source_lines and 0 < int(line) <= len(source_lines):
+                src = source_lines[int(line) - 1].strip()
             survivors.append({
                 "job_id": job_id, "operator": operator,
                 "line": line, "function": qual_of(int(line)),
+                "source": src, "diff": diff or "",
             })
         elif test == "INCOMPETENT" or worker in ("EXCEPTION", "ABNORMAL"):
             counts["incompetent"] += 1
@@ -460,7 +542,8 @@ def run_mutation(sites: list[Site], max_mutants: int | None, timeout_factor: flo
             if kept:
                 subprocess.run([cr, "exec", str(config), str(session)], cwd=REPO_ROOT, check=True)
 
-            outcome = _read_outcomes(session, ranges)
+            source_lines = (REPO_ROOT / module_rel).read_text(encoding="utf-8").splitlines()
+            outcome = _read_outcomes(session, ranges, source_lines)
             site_out[module_rel] = {
                 "functions": {q: {"lines": [lo, hi]} for q, (lo, hi) in ranges.items()},
                 "test_command": cmd,
@@ -478,6 +561,32 @@ def run_mutation(sites: list[Site], max_mutants: int | None, timeout_factor: flo
     return report
 
 
+def _auto_class(source: str) -> str:
+    """Hint for manual classification; the CSV's ``classification`` stays empty"""
+    if "logger." in source or "self._logger" in source:
+        return "log-only"
+    return ""
+
+
+def write_survivor_csv(mutation: dict[str, object], path: Path) -> int:
+    """One row per surviving mutant, for manual classification (R2-1)"""
+    rows = 0
+    with open(path, "w", encoding="utf-8", newline="") as fh:
+        writer = csv.writer(fh)
+        writer.writerow(["site", "module", "function", "line", "operator",
+                         "source", "diff", "auto_hint", "classification", "note"])
+        for site_key, modules in mutation.items():
+            for module_rel, mut in modules.items():  # type: ignore[attr-defined]
+                for sv in mut["surviving_mutants"]:
+                    writer.writerow([
+                        site_key, module_rel, sv["function"], sv["line"],
+                        sv["operator"], sv["source"], sv["diff"],
+                        _auto_class(str(sv["source"])), "", "",
+                    ])
+                    rows += 1
+    return rows
+
+
 # --------------------------------------------------------------------------
 # entry point
 # --------------------------------------------------------------------------
@@ -486,7 +595,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--mode", choices=("coverage", "mutation", "both"), default="both")
     parser.add_argument("--sites", default=None,
-                        help="comma-separated site keys (default: all six)")
+                        help="comma-separated site keys (default: all)")
     parser.add_argument("--coverage-json", default=None,
                         help="path for/of the coverage.py JSON report")
     parser.add_argument("--skip-suite", action="store_true",
@@ -537,6 +646,10 @@ def main() -> None:
     stamp = _dt.datetime.now().strftime("%Y%m%d_%H%M%S")
     out_file = RESULTS_DIR / f"safety_site_mutation_{stamp}.json"
     out_file.write_text(json.dumps(doc, indent=2) + "\n", encoding="utf-8")
+    if "mutation" in doc:
+        csv_file = RESULTS_DIR / f"safety_site_survivors_{stamp}.csv"
+        n_rows = write_survivor_csv(doc["mutation"], csv_file)  # type: ignore[arg-type]
+        print(f"[mutation] {n_rows} surviving mutants written to {csv_file}")
 
     # human summary
     print("\n=== safety-site summary ===")
