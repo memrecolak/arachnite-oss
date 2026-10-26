@@ -29,8 +29,8 @@ close_gripper + raise_gripper. Deliberation can never cut into it. The
 collision reflex declares ReflexPreemption.PREEMPT, so a collision inside the
 block cancels the step, runs PickAndPlaceAction.on_preempted() (freeze the
 arm, keep the grip -- no rollback, nothing is dropped) and then retracts the
-arm with the object still held. Once the hazard has cleared,
-PlaceHeldObjectInstinct has deliberation finish the job.
+arm with whatever the gripper holds. If an object is held, once the hazard
+has cleared PlaceHeldObjectInstinct has deliberation finish the job.
 """
 
 from __future__ import annotations
@@ -460,7 +460,7 @@ class EmergencyRetractAction(BaseActionNode):
     obstacle.
 
     Co-location rule: must be on the same AgentNode as CollisionReflex.
-    timeout_s is short — this must complete before the next tick.
+    timeout_s is short so a hung retract frees the "arm" resource quickly.
     """
     node_id   = "EmergencyRetractAction"
     timeout_s = 1.0

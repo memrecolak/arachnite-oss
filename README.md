@@ -8,6 +8,13 @@ to build agents that run on edge devices (Raspberry Pi, Jetson Nano), laptops,
 or cloud servers, all connected by a pluggable transport layer.
 
 - **Async-first**: every node interface is `asyncio`-native
+- **Non-blocking actions**: actions run as tasks beside the tick loop, so sensing,
+  reflexes and deliberation continue while a long multi-step action executes
+- **Actuator arbitration**: actions declare the `resources` they command; at most
+  one running action owns a resource, and a reflex takes it over through the
+  owner's safe-stop (`ReflexPreemption`)
+- **Event-driven reflexes**: optional `reflex_mode="event"` evaluates a reflex the
+  moment its trigger signal is published, including signals a sensor `push()`es
 - **Typed**: strict type annotations throughout (mypy strict)
 - **Pluggable transports**: in-process, MQTT, NATS, Redis
 - **Distributed by manifest**: declarative multi-device deployment
@@ -158,10 +165,41 @@ registered instances:
 
 1. Nodes never hold references to each other; communication goes through `SignalBus`.
 2. `ReflexInstinctNode` and its target `ActionNode` must be on the same `AgentNode`.
-3. `MultiStepActionNode` mandatory blocks cannot be interrupted (except `emergency_stop`).
+3. `MultiStepActionNode` mandatory blocks cannot be interrupted by deliberation; only a
+   `ReflexPreemption.PREEMPT` reflex (through the owner's safe-stop) or `emergency_stop()` cuts in.
 4. `execute()` on any `ActionNode` must always return a `Result` — never raise.
 5. `evaluate()` on any `InstinctNode` must return `None` when not applicable — never raise.
 6. All node I/O must be async — wrap blocking hardware calls in `asyncio.to_thread()`.
+
+### Actions, resources and reflex arbitration
+
+The runtime launches each chosen action as a task and keeps ticking. A
+`Result` appears in `ctx.last_results` on the tick after the action
+completes. In tests, use `await runtime.wait_idle()` to wait for in-flight
+actions. Declare the actuators an action commands, and give it a safe-stop
+for when a reflex takes them away:
+
+```python
+class PickAndPlace(MultiStepActionNode):
+    node_id   = "PickAndPlace"
+    resources = frozenset({"arm", "gripper"})   # exclusive while running
+
+    async def on_preempted(self, proposal, preempted_by) -> None:
+        ...  # brake and hold; keep the grip; do not undo work
+
+class CollisionReflex(BaseReflexInstinctNode):
+    node_id    = "CollisionReflex"
+    priority   = 250
+    preemption = ReflexPreemption.PREEMPT       # or WAIT_FOR_BLOCK
+```
+
+A deliberative proposal that needs a busy resource either interrupts a
+lower-priority owner (at the owner's next safe step boundary, then takes
+over) or waits. A reflex with `PREEMPT` cancels the owner at once, even inside
+a mandatory block, and runs the owner's safe-stop before the reflex action
+starts. `WAIT_FOR_BLOCK` lets a running mandatory block finish first. See
+[`spec/03_runtime.md`](spec/03_runtime.md) and
+[`examples/robot_arm/`](examples/robot_arm).
 
 ### Runtime vs. runtime-less
 
@@ -174,7 +212,7 @@ bus = SignalBus()
 action_master = ActionMasterNode(bus)
 action_master.register(MyActionNode(bus))
 # Drive it on a loop you own — no runtime, no tick loop:
-result = await action_master.dispatch(proposal)
+result = await action_master.dispatch(proposal)   # awaits the Result
 ```
 
 **Reach for the deliberative runtime only when ≥2 autonomous behaviors compete
@@ -195,12 +233,12 @@ agents:
     transport: nats
     transport_url: ${NATS_URL}
     nodes:
-      - ProximitySense
       - ObjectDetectionSense
   control:
     transport: nats
     transport_url: ${NATS_URL}
     nodes:
+      - ProximitySense      # feeds the reflex: keep it on the reflex's AgentNode
       - JointPositionSense
       - CollisionReflex     # priority 250, reflex
       - EmergencyRetract    # co-located target

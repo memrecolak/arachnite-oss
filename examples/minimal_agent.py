@@ -78,10 +78,13 @@ class HotInstinct(BaseInstinctNode):
 # ── 3. Action node ────────────────────────────────────────────────────────────
 # Extend BaseActionNode and implement execute().
 # Always return a Result — never raise.
+# The runtime launches execute() as a task and keeps ticking; the Result shows
+# up in ctx.last_results on the tick after it finishes.
 
 class CoolDown(BaseActionNode):
     node_id   = "CoolDown"
     timeout_s = 5.0
+    resources = frozenset({"fan"})  # actuators this action commands (exclusive)
 
     async def execute(self, proposal) -> Result:  # type: ignore[override]
         reading = proposal.parameters.get("reading", "?")

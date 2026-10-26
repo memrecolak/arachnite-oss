@@ -12,13 +12,14 @@ Two collision scenarios:
   --collide-at SECONDS   inject a collision at a fixed wall-clock time
                          (default 15 s; the arm is usually idle then)
   --collide-in-block     inject the collision the moment PickAndPlaceAction
-                         starts close_gripper — inside its mandatory block
+                         starts raise_gripper — inside its mandatory block,
+                         with the object already gripped
 
-In the in-block scenario the reflex (ReflexPreemption.PREEMPT) cuts into the
-block: PickAndPlaceAction.on_preempted() freezes the arm and keeps the grip,
-EmergencyRetractAction retracts the arm with the object still held, and once
-the hazard has cleared PlaceHeldObjectInstinct places the object. No object
-is dropped.
+In-block: the PREEMPT reflex cancels raise_gripper mid-step within ~1 tick,
+on_preempted() freezes the arm and keeps the grip (no rollback), and
+EmergencyRetractAction retracts the arm with the object still held. Once the
+hazard has cleared, PlaceHeldObjectInstinct places the object. Nothing is
+dropped.
 
 Run:
     python -m examples.robot_arm.simulate
@@ -69,11 +70,11 @@ async def _collide_at(seconds: float) -> None:
 
 
 async def _collide_in_block(pick: PickAndPlaceAction) -> None:
-    """Background task: sets the collision flag as close_gripper starts."""
-    while not (pick._current_step and pick._current_step.name == "close_gripper"):
+    """Background task: sets the collision flag as raise_gripper starts."""
+    while not (pick._current_step and pick._current_step.name == "raise_gripper"):
         await asyncio.sleep(0.001)
     print("\n" + "=" * 60)
-    print("  *** COLLISION INJECTED inside the mandatory block (close_gripper)")
+    print("  *** COLLISION INJECTED inside the mandatory block (raise_gripper)")
     print("=" * 60 + "\n")
     SIM.collision_imminent = True
 
@@ -168,7 +169,7 @@ def _parse() -> argparse.Namespace:
     parser.add_argument("--collide-at", type=float, default=15.0,
                         help="inject the collision at this time (s)")
     parser.add_argument("--collide-in-block", action="store_true",
-                        help="inject the collision as close_gripper starts")
+                        help="inject the collision as raise_gripper starts")
     parser.add_argument("--reflex-mode", choices=("tick", "event"), default="tick")
     return parser.parse_args()
 

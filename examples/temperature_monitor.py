@@ -8,6 +8,7 @@ A realistic thermal-monitoring agent demonstrating:
   - Reflex instinct (fires when temp > critical threshold, bypasses decision)
   - Multi-step cooling action with a mandatory sustain block and rollback
   - Emergency shutdown action triggered by the reflex
+  - Declared actuator resources: CoolFan owns "fan", EmergencyStop owns "heater"
   - NodeSupervisor restart policy on the action master
   - Structured logging to stdout
 
@@ -15,6 +16,15 @@ Pipeline:
     SimTempSensor
       → WarnInstinct (priority 70, temp > 60 °C)  → CoolFan (multi-step)
       → CriticalReflex (priority 250, temp > 85 °C) → EmergencyStop
+
+Actions run as tasks, so the tick loop keeps sensing while CoolFan works
+through its sequence. The reflex fires on the first tick above 85 °C even if
+CoolFan is inside its mandatory sustain block. EmergencyStop commands a
+different actuator ("heater") than CoolFan ("fan"), so it runs alongside the
+fan sequence instead of preempting it. While CoolFan runs, WarnInstinct's
+equal-priority re-proposals are held, and the next cycle starts once it
+finishes. Ctrl+C triggers a graceful stop(). A running CoolFan finishes its
+sustain block, stops before ramp_down, and its rollback spins the fan down.
 
 Run:
     python examples/temperature_monitor.py
@@ -129,10 +139,12 @@ class CoolFan(MultiStepActionNode):
       sustain   (mandatory)      — run at full speed; cannot be interrupted
       ramp_down (interruptible)  — spin fan back down
 
-    Uses ROLLBACK policy: if interrupted, _undo_sustain is called.
+    Uses ROLLBACK policy: if interrupted after sustain has completed (e.g. by
+    a graceful stop()), _undo_sustain is called.
     """
     node_id          = "CoolFan"
     interrupt_policy = InterruptPolicy.ROLLBACK
+    resources        = frozenset({"fan"})   # the actuator this action commands
 
     def steps(self) -> list[ActionStep]:
         return [
@@ -162,7 +174,7 @@ class CoolFan(MultiStepActionNode):
                                   error=ValueError(f"Unknown step: {step.name}"))
 
     async def _undo_sustain(self) -> None:
-        """Rollback: spin the fan back down if we're interrupted mid-sustain."""
+        """Rollback: spin the fan back down if interrupted after sustain."""
         self.logger.warning("Rolling back sustain — spinning fan down")
         await asyncio.sleep(0.1)
 
@@ -170,9 +182,14 @@ class CoolFan(MultiStepActionNode):
 # ── Emergency stop action (triggered by reflex) ───────────────────────────────
 
 class EmergencyStop(BaseActionNode):
-    """Hard stop. Triggered by CriticalReflex, bypassing the decision node."""
+    """
+    Hard stop: cuts the heater. Triggered by CriticalReflex, bypassing the
+    decision node. Its resource is disjoint from CoolFan's, so cooling keeps
+    running while the heater is cut.
+    """
     node_id   = "EmergencyStop"
     timeout_s = 2.0
+    resources = frozenset({"heater"})
 
     async def execute(self, proposal) -> Result:  # type: ignore[override]
         reading = proposal.parameters.get("reading", "?")

@@ -32,18 +32,18 @@ before concluding something is undocumented:
 One pipeline cycle ("tick") in order:
 
 0. **on_tick_start(tick)** — called on all leaf nodes (sense, instinct, action) via masters; default implementation syncs `self.logger._set_tick(tick)` so every LogEvent.tick reflects the current tick (subclasses overriding must call `super().on_tick_start(tick)`). Runtime additionally syncs its own logger and the four master loggers directly each tick.
-1. **SenseMasterNode.read_all()** — SenseNodes read hardware → list[Signal] (poll_interval_s enforced per node; throttle timestamps are per-sensor, not batch-start)
-2. **Supervisor signal injection** — buffered supervisor signals appended to signals: lifecycle transitions as `SupervisorSignal` (kind `supervisor`: RUNNING/STOPPED/RESTARTING) plus, for FAULTED/DEAD, a typed `NodeFaultSignal` (kind `node_fault`, carrying error_type/error_message). When a leaf node raises during a tick, its master reports the fault to the supervisor; the resulting signals are buffered and surface in `ctx.signals` on the **next** tick (N+1), as both a `supervisor` and a `node_fault` signal.
-3. **ContextNode.update(signals)** — merge signals + last results → Context snapshot (StateUpdateSignals applied to state here; ctx.state is a shallow copy; history deque and inner lists are shallow-copied per snapshot so subsequent ticks do not mutate previously returned Context objects)
-4. **InstinctMasterNode.evaluate_reflexes(ctx)** — reflex instincts fire first, bypass decision (sequential); ActionNotFoundError caught and logged; all reflex results accumulated
-5. **InstinctMasterNode.evaluate_all(ctx)** — normal instincts produce list[Proposal] (trigger_interval_s throttling applied)
-6. **DecisionMasterNode.on_new_proposals_many()** — pick proposals for concurrent dispatch + interrupts; rejected instincts notified via on_proposal_rejected() (covers both fresh and carried-forward pending proposals)
-6b. **Interrupt dispatch** — for each interrupt request, call request_interrupt(); MandatoryBlockViolation caught and logged as WARNING (not suppressed); other exceptions logged as ERROR
-7. **ActionMasterNode.dispatch_many(proposals)** → list[Result] (concurrent via asyncio.gather)
-8. Results merged (reflex + normal) and stored in `_last_results` / `_last_result` for the *next* tick's `_context.update()` to snapshot into ctx.last_results / ctx.last_result (the feedback channel that instincts read to react to outcomes). The runtime clears `_last_results` / `_last_result` to []/None immediately *after* the snapshot is taken — gives last_results a one-tick lifetime (bounded staleness without making the field empty).
+1. **ActionMasterNode.drain_completed()** — collects the Results of action tasks that finished since the previous tick (completion order), for this tick's context.
+2. **SenseMasterNode.read_all()** — SenseNodes read hardware → list[Signal] (poll_interval_s enforced per node; throttle timestamps are per-sensor, not batch-start). Signals pushed with `BaseSenseNode.push()` since the last tick are appended once (they were already published on the bus when pushed).
+3. **Supervisor signal injection** — buffered supervisor signals appended to signals: lifecycle transitions as `SupervisorSignal` (kind `supervisor`: RUNNING/STOPPED/RESTARTING) plus, for FAULTED/DEAD, a typed `NodeFaultSignal` (kind `node_fault`, carrying error_type/error_message). When a leaf node raises during a tick, its master reports the fault to the supervisor; the resulting signals are buffered and surface in `ctx.signals` on the **next** tick (N+1), as both a `supervisor` and a `node_fault` signal. Bus-published StateUpdateSignals buffered since the last tick are appended after them.
+4. **ContextNode.update(signals, results, action_states)** — merge signals + drained results + the `execution_state()` of every running multi-step action → Context snapshot (StateUpdateSignals applied to state here; ctx.state is a shallow copy; history deque and inner lists are shallow-copied per snapshot so subsequent ticks do not mutate previously returned Context objects). The drained results become `ctx.last_results` / `ctx.last_result` (first completed) for exactly this tick.
+5. **InstinctMasterNode.evaluate_reflexes(ctx)** — reflex instincts are evaluated before deliberation and bypass the decision layer. Each reflex proposal (priority order) goes to `ActionMasterNode.launch_reflex(proposal, node.preemption)`, which starts the action as a task or arms it and preempts the resource owners (see *Reflex arbitration*). Nothing is awaited. Unknown action → WARNING. Under `reflex_conflict="raise"` a priority tie is logged at ERROR and all tied reflexes are still launched in priority order. With `reflex_mode="event"`, reflexes that declare `trigger_on_signals` are skipped here: the event lane evaluates them instead.
+6. **InstinctMasterNode.evaluate_all(ctx)** — normal instincts produce list[Proposal] (trigger_interval_s throttling applied)
+7. **DecisionMasterNode.on_new_proposals_many(..., conflicts=action_master.conflicting_owners)** — pick proposals + interrupt requests. A proposal that shares an `action_id` **or a declared resource** with a running action is a conflict. When every owner is interruptible, deliberative and of lower priority, an `InterruptRequest(target_action_id=owner)` is issued; otherwise the proposal is held. Reflex-owned actions are reported non-interruptible. Rejected instincts are notified via on_proposal_rejected() (covers fresh, carried-forward pending, and parked hand-off proposals).
+7b. **Interrupt dispatch** — `request_interrupt(req, action_id=req.target_action_id)` for each; MandatoryBlockViolation caught and logged as WARNING (not suppressed); other exceptions logged as ERROR
+8. **ActionMasterNode.launch(proposal, origin="decision")** for each chosen proposal (highest priority per action_id) — starts `execute()` as a tracked `asyncio.Task` and returns a `LaunchOutcome` at once; **the tick never waits for an action**. `BLOCKED` (owner still unwinding after an interrupt) → `DecisionMasterNode.park(proposal)` for hand-off; `NOT_FOUND` → WARNING.
 9. **on_tick_end(tick, duration_s)** — called on all leaf nodes via masters
 
-Different ActionNodes execute concurrently. Same ActionNode cannot run twice concurrently.
+**Actions run beside the tick (ADR 0005).** A long `MultiStepActionNode` keeps executing while later ticks sense, evaluate reflexes and deliberate. A Result is buffered when the task ends and appears in `ctx.last_results` on the **next** tick after completion (one-tick lifetime), so `tick()` returning does *not* mean the dispatched actions have finished. Use `await runtime.wait_idle(timeout)` to wait for in-flight actions. Different actions run concurrently unless they conflict. Two actions conflict when they share an `action_id` or any declared `resources`, and at most one running action owns a resource at any time (actuator exclusivity).
 
 Nodes never hold references to each other — all communication goes through SignalBus.
 
@@ -53,9 +53,12 @@ Nodes never hold references to each other — all communication goes through Sig
 
 A common mistake when building on Arachnite is assuming every node must do all of
 its work synchronously inside the tick. It must not. The tick is a fast, fixed-cadence
-cycle (default 10 Hz): the per-tick methods it calls — `read()`, `evaluate()`,
-`execute()` — must each return quickly so the next tick fires on time (rule 6: all
-node I/O is async; wrap blocking calls in `asyncio.to_thread()`). Work that is slow,
+cycle (default 10 Hz): the per-tick methods it awaits — `read()` and `evaluate()` —
+must each return quickly so the next tick fires on time (rule 6: all node I/O is
+async; wrap blocking calls in `asyncio.to_thread()`). `execute()` is different: the
+runtime launches it as a tracked task and does not wait for it, so a multi-second
+physical action (a `MultiStepActionNode` sequence) is fine there. It must still never
+block the event loop synchronously, because it shares that loop with the tick. Work that is slow,
 latency-unbounded, or event-driven (LLM inference, heavy CV analysis, network
 round-trips, hardware event streams) does **not** belong on the synchronous tick
 path. It runs in a *background task* alongside the loop, and the tick only reads the
@@ -106,6 +109,13 @@ result  = await action_master.dispatch(Proposal(
 ))
 ```
 
+`dispatch()` / `dispatch_many()` **await** the Result (runtime-less use). The runtime
+itself uses the non-blocking `launch()` instead. Resource exclusivity holds on both
+paths. A direct `dispatch()` that conflicts with a running action returns at once with
+`Result(success=False, error=ResourceConflictError)`, or `RuntimeError("action already
+running")` for the same action_id. Pass `origin="reflex"` to skip guards; with the default
+`origin=None` the legacy rule applies (priority ≥ 200 bypasses guards).
+
 **When do you actually need `InstinctMaster` / `DecisionMaster` / the tick loop?**
 Only when **≥2 autonomous behaviors compete continuously on dynamic priority** — the
 robotics/edge control shape the deliberative layer is built for. For a single agent or a
@@ -129,6 +139,7 @@ from arachnite import (
     Signal, StateUpdateSignal, Context, Proposal, Result,
     ActionStep, StepResult,
     InterruptPolicy, InterruptRequest, ActionExecutionState,
+    ReflexPreemption,                      # PREEMPT (default) | WAIT_FOR_BLOCK
     NodeState, RestartPolicy, MergePolicy, SupervisorSignal, NodeFaultSignal,
     LogLevel, LogEvent, ShutdownPhase, HistoryConfig,
 
@@ -141,6 +152,8 @@ from arachnite import (
     GreedyDecisionNode, WeightedDecisionNode, RandomDecisionNode,
     ActiveInferenceDecisionNode,
     BaseActionNode,   MultiStepActionNode,    ActionMasterNode,
+    LaunchStatus, LaunchOutcome,           # result of ActionMasterNode.launch()/launch_reflex()
+    ActionGuard, GuardVerdict,
 
     # LLM providers
     LLMProvider, AnthropicProvider, OllamaProvider, LocalProvider,
@@ -172,8 +185,13 @@ from arachnite import (
 
     # Exceptions
     DependencyValidationError,
+    ResourceConflictError,                 # action needs a resource a running action owns
+    ActionVetoed,
     UnsafeCodecError,
 )
+# Not re-exported at the root — import from arachnite.exceptions:
+#   RollbackError (.failures), StepAbortError, MandatoryBlockViolation,
+#   ReflexConflictError (.proposals), ActionNotFoundError, ActionTimeoutError
 ```
 
 ---
@@ -224,11 +242,13 @@ class MyInstinct(BaseInstinctNode):
 
 ### Reflex instinct node (priority >= 200, bypasses decision)
 ```python
-from arachnite import BaseReflexInstinctNode, Context, Proposal
+from arachnite import BaseReflexInstinctNode, Context, Proposal, ReflexPreemption
 
 class EmergencyReflex(BaseReflexInstinctNode):
-    node_id  = "EmergencyReflex"
-    priority = 250   # must be >= 200
+    node_id    = "EmergencyReflex"
+    priority   = 250   # must be >= 200
+    preemption = ReflexPreemption.PREEMPT   # default; see *Reflex arbitration*
+    # trigger_on_signals = ["temperature"]  # with reflex_mode="event": evaluated per signal
 
     async def evaluate(self, ctx: Context) -> Proposal | None:
         critical = [s for s in ctx.signals if s.kind == "temperature" and s.value > 90.0]
@@ -267,8 +287,9 @@ from arachnite import BaseActionNode, Proposal, Result
 
 class CoolDown(BaseActionNode):
     node_id    = "CoolDown"   # must match Proposal.action_id
-    timeout_s  = 10.0
-    max_retries = 1
+    timeout_s  = 10.0         # bounds each execute() attempt
+    max_retries = 1           # never retried after an interrupted/preempted run
+    resources  = frozenset({"fan"})   # actuators this action commands (exclusive)
 
     async def execute(self, proposal: Proposal) -> Result:
         target = proposal.parameters.get("target_temp", 35.0)
@@ -277,6 +298,10 @@ class CoolDown(BaseActionNode):
         # RULE: always return Result — never raise
 ```
 
+The runtime runs `execute()` as a task, so it may take as long as the physical
+operation needs. It must be **cancellation-safe**: a reflex preemption, `emergency_stop()`
+or shutdown arrives as `asyncio.CancelledError` at an `await`.
+
 ### Multi-step action node
 ```python
 from arachnite import MultiStepActionNode, ActionStep, Proposal, Result, StepResult, InterruptPolicy
@@ -284,6 +309,7 @@ from arachnite import MultiStepActionNode, ActionStep, Proposal, Result, StepRes
 class CoolSequence(MultiStepActionNode):
     node_id          = "CoolSequence"
     interrupt_policy = InterruptPolicy.ROLLBACK
+    resources        = frozenset({"fan"})
 
     def steps(self) -> list[ActionStep]:
         return [
@@ -307,7 +333,27 @@ class CoolSequence(MultiStepActionNode):
 
     async def _undo_sustain(self) -> None:
         await ramp_fan(100, 0)   # rollback: always stop the fan
+
+    async def on_preempted(self, proposal: Proposal, preempted_by: Proposal) -> None:
+        await hold_fan()         # safe-stop after a reflex took "fan"; no undo here
 ```
+
+Multi-step semantics to rely on:
+- A deliberative interrupt is honoured only at a boundary before an **interruptible**
+  step (per `interrupt_policy`). A request arriving before or inside a mandatory block
+  is held until the block completes. Deliberation can never cut into a mandatory block.
+- ROLLBACK: `on_interrupted()` (default) runs the rollback of every completed
+  non-interruptible step in reverse order and attempts **all** of them. Failures are
+  raised together as one `RollbackError` whose `failures` lists `(step_name, exc)`.
+  `execute()` reports that as `Result(interrupted=True, rolled_back=False, error=RollbackError)`.
+- An aborting step (it returns `abort_sequence=True`, times out, or raises) goes through
+  `on_aborted(completed, failed_step, proposal)`. Its default runs the same rollback walk
+  under ROLLBACK and does nothing otherwise. `Result.error` is a `StepAbortError`.
+- `max_retries` never retries an interrupted or preempted run, or a failed rollback.
+- Under `ActionMasterNode` the run state is reset when the action is reserved (inside
+  `launch()`), not when `execute()` starts. An interrupt requested in between survives
+  and is honoured at the first interruptible boundary. A direct `await node.execute(p)`
+  outside a master still resets at entry.
 
 ### Wire it all together (using RuntimeBuilder — recommended)
 ```python
@@ -331,10 +377,12 @@ async def main() -> None:
 asyncio.run(main())
 ```
 
-RuntimeBuilder defaults: GreedyDecisionNode strategy, 10 Hz tick rate, dispatch_all reflex conflict.
+RuntimeBuilder defaults: GreedyDecisionNode strategy, 10 Hz tick rate, dispatch_all reflex conflict,
+`reflex_mode="tick"`, `strict_resources=False`.
 Pass node **classes** to auto-instantiate with the builder's bus, or pre-built **instances** for custom args.
 Access the shared bus via `builder.bus`. Other chainable options: `.strategy()`, `.log_sinks()`,
-`.reflex_conflict()`, `.permissions()`, `.shutdown()`, `.overrun_warn()`, `.overrun_warn_consecutive()`.
+`.reflex_conflict()`, `.reflex_mode("tick" | "event")`, `.strict_resources()`, `.permissions()`,
+`.shutdown()`, `.overrun_warn()`, `.overrun_warn_consecutive()`.
 
 ### Wire it all together (manual — full control)
 ```python
@@ -409,7 +457,7 @@ caught, logged at WARNING, and never fail the tick (ADR 0003).
 - `ArachniteRuntime(..., tick_instrumenter=None)` — optional constructor kwarg.
 - `rt.set_tick_instrumenter(inst | None)` — attach/detach at any time; takes effect next tick.
 
-Stage mapping (§7.5 of spec): `sense` = `notify_tick_start` + `read_all()` + supervisor-buffer drain; `context` = `ContextNode.update()`; `reflex` = reflex evaluate + dispatch (bypass arc — fused); `instinct` = `evaluate_all()` (evaluate only); `decide` = interruptibility map + `on_new_proposals_many` + `notify_rejected` + interrupts; `act` = `dispatch_many()` + `notify_tick_end`.
+Stage mapping (§7.5 of spec): `sense` = `notify_tick_start` + completed-result drain + `read_all()` + supervisor-buffer drain; `context` = `ContextNode.update()`; `reflex` = reflex evaluate + `launch_reflex()` (bypass arc — fused; launch only); `instinct` = `evaluate_all()` (evaluate only); `decide` = interruptibility map + `on_new_proposals_many` + `notify_rejected` + interrupts; `act` = `launch()` of the chosen proposals + `notify_tick_end`. Since actions run as tasks (ADR 0005), `act` and `reflex` measure **launch cost only**, not action execution time.
 
 ```python
 from arachnite import ArachniteRuntime, TickInstrumenter, TICK_STAGE_NAMES
@@ -605,36 +653,226 @@ class SocialInstinct(BaseInstinctNode):
     priority           = 65
     trigger_on_signals = ["face", "speech", "proximity"]
     # evaluate() only called when at least one matching signal is present.
-    # None (default) = fire every tick. Does not apply to reflex nodes.
+    # None (default) = fire every tick. Not a gate for reflex nodes (see below).
     # Can be combined with trigger_interval_s (signal gate checked first).
+```
+
+On a **reflex** node, `trigger_on_signals` does not gate tick-mode evaluation (reflexes
+are evaluated every tick). With `ArachniteRuntime(reflex_mode="event")`, it moves the
+reflex onto the event-driven lane instead (see *Event-driven reflexes*).
+
+---
+
+## Action dispatch, actuator resources and arbitration (ADR 0005)
+
+**Non-blocking launch.** The runtime starts every action with
+`ActionMasterNode.launch(proposal, origin="decision")` or
+`launch_reflex(proposal, preemption)`. The lookup, conflict check, guards and resource
+reservation all happen synchronously, then `execute()` starts as a tracked task and a
+`LaunchOutcome(status, action_id, owners)` is returned at once:
+
+| `LaunchStatus` | Meaning |
+|---|---|
+| `LAUNCHED` | `execute()` started as a task |
+| `BLOCKED` | deliberative launch conflicts with a running owner (or an armed reflex's claim); not started |
+| `ARMED` | reflex waits for its owners to release; owners are being preempted |
+| `DEDUPED` | that reflex action is already running or armed as a reflex |
+| `VETOED` | an `ActionGuard` denied it (a failed `ActionVetoed` Result is buffered) |
+| `NOT_FOUND` | no ActionNode registered under that action_id |
+
+Results of launched actions are collected with `drain_completed()` (the runtime does
+this each tick). `await action_master.wait_idle(timeout)` / `await runtime.wait_idle(timeout)`
+waits until nothing is running or armed, and returns False on timeout.
+
+**Declaring resources.** `resources` names the actuators an action commands. Two actions
+conflict if they share an `action_id` or any resource. Resources are acquired
+all-or-nothing at launch and released when the task ends, so at most one running action
+owns a resource. An action with no declared resources conflicts only on its own
+`action_id` (the behaviour before ADR 0005). Undeclared actuator access is invisible to the
+framework. To make declaration mandatory, use `strict_resources` (registration of an
+action with empty `resources` raises `NodeRegistrationError`):
+
+```python
+class ArmMove(BaseActionNode):
+    node_id   = "ArmMove"
+    resources = frozenset({"arm"})
+
+class Gripper(BaseActionNode):
+    node_id   = "Gripper"
+    resources = frozenset({"gripper"})          # disjoint → may run alongside ArmMove
+
+class PickAndPlace(MultiStepActionNode):
+    node_id   = "PickAndPlace"
+    resources = frozenset({"arm", "gripper"})   # conflicts with both of the above
+
+am = ActionMasterNode(bus=bus, strict_resources=True)
+# or: RuntimeBuilder().strict_resources()
+```
+
+**Deliberative proposals vs. running owners** (inside `DecisionMasterNode`):
+- No conflict → launched.
+- Every conflicting owner is deliberative, currently interruptible and of **lower**
+  priority → an `InterruptRequest(target_action_id=owner)` goes to each owner, which stops
+  under its own `InterruptPolicy`. The proposal is **parked for hand-off**
+  (`DecisionMasterNode.park()`; see `dm.handoff_proposals`). It is retried every tick
+  ahead of fresh proposals until the owners release. It is superseded only by a new
+  proposal from the same instinct and dropped after `max_handoff_ticks` (default 100).
+- Otherwise it is **held** (not dispatched; kept only if `persist=True`). This covers an
+  owner inside a mandatory block, a reflex-owned action, and an owner of equal or higher
+  priority. Deliberation never cuts into a mandatory block.
+
+```python
+# Query what's running:
+running = action_master.current_actions()      # dict[str, BaseActionNode]
+ids     = action_master.running_action_ids()   # set[str]
+owners  = action_master.resource_owners()      # dict[resource, action_id]
+armed   = action_master.armed_reflexes()       # dict[action_id, Proposal]
+origin  = action_master.origin_of("ArmMove")   # "reflex" | "decision" | "direct" | None
+blocks  = action_master.conflicting_owners(p)  # set[action_id]; empty = can start now
+
+# Interrupt a specific running action (deliberative; raises MandatoryBlockViolation in a block):
+await action_master.request_interrupt(req, action_id="CoolDown")
+
+# Runtime-less, awaiting dispatch (dedups by action_id, keeps highest priority):
+results = await action_master.dispatch_many([proposal_a, proposal_b])
+
+# Context provides plural fields:
+ctx.last_results   # list[Result] — actions that completed since the previous tick (completion order)
+ctx.action_states  # list[ActionExecutionState] — every running multi-step action
+# Singular ctx.last_result (first completed) / ctx.action_state still work
 ```
 
 ---
 
-## Concurrent action dispatch
+## Reflex arbitration — `ReflexPreemption`
 
-Different ActionNodes execute concurrently — e.g. a camera instinct and an audio instinct
-targeting different ActionNodes (speaker vs display) run in parallel. The same ActionNode
-cannot run twice concurrently. `dispatch_many()` pre-filters duplicates; `_dispatch_one()`
-has an atomic check-and-set guard against `_running_nodes` to prevent TOCTOU races
-(e.g. reflex + normal proposal for the same action in one tick).
+When a reflex's target action needs a resource that a running action owns, the reflex
+node's `preemption` decides what happens:
+
+- **`ReflexPreemption.PREEMPT` (default)**: the owner's task is cancelled at its current
+  `await`, **even inside a mandatory block**. Its `on_preempted(proposal, preempted_by)`
+  safe-stop hook then runs, shielded and bounded by `safe_stop_timeout_s` (default 1.0 s;
+  an overrun is logged and abandoned). Only then are its resources released and the
+  reflex action started. The owner's Result has `preempted=True, interrupted=True` and is
+  never retried. No rollback runs unless the owner sets `rollback_on_preempt = True`,
+  because undoing a physical operation during a hazard can itself be unsafe.
+- **`ReflexPreemption.WAIT_FOR_BLOCK`**: if the owner is inside a mandatory block, the
+  reflex is **armed** and the owner is preempted at the first step boundary after the
+  block, whatever its `InterruptPolicy`. Outside a block it behaves like PREEMPT. The
+  wait is bounded by the remaining mandatory-step timeouts.
+- An armed reflex **claims** its resources, so no deliberative launch can take them in
+  between. It starts the moment its owners release, ahead of any deliberative proposal.
+- A reflex **never preempts a running reflex**: it is armed until that action releases.
+  A reflex whose action is already running or armed as a reflex is de-duplicated
+  (`DEDUPED`, logged). A reflex with disjoint resources simply runs alongside the owner.
+- Reflex launches bypass `ActionGuard`s by **origin** (`origin="reflex"`), not by priority.
+  A deliberative proposal at priority ≥ 200 is still guarded.
+- Preemption happens only on the runtime's `launch_reflex()` path. A direct
+  `dispatch()` never preempts anything.
+
+**Choosing a mode.** Use PREEMPT when stopping now is safer than finishing the block,
+for example a collision or a person in the workspace, and the owner has a meaningful
+safe-stop. Use WAIT_FOR_BLOCK when an interrupted block is itself a hazard, for example
+half-poured material or a weld, and the hazard tolerates the remaining block time.
+
+**Writing a safe-stop.** `on_preempted()` brings actuators to a safe *hold*: brake, freeze
+the joints, keep the grip. It must not undo work, and it must finish within
+`safe_stop_timeout_s`. Hardware calls made through `asyncio.to_thread()` cannot be
+cancelled, so the hook must cope with a command that is still in flight. The same hook
+runs when `emergency_stop()` or shutdown cancels the action; `preempted_by` is then a
+stand-in proposal with `action_id="__shutdown__"`.
 
 ```python
-# The runtime does this automatically. Manual concurrent dispatch:
-results = await action_master.dispatch_many([proposal_a, proposal_b])
+class PickAndPlace(MultiStepActionNode):
+    node_id             = "PickAndPlace"
+    resources           = frozenset({"arm", "gripper"})
+    interrupt_policy    = InterruptPolicy.ROLLBACK   # governs deliberative interrupts
+    safe_stop_timeout_s = 0.5
+    rollback_on_preempt = False                      # default: no undo on preemption
 
-# Query what's running:
-running = action_master.current_actions()     # dict[str, BaseActionNode]
-ids     = action_master.running_action_ids()  # set[str]
+    async def on_preempted(self, proposal: Proposal, preempted_by: Proposal) -> None:
+        await self.arm.brake()                       # hold position, keep the grip
+        self.logger.warning("Preempted; arm held", by=preempted_by.instinct_id)
 
-# Interrupt a specific running action:
-await action_master.request_interrupt(req, action_id="CoolDown")
+class CollisionReflex(BaseReflexInstinctNode):
+    node_id    = "CollisionReflex"
+    priority   = 250
+    preemption = ReflexPreemption.PREEMPT            # or WAIT_FOR_BLOCK
+    async def evaluate(self, ctx): ...               # → Proposal(action_id="Retract", ...)
 
-# Context provides plural fields:
-ctx.last_results   # list[Result] — all results from concurrent dispatch
-ctx.action_states  # list[ActionExecutionState] — all running actions
-# Singular ctx.last_result / ctx.action_state still work (highest-priority item)
+class Retract(BaseActionNode):
+    node_id   = "Retract"
+    resources = frozenset({"arm"})                   # takes "arm" only; the grip is kept
 ```
+
+See `examples/robot_arm/` for the complete pattern, including a recovery instinct that
+finishes the job once the hazard has cleared.
+
+---
+
+## Event-driven reflexes — `reflex_mode="event"` and `BaseSenseNode.push()`
+
+By default (`reflex_mode="tick"`) reflexes are evaluated once per tick, so reflex latency
+includes up to one tick period of quantisation. Opt in to the event lane per runtime:
+
+```python
+rt = ArachniteRuntime(..., reflex_mode="event",
+                      reflex_signal_ttl_s=None,      # default: one tick period
+                      reflex_eval_timeout_s=0.05)
+# or: RuntimeBuilder().reflex_mode("event")
+```
+
+- A reflex node that declares `trigger_on_signals` is evaluated **the moment a matching
+  signal is published on the bus**, not once per tick. That signal may come from a polled
+  sensor during the sense stage or from `push()` outside any tick. Reflexes without
+  `trigger_on_signals` stay in the tick's reflex stage.
+- The reflex sees `ContextNode.reflex_view(signals)`: the freshest signal per
+  `(source, kind)` of its trigger kinds no older than `reflex_signal_ttl_s`, plus current
+  state, results and action states. The history is **empty** (no per-event copy).
+- Evaluation is bounded by `reflex_eval_timeout_s`. Errors and timeouts are logged and
+  never raised into the publisher. Launching goes through the same arbitration as above.
+  The lane stays live while the runtime is paused.
+
+**Event-driven sensor.** Call `await self.push(signal)` from a background listener started
+in `setup()`. It publishes immediately, so an event-mode reflex triggered by that kind
+runs before `push()` returns. The signal is also queued so that the next tick's
+`read_all()` hands it to the context once, for deliberation.
+
+```python
+class ToFSense(BaseSenseNode):
+    node_id     = "ToFSense"
+    signal_kind = "proximity"
+
+    async def setup(self) -> None:
+        self.spawn_background_task(self._listen())
+
+    async def _listen(self) -> None:
+        async for mm in tof_interrupt_stream():          # hardware-driven events
+            await self.push(Signal(source=self.node_id, kind=self.signal_kind,
+                                   value=mm / 1000, confidence=1.0,
+                                   timestamp=time.monotonic()))
+
+    async def read(self) -> Signal | None:
+        return None                                      # nothing polled
+```
+
+---
+
+## Shutdown — `stop()` vs. `emergency_stop()`
+
+- **`await rt.stop()`** (graceful, 7 phases via `ShutdownCoordinator`):
+  1. Sensing stops.
+  2. The in-flight tick finishes.
+  3. A shutdown interrupt goes to every running action. It is held through a running
+     mandatory block, and the coordinator waits for the blocks to finish (bounded by
+     the remaining block timeouts).
+  4. Actions stop at their next boundary, so ROLLBACK actions unwind. Whatever is still
+     running is then cancelled through its safe-stop.
+  5–7. Supervisors stop, nodes tear down, the transport disconnects.
+- **`await rt.emergency_stop()`** stops the loop and the reflex lane, then cancels every
+  action. Each one runs its `on_preempted()` safe-stop (bounded); **no rollback** runs.
+  Then the nodes tear down. This is a *shutdown* path, not a hazard response: to cut
+  into a mandatory block and keep the agent running, use a PREEMPT reflex.
 
 ---
 
@@ -656,7 +894,7 @@ class DoorbellInstinct(BaseInstinctNode):
             return Proposal(
                 instinct_id=self.node_id, action_id="AnswerDoor",
                 priority=self.priority, urgency=0.8,
-                persist=True,  # survive if a higher-priority action is running
+                persist=True,  # survive while held (owner busy, in a block, or outranks it)
             )
         return None
 ```
@@ -667,14 +905,20 @@ Supersession rules (managed by DecisionMasterNode):
 - Instinct throttled/gated (not evaluated) → pending stays
 - Proposal dispatched → removed from pending
 - Pending exceeds max_pending_ticks (default 50) → dropped
-- Instinct unregistered via unregister_instinct_live() → clear_pending(instinct_id) removes pending + age
+- Instinct unregistered via unregister_instinct_live() → clear_pending(instinct_id) removes pending + age (and any parked hand-off)
+
+Separate from `persist`: a proposal that was selected and interrupted its owner, but could not
+start yet, is **parked for hand-off** (`dm.park()`), whatever its `persist` flag. It is re-offered
+every tick until it starts, is superseded by any new proposal from the same instinct, or exceeds
+`max_handoff_ticks` (default 100). An instinct going quiet does not cancel it.
 
 ```python
-# Configure staleness cap:
-dm = DecisionMasterNode(bus=bus, strategy=strategy, max_pending_ticks=100)
+# Configure staleness caps:
+dm = DecisionMasterNode(bus=bus, strategy=strategy, max_pending_ticks=100, max_handoff_ticks=100)
 
-# Introspect pending proposals:
+# Introspect pending / parked proposals:
 dm.pending_proposals  # dict[str, Proposal] keyed by instinct_id
+dm.handoff_proposals  # dict[str, Proposal] keyed by instinct_id
 
 # All proposals considered in the most recent on_new_proposals_many() call
 # (includes both fresh proposals and carried-forward pending proposals):
@@ -863,6 +1107,9 @@ class EventDrivenSense(BaseSenseNode):
                       value=event, confidence=1.0, timestamp=time.monotonic())
 ```
 
+For hazard events that a reflex must see at once, have the listener call
+`await self.push(signal)` instead of queueing for `read()` (see *Event-driven reflexes*).
+
 `cancel_background_tasks()` is called by all three master nodes (SenseMasterNode,
 InstinctMasterNode, ActionMasterNode) before their own `teardown()`. Override it only if
 custom cleanup ordering is required.
@@ -951,7 +1198,7 @@ python -m benchmarks.active_inference_comparison # decision strategy A/B (Greedy
 
 | Benchmark | Definition | Unit |
 |-----------|-----------|------|
-| Tick latency | L_tick = t₁ − t₀ around `runtime.tick()` | ms |
+| Tick latency | L_tick = t₁ − t₀ around `runtime.tick()` (action launch only, not execution — ADR 0005) | ms |
 | Reflex latency | T_reflex = t_action − t_sense (sensor read to action entry) | µs |
 | Memory footprint | Δ_RSS = RSS(config) − RSS(baseline) after 100 ticks | MB |
 | Scalability factor | S(N) = median_tick(N) / median_tick(1) | dimensionless |
@@ -1079,16 +1326,40 @@ bus.clear()                         # reset recorded signals and subscribers
 `MockBus` extends `SignalBus` — subscribers still fire normally, so nodes that
 subscribe to the bus during `setup()` work exactly as in production.
 
+### Testing with the non-blocking runtime
+
+`await rt.tick()` returns once the actions are *launched*, not finished. Wait for them
+explicitly, then tick once more to see their Results in the context:
+
+```python
+await rt.pause()                          # stop the background loop racing manual ticks
+await rt.tick()                           # launches the action
+assert await rt.wait_idle(timeout=2.0)    # False on timeout
+await rt.tick()                           # Results drained into this tick's context
+assert rt.context.snapshot().last_results[0].success
+```
+
+Without a runtime, `await action_master.dispatch(proposal)` still awaits and returns the
+Result directly. To test a preemption, use `action_master.launch(...)`, then
+`launch_reflex(...)`, then `wait_idle()` and `drain_completed()`. The preempted owner's
+Result has `preempted=True`.
+
 ---
 
 ## Rules — never violate
 
 1. Nodes never hold references to each other — use SignalBus
 2. ReflexInstinctNode and its target ActionNode must be on the same AgentNode
-3. MultiStepActionNode mandatory blocks (interruptible=False) cannot be interrupted except by emergency_stop()
+3. MultiStepActionNode mandatory blocks (interruptible=False) can never be interrupted by deliberation. Only a reflex with `ReflexPreemption.PREEMPT` (through the owner's `on_preempted()` safe-stop) or `emergency_stop()` cuts into one.
 4. execute() on any ActionNode must always return a Result — never raise
 5. evaluate() on any InstinctNode must return None when not applicable — never raise
 6. All node I/O must be async — wrap blocking calls in asyncio.to_thread()
+
+Concurrency obligations (ADR 0005):
+- Declare `resources` on every ActionNode that commands an actuator. Exclusivity is only enforced for declared resources.
+- Action code must be cancellation-safe. Preemption, `emergency_stop()` and shutdown arrive as `CancelledError` at an `await`.
+- `on_preempted()` holds the actuators safe and does not undo work. It must finish within `safe_stop_timeout_s`.
+- Never assume an action finished when `tick()` returns. Read `ctx.last_results` on a later tick, or `await wait_idle()`.
 
 ## Priority convention
 
@@ -1108,7 +1379,7 @@ arachnite/
   models.py         all dataclasses and enums (Signal.confidence rejects NaN/Inf)
   bus.py            SignalBus
   context.py        ContextNode (state persistence, StateUpdateSignal, max_state_keys eviction)
-  runtime.py        ArachniteRuntime (tick loop, live reg/unreg, shutdown)
+  runtime.py        ArachniteRuntime (tick loop, event-driven reflex lane, wait_idle, live reg/unreg, shutdown)
   builder.py        RuntimeBuilder (fluent construction API)
   supervisor.py     NodeSupervisor (cancel_restart_tasks(), restart_task_count property)
   health.py         HealthMonitor
@@ -1125,10 +1396,11 @@ arachnite/
   testing.py      make_signal, make_proposal, make_result, make_context, MockBus
   nodes/
     base.py         BaseNode ABC
-    sense.py        BaseSenseNode, SenseMasterNode (get_node)
-    instinct.py     BaseInstinctNode, BaseReflexInstinctNode, InstinctMasterNode (get_node)
-    decision.py     BaseDecisionNode, DecisionMasterNode, built-in strategies
-    action.py       BaseActionNode, MultiStepActionNode, ActionMasterNode (get_node)
+    sense.py        BaseSenseNode (push), SenseMasterNode (get_node)
+    instinct.py     BaseInstinctNode, BaseReflexInstinctNode (preemption), InstinctMasterNode (get_node)
+    decision.py     BaseDecisionNode, DecisionMasterNode (park / hand-off), built-in strategies
+    action.py       BaseActionNode (resources, on_preempted), MultiStepActionNode, ActionMasterNode
+                    (launch / launch_reflex / wait_idle, LaunchStatus, LaunchOutcome, get_node)
     llm.py          LLMInstinctNode (asyncio.Lock guards _cached_proposal)
     active_inference.py  ActiveInferenceDecisionNode
   transport/
@@ -1147,6 +1419,7 @@ examples/
   minimal_agent.py          simplest complete pipeline
   temperature_monitor.py    realistic: reflex, multi-step action, supervisor
   web_dashboard_demo.py     adds SignalDashboard to temperature_monitor
+  robot_arm/                pick-and-place: resources, PREEMPT reflex + safe-stop, recovery, manifest
 tests/
   conftest.py       shared fixtures — good reference implementations
 ```
