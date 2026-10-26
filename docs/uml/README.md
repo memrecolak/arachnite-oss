@@ -16,8 +16,19 @@ standalone diagram; view them together for a full picture.
 PlantUML JAR (offline):
 
 ```bash
-plantuml -tpng docs/uml/*.puml          # → PNG next to each .puml
-plantuml -tsvg docs/uml/*.puml          # → SVG
+plantuml -charset UTF-8 -tpng docs/uml/*.puml          # → PNG next to each .puml
+plantuml -charset UTF-8 -tsvg docs/uml/*.puml          # → SVG
+```
+
+`-charset UTF-8` is required on systems whose default encoding is not UTF-8
+(e.g. Windows), or em-dashes and other symbols render garbled. The runtime
+composition diagram is wider than PlantUML's default 4096 px limit; raise it
+with `-DPLANTUML_LIMIT_SIZE=16384` (JVM option) or the PNG is clipped. Without
+Graphviz installed, add `-Playout=smetana`. The committed PNGs were rendered with
+PlantUML 1.2023.13:
+
+```bash
+java -DPLANTUML_LIMIT_SIZE=16384 -jar plantuml.jar -charset UTF-8 -Playout=smetana -tpng docs/uml/*.puml
 ```
 
 VS Code: install the **PlantUML** extension and preview with `Alt+D`.

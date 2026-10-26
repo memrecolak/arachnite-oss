@@ -47,6 +47,7 @@ class ArachniteRuntime {
   + resume(): None
   + tick(): None
   + wait_idle(timeout): bool
+  + monitor_state(): MonitorState
   - _on_reflex_signal(signal): None
   + register_sense_live(node): None
   + register_instinct_live(node): None
@@ -152,6 +153,23 @@ class HealthMonitor {
   + update_remote(remote: RemoteNodeState): None
 }
 
+class SafetyMonitorRegistry {
+  + register(monitor): None
+  + check_all(tick, state: MonitorState): list<SafetyViolationSignal>
+  + {static} default(bus): SafetyMonitorRegistry
+}
+
+class MonitorState <<dataclass>> {
+  + reflex_fired: bool
+  + reflex_action_dispatched: bool
+  + reflex_routed_through_decision: bool
+  + mandatory_block_active: bool
+  + interrupt_accepted_during_block: bool
+  + resources_with_multiple_owners: int
+  + active_reflex_nodes / total_reflex_nodes: int
+  + tick_duration_ms / tick_budget_ms: float
+}
+
 abstract class BaseSafetyMonitor {
   + monitor_id: str
   + {abstract} check(tick, state): SafetyViolationSignal | None
@@ -161,6 +179,7 @@ abstract class BaseSafetyMonitor {
 class ReflexBypassMonitor
 class MandatoryBlockMonitor
 class ReflexDispatchMonitor
+class ActuatorExclusivityMonitor
 class ReflexAvailabilityMonitor
 class TickBudgetMonitor
 
@@ -208,8 +227,10 @@ ActionMasterNode "1" *-- "*" ActionTask          : running actions
 ActionMasterNode ..> LaunchOutcome               : returns
 ArachniteRuntime "1" *-- "4..*" NodeSupervisor   : one per master
 ArachniteRuntime "1" *-- "1" HealthMonitor
-ArachniteRuntime "1" o-- "*" BaseSafetyMonitor   : monitors
+ArachniteRuntime ..> MonitorState                : monitor_state() builds
 ArachniteRuntime "1" ..> ShutdownCoordinator     : on stop()
+SafetyMonitorRegistry "1" o-- "*" BaseSafetyMonitor : check_all() runs
+SafetyMonitorRegistry ..> MonitorState           : (caller's run loop,\nafter each tick)
 
 HealthMonitor "1" o-- "*" NodeSupervisor
 NodeSupervisor "1" --> "1" SignalBus             : publishes SupervisorSignal
@@ -217,6 +238,7 @@ NodeSupervisor "1" --> "1" SignalBus             : publishes SupervisorSignal
 BaseSafetyMonitor <|-- ReflexBypassMonitor
 BaseSafetyMonitor <|-- MandatoryBlockMonitor
 BaseSafetyMonitor <|-- ReflexDispatchMonitor
+BaseSafetyMonitor <|-- ActuatorExclusivityMonitor
 BaseSafetyMonitor <|-- ReflexAvailabilityMonitor
 BaseSafetyMonitor <|-- TickBudgetMonitor
 
