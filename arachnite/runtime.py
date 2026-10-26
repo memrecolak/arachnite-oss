@@ -829,6 +829,10 @@ class ArachniteRuntime:
         background `_loop()`. Tests typically call `pause()` first precisely
         to stop the background loop from racing with manual `tick()` calls,
         and then drive ticks deterministically via this method.
+
+        Actions selected this tick are launched, not awaited: use
+        ``await wait_idle()`` before asserting on their effects; their
+        Results appear in the next tick's ``ctx.last_results``.
         """
         self._tick_count += 1
         tick_start = time.monotonic()
