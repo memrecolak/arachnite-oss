@@ -112,7 +112,7 @@ class ArmState:
             and not self.holding
             and 0.10 <= self.object_distance <= 0.35
         ):
-            self.pick_start_ns = time.monotonic_ns()
+            self.pick_start_ns = time.perf_counter_ns()
         return self.object_distance
 
     @staticmethod
@@ -141,7 +141,7 @@ class ArmState:
         self.start_time = time.monotonic()
         if self.pick_start_ns >= 0:
             self.pick_durations_ms.append(
-                (time.monotonic_ns() - self.pick_start_ns) / 1e6
+                (time.perf_counter_ns() - self.pick_start_ns) / 1e6
             )
             self.pick_start_ns = -1
 

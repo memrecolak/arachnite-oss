@@ -614,3 +614,46 @@ The optional-dep imports for `aiomqtt` (MQTT), `nats` (NATS), and `redis.asyncio
 ### 22\.14\.5 Source
 
 `benchmarks/transport_latency.py`
+
+## __22\.15 Reflex Arbitration (Reflex Response While an Action Runs)__
+
+Measures how fast a reflex takes effect while another action is running, and what happens to that action (ADR 0005, §17.12). Two experiments share one instrumented rig: an arm actuator that logs every motion, counts overlapping writers and flags a dropped object; a proximity sense node over a latched collision flag; a collision reflex (priority 250); and a `Retract` action (`resources = {"arm"}`) that keeps any grip.
+
+### 22\.15\.1 Formal Definition
+
+For one trial, let t_onset be the `time.perf_counter()` reading when the collision flag is raised and t_entry the reading at entry to `Retract.execute()`:
+
+> L_reflex = (t_entry − t_onset) · 1000
+
+With a tick-lane reflex, L_reflex = T_detect + T_pipeline + T_handover, where T_detect is the wait until the next sense poll (≤ one tick period), T_pipeline the in-tick reflex path (§22.3), and T_handover the time to free the resource (the owner's bounded `on_preempted()` safe-stop under `PREEMPT`, the rest of the mandatory block under `WAIT_FOR_BLOCK`). With the event lane and a pushing sense node, T_detect ≈ 0. With blocking dispatch (arachnite ≤ 0.12) T_handover is the rest of the running action.
+
+**E9 — stage-wise collision injection.** A six-step pick-and-place (`approach` | `lower`, `close`, `raise` | `move`, `release`; the middle three form a mandatory block; `InterruptPolicy.ROLLBACK`; `resources = {"arm", "gripper"}`) runs, and the flag is raised at a uniformly random point within 10–90 % of one stage. Stages: `idle` (no action), the six steps. Per trial: L_reflex, the pick's fate (completed / interrupted / preempted), whether it rolled back, the step it stopped at, the steps it began after the onset, the safe-stop duration, actuator overlaps, the object-dropped flag and the final arm state.
+
+**E10 — reflex latency under a long-running action.** A conveyor action on a disjoint resource (`resources = {"conveyor"}`) is re-dispatched back to back with duration D ∈ {0, 0.1, 0.5, 2.5} s, and each stimulus arrives at a uniformly random point within 5–95 % of a running conveyor action (D = 0: a random tick phase). Per trial: L_reflex. Per cell: tick-interval median and maximum, overruns (interval > 1.2 · period), and the number of ticks that ran during each conveyor action.
+
+### 22\.15\.2 Protocol
+
+| Parameter | Value |
+|-----------|-------|
+| Tick rate | 10 Hz (`--tick-rate`) |
+| Trials per cell | 200 (`--trials`) |
+| Pick step durations | 0.5 / 0.4 / 0.2 / 0.4 / 0.5 / 0.1 s (the robot-arm example's timings × 0.5; mandatory block = 1.0 s = 10 ticks) |
+| Rollback motion / safe-stop / retract | 0.10 / 0.02 / 0.15 s |
+| Isolation | E9: a fresh runtime per trial. E10: a fresh runtime per cell |
+| Onsets | Seeded PRNG (seed 20261026 + 1000 · cell index), identical across arms |
+| Timer | `time.perf_counter()` |
+| Arms | `preempt` / `wait` / `event` (E9), `tick` / `event` (E10); `blocking` when the installed arachnite has no `ReflexPreemption` |
+
+The rig uses only API common to 0.12.x and 0.13, so the same script yields the blocking-dispatch "before" arm when run in a 0.12 environment (the `resources` and `on_preempted` declarations are then inert).
+
+### 22\.15\.3 Statistical Treatment
+
+Per cell: median, P95, P99, maximum and mean of L_reflex over trials, plus counts of fates, rollbacks, overlaps, drops and missed trials (no reflex action within the cell's timeout). Raw per-trial rows are kept in the JSON so other statistics can be recomputed. Latency is a per-trial measure; there is no per-run median layer.
+
+### 22\.15\.4 Notes
+
+On Windows the ~15.6 ms timer granularity quantises onset phases and the 20 ms safe-stop; publication numbers come from Linux hosts. Expected shape: blocking dispatch — L_reflex grows with the remaining action time (E10: ∝ D); `PREEMPT` — at most one tick period plus the safe-stop, inside or outside the block; `WAIT_FOR_BLOCK` — the rest of the block inside it, as `PREEMPT` outside; event lane — the safe-stop alone. Actuator overlaps and dropped objects are expected to be zero in every non-blocking arm.
+
+### 22\.15\.5 Source
+
+`benchmarks/reflex_arbitration.py` (`e9` / `e10` subcommands)

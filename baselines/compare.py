@@ -24,6 +24,13 @@ Frameworks tested:
 Frameworks for which the runtime benchmark cannot run on this machine
 contribute LoC only and are reported with a [SKIP] line at the top of the
 output.
+
+Primary metric: per-pick wall time (object detected -> object released),
+which counts the same unit of work in every framework. Per-tick latency is
+reported too, but its unit of work differs by framework, and since v0.13
+(ADR 0005) Arachnite's tick launches actions as tasks rather than awaiting
+them: under --noise the actuation delays run across ticks, so only the
+per-pick figure stays comparable.
 """
 
 from __future__ import annotations
@@ -157,14 +164,26 @@ async def bench_arachnite(
         for _ in range(warmup):
             await rt.tick()
 
+        # Actions run as tasks (v0.13, ADR 0005): let an in-flight pick finish
+        # before the reset so it cannot write into the measured window.
+        await am.wait_idle(timeout=5.0)
         ArmState.__init__(SIM)  # Reset after warmup (see note above)
 
-        # Measure
+        # Measure. A sample is the wall time of tick(). Actions are tasks
+        # the tick does not await: in deterministic mode (no simulated
+        # sleeps) a launched pick still runs to completion at the tick's
+        # first yield, so the sample covers the same work as before; with
+        # --noise the actuation delays run across later ticks instead of
+        # inside one, so per-pick wall time — not per-tick — is the
+        # comparable measure across frameworks.
         samples = []
         for _tick in range(n_ticks):
             t0 = time.perf_counter()
             await rt.tick()
             samples.append((time.perf_counter() - t0) * 1_000)
+        # A pick still in flight completes and is counted, as in the
+        # inline-executing baselines.
+        await am.wait_idle(timeout=5.0)
     finally:
         for m in (am, dm, im, sm):
             await m.teardown()
@@ -619,9 +638,9 @@ def main() -> None:
     print("  " + "-" * 70)
 
     for metric in [
+        "per_pick_median_ms", "per_pick_p95_ms", "per_pick_p99_ms",
         "mean", "median", "p95", "p99", "std_dev",
         "ci_lower", "ci_upper", "memory_mb",
-        "per_pick_median_ms", "per_pick_p95_ms", "per_pick_p99_ms",
     ]:
         if metric == "memory_mb":
             unit = "MB"
@@ -629,6 +648,8 @@ def main() -> None:
             unit = "ms/pick"
         else:
             unit = "ms"
+        if metric == "mean":
+            print("  per-tick (unit of work differs by framework):")
         print(f"  {metric + ' (' + unit + ')':<25} ", end="")
         for name, stats in analysis.items():
             if not name.startswith("_"):
@@ -652,8 +673,18 @@ def main() -> None:
             p_val = comp["wilcoxon_p"]
             p_str = f"{p_val:.6f}" if p_val is not None else "n/a"
             print(f"  vs {baseline}:")
-            print(f"    Wilcoxon W = {comp['wilcoxon_W']:.1f}, p = {p_str}")
-            print(f"    Cliff's delta = {comp['cliffs_delta']:.3f} ({comp['effect_magnitude']})")
+            pp_d = comp.get("per_pick_cliffs_delta")
+            if pp_d is not None:
+                pp_p = comp.get("per_pick_wilcoxon_p")
+                pp_p_str = f"{pp_p:.6f}" if pp_p is not None else "n/a"
+                pp_w = comp.get("per_pick_wilcoxon_W")
+                pp_w_str = f"{pp_w:.1f}" if pp_w is not None else "n/a"
+                print(f"    per-pick: Wilcoxon W = {pp_w_str}, "
+                      f"p = {pp_p_str}, Cliff's delta = {pp_d:.3f} "
+                      f"({comp['per_pick_effect_magnitude']}), "
+                      f"paired n = {comp['per_pick_paired_n']}")
+            print(f"    per-tick: Wilcoxon W = {comp['wilcoxon_W']:.1f}, p = {p_str}, "
+                  f"Cliff's delta = {comp['cliffs_delta']:.3f} ({comp['effect_magnitude']})")
 
     # LoC in results
     analysis["lines_of_code"] = loc
@@ -661,6 +692,9 @@ def main() -> None:
     # E5: record the simulation arm so noisy and deterministic result files
     # are never mistaken for one another.
     analysis["noise_mode"] = args.noise
+    import arachnite
+    analysis["arachnite_version"] = arachnite.__version__
+    analysis["primary_metric"] = "per_pick"
     if args.noise:
         from baselines.shared_sim import (
             NOISE_ACTUATION_DELAY_MS,

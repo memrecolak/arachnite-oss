@@ -168,7 +168,7 @@ class ProximitySenseNode(BaseSenseNode):
             and not SIM.holding
             and 0.10 <= SIM.object_distance <= 0.35
         ):
-            SIM.pick_start_ns = time.monotonic_ns()
+            SIM.pick_start_ns = time.perf_counter_ns()
         return Signal(
             source    = self.node_id,
             kind      = self.signal_kind,
@@ -406,7 +406,7 @@ class PickAndPlaceAction(MultiStepActionNode):
                 # the grasp window after the previous release.
                 if SIM.pick_start_ns >= 0:
                     SIM.pick_durations_ms.append(
-                        (time.monotonic_ns() - SIM.pick_start_ns) / 1e6
+                        (time.perf_counter_ns() - SIM.pick_start_ns) / 1e6
                     )
                     SIM.pick_start_ns = -1
                 return StepResult(step_name="release_gripper", success=True,

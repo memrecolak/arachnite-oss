@@ -13,6 +13,7 @@ adds. Arachnite ships with a complete benchmarking suite.
 | Memory footprint | RAM usage on constrained devices | `benchmarks/memory_footprint.py` |
 | Node-count scaling | How many nodes before it slows down | `benchmarks/scalability_sweep.py` |
 | Bus throughput | SignalBus capacity | `benchmarks/scalability_extended.py` |
+| Reflex while an action runs | Hazard response time and what happens to the running action | `benchmarks/reflex_arbitration.py e9` / `e10` |
 
 ## Quick Start: Tick Latency
 
