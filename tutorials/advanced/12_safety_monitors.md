@@ -7,89 +7,59 @@ alarm if a safety invariant is breached.
 
 ## What Gets Monitored
 
-Arachnite ships with five built-in monitors:
+Arachnite ships with six built-in monitors:
 
 | Monitor | What it checks | Severity |
 |---------|---------------|----------|
-| `ReflexBypassMonitor` | Reflex fires but decision layer also entered | CRITICAL |
-| `MandatoryBlockMonitor` | Deliberative interrupt accepted during mandatory block | CRITICAL |
-| `ReflexDispatchMonitor` | Reflex fires but action not dispatched | CRITICAL |
-| `ReflexAvailabilityMonitor` | Reflex node is FAULTED or DEAD | WARNING |
+| `ReflexBypassMonitor` | A reflex's proposal was offered to the decision layer | CRITICAL |
+| `MandatoryBlockMonitor` | A deliberative interrupt was honoured inside a mandatory block | CRITICAL |
+| `ReflexDispatchMonitor` | A reflex fired but its action could not be reached | CRITICAL |
+| `ActuatorExclusivityMonitor` | A declared resource had more than one running owner | CRITICAL |
+| `ReflexAvailabilityMonitor` | A reflex node is FAULTED, RESTARTING or DEAD | WARNING |
 | `TickBudgetMonitor` | 3+ consecutive tick overruns | WARNING |
 
-These correspond to the formal safety properties verified in the UPPAAL model
-(Properties P1-P5). The monitors check the *same* invariants at runtime.
+The first four are the framework's structural safety properties — the same
+ones the CSP models in `formal/` verify. The monitors check them at runtime.
 
 ## Quick Setup
 
 ```python
 from arachnite import SignalBus
-from arachnite.safety_monitor import SafetyMonitorRegistry, MonitorState
+from arachnite.safety_monitor import SafetyMonitorRegistry
 
 bus = SignalBus()
-monitors = SafetyMonitorRegistry.default(bus)  # all 5 monitors
+monitors = SafetyMonitorRegistry.default(bus)  # all 6 monitors
 ```
 
-The runtime does **not** run the monitors for you. After each tick, build a
-`MonitorState` from what actually happened and call `check_all()`. Every
-field must come from a real source: a monitor fed constant values checks
-nothing. Some fields can be read from the master nodes you built; the
-others come from your own instrumentation:
+The runtime does **not** run the monitors for you. After each tick, ask the
+runtime for a `MonitorState` and call `check_all()`:
 
 ```python
-from arachnite import NodeState
-
-
-def build_monitor_state(
-    rt, instinct_master, action_master, *,
-    reflex_fired: bool,              # your tracking, e.g. a log sink that sees "Reflex fired"
-    reflex_action_dispatched: bool,  # ... and the dispatch that followed it
-    tick_duration_ms: float,         # e.g. from a TickInstrumenter's on_tick_complete()
-    tick_budget_ms: float,           # 1000 / tick_rate_hz
-) -> MonitorState:
-    reflex_ids = {n.node_id for n in instinct_master.reflex_nodes}
-    running = set(rt.health.nodes_in_state(NodeState.RUNNING))
-    return MonitorState(
-        tick=rt.tick_count,
-        reflex_fired=reflex_fired,
-        reflex_action_dispatched=reflex_action_dispatched,
-        # A reflex's own proposal never enters the decision layer (see below)
-        decision_entered=False,
-        mandatory_block_active=not action_master.is_interruptible(),
-        # Deliberation is refused inside a block (MandatoryBlockViolation)
-        interrupt_accepted_during_block=False,
-        active_reflex_nodes=len(reflex_ids & running),
-        total_reflex_nodes=len(reflex_ids),
-        tick_duration_ms=tick_duration_ms,
-        tick_budget_ms=tick_budget_ms,
-    )
-
-
-state = build_monitor_state(
-    rt, instinct_master, action_master,
-    reflex_fired=False, reflex_action_dispatched=False,
-    tick_duration_ms=0.5, tick_budget_ms=100.0,
-)
+state = rt.monitor_state()
 violations = await monitors.check_all(rt.tick_count, state)
-if violations:
-    for v in violations:
-        print(f"SAFETY: {v.property_name} — {v.details}")
+for v in violations:
+    print(f"SAFETY: {v.property_name} — {v.details}")
 ```
 
-Two fields need care, because the runtime's behaviour is more subtle than
-their names suggest:
+`rt.monitor_state()` is built from what the runtime actually observed during
+the last tick — nothing in it is a constant you have to remember to fill in:
 
-- **`decision_entered`** is about the *reflex's proposal*. In
-  `ArachniteRuntime` the decide stage runs on every tick, including ticks
-  where a reflex fired: the normal instincts still get their turn. The
-  reflex's own proposal never goes through it. Don't set this field from
-  "did the decide stage run", or `ReflexBypassMonitor` reports a violation
-  on every reflex tick.
-- **`interrupt_accepted_during_block`** should count only *deliberative*
-  interrupts. The decision layer can't interrupt a mandatory block (the
-  request is refused with `MandatoryBlockViolation`). A reflex with
-  `ReflexPreemption.PREEMPT` cutting into a block is declared behaviour, not
-  a violation (see [Multi-Step Actions](01_multi_step_actions.md)).
+- **`reflex_fired` / `reflex_action_dispatched`** — the launch outcome of every
+  reflex proposal since the previous tick (event-lane reflexes included).
+  Launched, armed (waiting for a preempted owner's safe-stop) and
+  de-duplicated all count as "dispatched"; an unknown action does not.
+- **`reflex_routed_through_decision`** — whether a reflex node's proposal was
+  offered to the decision layer. The decide stage runs on *every* tick, also
+  when a reflex fired — the normal instincts still get their turn — so the
+  property is about the reflex's own proposal, which must never go there.
+- **`interrupt_accepted_during_block`** — whether an action that finished
+  reported a *deliberative* stop strictly inside a mandatory block. A reflex
+  with `ReflexPreemption.PREEMPT` cutting into a block is declared behaviour,
+  not a violation (see [Multi-Step Actions](01_multi_step_actions.md)).
+- **`mandatory_block_active`, `resources_with_multiple_owners`,
+  `active_reflex_nodes` / `total_reflex_nodes`, `tick_duration_ms`,
+  `tick_budget_ms`** — read from the running actions, their resources, the
+  reflex nodes' supervisor states and the tick itself.
 
 ## Reacting to Violations
 

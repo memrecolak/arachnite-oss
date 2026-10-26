@@ -6,6 +6,7 @@ import pytest
 
 from arachnite import SignalBus
 from arachnite.safety_monitor import (
+    ActuatorExclusivityMonitor,
     MandatoryBlockMonitor,
     MonitorState,
     ReflexAvailabilityMonitor,
@@ -34,20 +35,28 @@ class TestReflexBypassMonitor:
     @pytest.mark.asyncio
     async def test_no_violation_when_reflex_not_fired(self, bus: SignalBus) -> None:
         m = ReflexBypassMonitor(bus)
-        result = await m.check(1, _state(reflex_fired=False, decision_entered=True))
+        result = await m.check(1, _state(reflex_fired=False, reflex_routed_through_decision=True))
         assert result is None
         assert m.healthy
 
     @pytest.mark.asyncio
+    async def test_decision_stage_running_is_not_a_violation(self, bus: SignalBus) -> None:
+        """The decision stage runs every tick (ADR 0005); only a reflex
+        proposal reaching it breaks the bypass."""
+        m = ReflexBypassMonitor(bus)
+        result = await m.check(1, _state(reflex_fired=True, decision_entered=True))
+        assert result is None
+
+    @pytest.mark.asyncio
     async def test_no_violation_when_reflex_fires_without_decision(self, bus: SignalBus) -> None:
         m = ReflexBypassMonitor(bus)
-        result = await m.check(1, _state(reflex_fired=True, decision_entered=False))
+        result = await m.check(1, _state(reflex_fired=True, reflex_routed_through_decision=False))
         assert result is None
 
     @pytest.mark.asyncio
     async def test_violation_when_reflex_and_decision_both_entered(self, bus: SignalBus) -> None:
         m = ReflexBypassMonitor(bus)
-        result = await m.check(1, _state(reflex_fired=True, decision_entered=True))
+        result = await m.check(1, _state(reflex_fired=True, reflex_routed_through_decision=True))
         assert result is not None
         assert result.severity == SafetySeverity.CRITICAL
         assert result.property_name == "reflex_bypass"
@@ -62,7 +71,7 @@ class TestReflexBypassMonitor:
         bus.subscribe("safety_violation", _capture)
 
         m = ReflexBypassMonitor(bus)
-        await m.check(1, _state(reflex_fired=True, decision_entered=True))
+        await m.check(1, _state(reflex_fired=True, reflex_routed_through_decision=True))
         assert len(received) == 1
         assert received[0].monitor_id == "ReflexBypassMonitor"
 
@@ -193,15 +202,16 @@ class TestTickBudgetMonitor:
 
 class TestSafetyMonitorRegistry:
     @pytest.mark.asyncio
-    async def test_default_has_five_monitors(self, bus: SignalBus) -> None:
+    async def test_default_has_six_monitors(self, bus: SignalBus) -> None:
         reg = SafetyMonitorRegistry.default(bus)
-        assert len(reg.monitors) == 5
+        assert len(reg.monitors) == 6
+        assert any(isinstance(m, ActuatorExclusivityMonitor) for m in reg.monitors)
 
     @pytest.mark.asyncio
     async def test_check_all_returns_violations(self, bus: SignalBus) -> None:
         reg = SafetyMonitorRegistry.default(bus)
         violations = await reg.check_all(1, _state(
-            reflex_fired=True, decision_entered=True,
+            reflex_fired=True, reflex_routed_through_decision=True,
             reflex_action_dispatched=False,
         ))
         # ReflexBypass + ReflexDispatch should both fire
@@ -216,13 +226,13 @@ class TestSafetyMonitorRegistry:
     @pytest.mark.asyncio
     async def test_not_healthy_after_violation(self, bus: SignalBus) -> None:
         reg = SafetyMonitorRegistry.default(bus)
-        await reg.check_all(1, _state(reflex_fired=True, decision_entered=True))
+        await reg.check_all(1, _state(reflex_fired=True, reflex_routed_through_decision=True))
         assert not reg.all_healthy
 
     @pytest.mark.asyncio
     async def test_total_violations(self, bus: SignalBus) -> None:
         reg = SafetyMonitorRegistry.default(bus)
-        await reg.check_all(1, _state(reflex_fired=True, decision_entered=True))
+        await reg.check_all(1, _state(reflex_fired=True, reflex_routed_through_decision=True))
         assert reg.total_violations >= 1
 
     def test_register_unregister(self, bus: SignalBus) -> None:
@@ -232,3 +242,21 @@ class TestSafetyMonitorRegistry:
         assert len(reg.monitors) == 1
         reg.unregister("ReflexBypassMonitor")
         assert len(reg.monitors) == 0
+
+
+# ── ActuatorExclusivityMonitor ───────────────────────────────────────────────
+
+
+class TestActuatorExclusivityMonitor:
+    @pytest.mark.asyncio
+    async def test_no_violation_with_single_owners(self, bus: SignalBus) -> None:
+        m = ActuatorExclusivityMonitor(bus)
+        assert await m.check(1, _state(resources_with_multiple_owners=0)) is None
+
+    @pytest.mark.asyncio
+    async def test_violation_when_a_resource_has_two_owners(self, bus: SignalBus) -> None:
+        m = ActuatorExclusivityMonitor(bus)
+        result = await m.check(1, _state(resources_with_multiple_owners=1))
+        assert result is not None
+        assert result.property_name == "actuator_exclusivity"
+        assert result.severity == SafetySeverity.CRITICAL

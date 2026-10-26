@@ -105,6 +105,7 @@ from arachnite.nodes.llm import LLMInstinctNode
 from arachnite.nodes.sense import BaseSenseNode, SenseMasterNode
 from arachnite.runtime import TICK_STAGE_NAMES, ArachniteRuntime, TickInstrumenter
 from arachnite.safety_monitor import (
+    ActuatorExclusivityMonitor,
     BaseSafetyMonitor,
     MandatoryBlockMonitor,
     MonitorState,
@@ -224,6 +225,7 @@ __all__ = [
     "ReflexDispatchMonitor",
     "ReflexAvailabilityMonitor",
     "TickBudgetMonitor",
+    "ActuatorExclusivityMonitor",
     "BaseActionNode",
     "MultiStepActionNode",
     "ActionMasterNode",

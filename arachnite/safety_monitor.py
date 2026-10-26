@@ -4,13 +4,16 @@ arachnite.safety_monitor
 Runtime safety monitors that continuously verify invariants.
 
 Monitors are lightweight checkers that verify safety properties after each
-tick. They complement the static formal verification (UPPAAL model, §6) with
-dynamic runtime assurance.
+tick. They complement the mechanically checked CSP models in ``formal/``
+with dynamic runtime assurance.
 
 The runtime does NOT run these automatically. You wire them into your own run
-loop: build a `SafetyMonitorRegistry`, assemble a `MonitorState` from the
-tick's outcome, and call `registry.check_all(tick, state)` after each tick.
-See tutorials/advanced/12_safety_monitors.md for the integration pattern.
+loop: build a `SafetyMonitorRegistry` and, after each tick, call
+`registry.check_all(rt.tick_count, rt.monitor_state())`. `monitor_state()`
+assembles the MonitorState from what the runtime actually observed during
+the last tick (reflex launch outcomes, decision inputs, completed Results,
+mandatory blocks in progress, reflex-node health, tick duration). See
+tutorials/advanced/12_safety_monitors.md for the integration pattern.
 
 Each monitor implements a single safety invariant and emits a
 SafetyViolationSignal on the SignalBus if the invariant is breached.
@@ -114,13 +117,32 @@ class BaseSafetyMonitor(ABC):
 
 @dataclass
 class MonitorState:
-    """Snapshot of runtime state provided to monitors each tick."""
+    """
+    Snapshot of runtime state provided to monitors each tick.
+
+    ``ArachniteRuntime.monitor_state()`` fills every field from the last tick
+    (reflex-lane activity since the previous report included).
+    """
     tick: int = 0
+    #: At least one reflex proposal was produced.
     reflex_fired: bool = False
+    #: Every reflex proposal reached its action: launched, armed (waiting to
+    #: preempt) or de-duplicated — none was lost (e.g. unknown action).
     reflex_action_dispatched: bool = False
+    #: A reflex node's proposal was offered to the decision layer.
+    reflex_routed_through_decision: bool = False
+    #: Deprecated, ignored by the monitors: the decision stage runs every
+    #: tick, also when a reflex fired (ADR 0005). Use
+    #: ``reflex_routed_through_decision``.
     decision_entered: bool = False
+    #: A running action was inside a mandatory block at the end of the tick.
     mandatory_block_active: bool = False
+    #: A *deliberative* interrupt was honoured strictly inside a mandatory
+    #: block. Reflex preemption (PREEMPT) and emergency_stop() are declared
+    #: exceptions and never set this.
     interrupt_accepted_during_block: bool = False
+    #: Declared resources that had more than one running owner.
+    resources_with_multiple_owners: int = 0
     active_reflex_nodes: int = 0
     total_reflex_nodes: int = 0
     tick_duration_ms: float = 0.0
@@ -131,37 +153,40 @@ class MonitorState:
 
 
 class ReflexBypassMonitor(BaseSafetyMonitor):
-    """Verifies Property 1: reflex arc bypasses the decision layer.
+    """Verifies Property 1: reflex proposals bypass the decision layer.
 
-    Corresponds to UPPAAL P1: A[] (reflex_fired => !decision_entered)
+    Invariant: reflex_fired => !reflex_routed_through_decision.
 
-    If a reflex fires and the decision layer was also entered in the
-    same tick, the pipeline ordering invariant has been violated.
+    The decision stage itself runs every tick (deliberation continues while
+    a reflex acts), so the property is about the *reflex proposal*: it must
+    reach its action without ever being offered to the decision strategy.
     """
 
     monitor_id = "ReflexBypassMonitor"
 
     async def check(self, tick: int, state: MonitorState) -> SafetyViolationSignal | None:
         self._last_check_ok = True
-        if state.reflex_fired and state.decision_entered:
+        if state.reflex_fired and state.reflex_routed_through_decision:
             return await self.emit_violation(
                 property_name="reflex_bypass",
                 severity=SafetySeverity.CRITICAL,
                 details=(
-                    f"Tick {tick}: reflex fired but decision layer was also "
-                    f"entered. Pipeline ordering invariant violated."
+                    f"Tick {tick}: a reflex proposal was offered to the "
+                    f"decision layer. Reflex bypass invariant violated."
                 ),
             )
         return None
 
 
 class MandatoryBlockMonitor(BaseSafetyMonitor):
-    """Verifies Property 2: mandatory blocks cannot be interrupted.
+    """Verifies Property 2: deliberative atomicity of mandatory blocks.
 
-    Corresponds to UPPAAL P2: A[] (mandatory_block => !interrupted)
+    Invariant: no deliberative interrupt is honoured strictly inside a
+    mandatory block.
 
-    If an interrupt is accepted while a mandatory completion block
-    is active, the atomicity invariant has been violated.
+    A reflex declaring ReflexPreemption.PREEMPT and emergency_stop() are the
+    declared exceptions (ADR 0005) and are not violations; they surface as
+    ``Result.preempted`` / a shutdown, not as an accepted interrupt.
     """
 
     monitor_id = "MandatoryBlockMonitor"
@@ -173,20 +198,21 @@ class MandatoryBlockMonitor(BaseSafetyMonitor):
                 property_name="mandatory_block_atomicity",
                 severity=SafetySeverity.CRITICAL,
                 details=(
-                    f"Tick {tick}: interrupt accepted during mandatory "
-                    f"completion block. Atomicity invariant violated."
+                    f"Tick {tick}: deliberative interrupt honoured inside a "
+                    f"mandatory completion block. Atomicity invariant violated."
                 ),
             )
         return None
 
 
 class ReflexDispatchMonitor(BaseSafetyMonitor):
-    """Verifies Property 3: reflex fires imply action dispatched.
+    """Verifies Property 3: a fired reflex always reaches its action.
 
-    Corresponds to UPPAAL P3: A[] (reflex_fired => action_dispatched)
+    Invariant: reflex_fired => reflex_action_dispatched.
 
-    If a reflex fires but its target action was not dispatched,
-    the reflex path has a dead end.
+    Launched, armed (waiting for a preempted owner's safe-stop or for a
+    WAIT_FOR_BLOCK block) and de-duplicated outcomes all count as reaching
+    the action; a reflex whose action cannot be found is a dead end.
     """
 
     monitor_id = "ReflexDispatchMonitor"
@@ -200,6 +226,31 @@ class ReflexDispatchMonitor(BaseSafetyMonitor):
                 details=(
                     f"Tick {tick}: reflex fired but target action was "
                     f"not dispatched. Reflex path has dead end."
+                ),
+            )
+        return None
+
+
+class ActuatorExclusivityMonitor(BaseSafetyMonitor):
+    """Verifies Property 7: actuator exclusivity (ADR 0005).
+
+    Invariant: no declared resource has more than one running owner.
+
+    ActionMasterNode enforces this by construction for declared resources;
+    the monitor is the runtime check of that guarantee.
+    """
+
+    monitor_id = "ActuatorExclusivityMonitor"
+
+    async def check(self, tick: int, state: MonitorState) -> SafetyViolationSignal | None:
+        self._last_check_ok = True
+        if state.resources_with_multiple_owners > 0:
+            return await self.emit_violation(
+                property_name="actuator_exclusivity",
+                severity=SafetySeverity.CRITICAL,
+                details=(
+                    f"Tick {tick}: {state.resources_with_multiple_owners} "
+                    f"resource(s) owned by more than one running action."
                 ),
             )
         return None
@@ -312,6 +363,7 @@ class SafetyMonitorRegistry:
         registry.register(ReflexBypassMonitor(bus))
         registry.register(MandatoryBlockMonitor(bus))
         registry.register(ReflexDispatchMonitor(bus))
+        registry.register(ActuatorExclusivityMonitor(bus))
         registry.register(ReflexAvailabilityMonitor(bus))
         registry.register(TickBudgetMonitor(bus))
         return registry

@@ -410,7 +410,7 @@ from arachnite import \(
 
     ReflexBypassMonitor, MandatoryBlockMonitor, ReflexDispatchMonitor,
 
-    ReflexAvailabilityMonitor, TickBudgetMonitor,
+    ActuatorExclusivityMonitor, ReflexAvailabilityMonitor, TickBudgetMonitor,
 
     \# Models
 

@@ -163,7 +163,8 @@ from arachnite import (
     BaseSafetyMonitor, SafetyMonitorRegistry, SafetyViolationSignal,
     SafetySeverity, MonitorState,
     ReflexBypassMonitor, MandatoryBlockMonitor, ReflexDispatchMonitor,
-    ReflexAvailabilityMonitor, TickBudgetMonitor,
+    ActuatorExclusivityMonitor, ReflexAvailabilityMonitor, TickBudgetMonitor,
+    # usage: await registry.check_all(rt.tick_count, rt.monitor_state())
 
     # Media
     MediaStore,

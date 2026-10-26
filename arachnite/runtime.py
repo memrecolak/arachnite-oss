@@ -25,6 +25,7 @@ from arachnite.models import (
     ActionExecutionState,
     Context,
     DecisionEvent,
+    NodeState,
     Permission,
     Proposal,
     ReflexPreemption,
@@ -32,7 +33,12 @@ from arachnite.models import (
     ShutdownPhase,
     Signal,
 )
-from arachnite.nodes.action import ActionMasterNode, BaseActionNode, LaunchStatus
+from arachnite.nodes.action import (
+    ActionMasterNode,
+    BaseActionNode,
+    LaunchStatus,
+    MultiStepActionNode,
+)
 from arachnite.nodes.base import BaseNode
 from arachnite.nodes.decision import DecisionMasterNode
 from arachnite.nodes.instinct import (
@@ -41,6 +47,7 @@ from arachnite.nodes.instinct import (
     InstinctMasterNode,
 )
 from arachnite.nodes.sense import BaseSenseNode, SenseMasterNode
+from arachnite.safety_monitor import MonitorState
 from arachnite.shutdown import ShutdownCoordinator
 from arachnite.supervisor import NodeSupervisor
 
@@ -271,6 +278,12 @@ class ArachniteRuntime:
         self._lane_kinds: set[str] = set()
         # (source, kind) -> (latest signal, monotonic receipt time)
         self._lane_latest: dict[tuple[str, str], tuple[Signal, float]] = {}
+
+        # Observations for monitor_state(): reflex launch outcomes (tick
+        # stage and event lane) since the last completed tick, and facts
+        # recorded by the last tick.
+        self._reflex_outcomes: list[LaunchStatus] = []
+        self._monitor_report: dict[str, object] = {}
 
     # ── Public properties ─────────────────────────────────────────────────────
 
@@ -749,6 +762,7 @@ class ArachniteRuntime:
                 else ReflexPreemption.PREEMPT
             )
             outcome = self._action_master.launch_reflex(rp, preemption)
+            self._reflex_outcomes.append(outcome.status)
             if outcome.status is LaunchStatus.NOT_FOUND:
                 self._logger.warning(
                     "Reflex dispatch skipped: action not found",
@@ -781,6 +795,63 @@ class ArachniteRuntime:
         ``ctx.last_results`` on the next tick.
         """
         return await self._action_master.wait_idle(timeout)
+
+    # ── Runtime safety monitoring ────────────────────────────────────────────
+
+    def monitor_state(self) -> MonitorState:
+        """
+        MonitorState for ``SafetyMonitorRegistry.check_all()``, built from what
+        the runtime observed in the last tick: reflex launch outcomes (event
+        lane included), whether a reflex proposal reached the decision layer,
+        whether a completed action reported a deliberative stop inside a
+        mandatory block, blocks in progress, resource ownership, reflex-node
+        health and the tick's duration.
+        """
+        report = self._monitor_report
+        raw_outcomes = report.get("reflex_outcomes", [])
+        outcomes = raw_outcomes if isinstance(raw_outcomes, list) else []
+        owners: dict[str, int] = {}
+        for node in self._action_master.current_actions().values():
+            for resource in node.resources:
+                owners[resource] = owners.get(resource, 0) + 1
+        reflex_nodes = self._instinct_master.reflex_nodes
+        reflex_states = self._supervisors[1].all_states()
+        unavailable = (NodeState.FAULTED, NodeState.RESTARTING, NodeState.DEAD)
+        active = sum(
+            1 for n in reflex_nodes if reflex_states.get(n.node_id) not in unavailable
+        )
+        duration = report.get("tick_duration_ms", 0.0)
+        return MonitorState(
+            tick                            = self._tick_count,
+            reflex_fired                    = bool(outcomes),
+            reflex_action_dispatched        = all(
+                status is not LaunchStatus.NOT_FOUND for status in outcomes
+            ),
+            reflex_routed_through_decision  = bool(report.get("reflex_routed", False)),
+            mandatory_block_active          = not self._action_master.is_interruptible(),
+            interrupt_accepted_during_block = bool(report.get("interior_interrupt", False)),
+            resources_with_multiple_owners  = sum(1 for n in owners.values() if n > 1),
+            active_reflex_nodes             = active,
+            total_reflex_nodes              = len(reflex_nodes),
+            tick_duration_ms                = float(duration) if isinstance(
+                duration, (int, float),
+            ) else 0.0,
+            tick_budget_ms                  = self._interval * 1000.0,
+        )
+
+    def _stopped_inside_block(self, result: Result) -> bool:
+        """True if a non-preempted interrupt stopped the action inside a block."""
+        if not result.interrupted or result.preempted or result.stopped_at_step is None:
+            return False
+        node = self._action_master.get_node(result.action_id)
+        if not isinstance(node, MultiStepActionNode):
+            return False
+        steps = node.steps()
+        names = [s.name for s in steps]
+        if result.stopped_at_step not in names:
+            return False
+        i = names.index(result.stopped_at_step)
+        return i > 0 and not steps[i].interruptible and not steps[i - 1].interruptible
 
     # ── Tick loop ─────────────────────────────────────────────────────────────
 
@@ -896,6 +967,7 @@ class ArachniteRuntime:
         if completed:
             self._last_results = completed
             self._last_result = completed[0]
+        interior_interrupt = any(self._stopped_inside_block(r) for r in completed)
 
         # 1. Sense
         signals = await self._sense_master.read_all()
@@ -1008,6 +1080,8 @@ class ArachniteRuntime:
 
         # Notify rejected instincts (includes carried-forward pending proposals)
         all_considered = self._decision_master.last_considered
+        reflex_ids = {n.node_id for n in self._instinct_master.reflex_nodes}
+        reflex_routed = any(p.instinct_id in reflex_ids for p in all_considered)
         dispatched_ids = {p.instinct_id for p in to_dispatch}
         rejected = [p for p in all_considered if p.instinct_id not in dispatched_ids]
         if rejected:
@@ -1088,6 +1162,13 @@ class ArachniteRuntime:
 
         # 7. Tick-end hooks on all leaf nodes (charged to `act`, instrumentation ADR)
         tick_duration = time.monotonic() - tick_start
+        outcomes, self._reflex_outcomes = self._reflex_outcomes, []
+        self._monitor_report = {
+            "reflex_outcomes": outcomes,
+            "reflex_routed": reflex_routed,
+            "interior_interrupt": interior_interrupt,
+            "tick_duration_ms": tick_duration * 1000.0,
+        }
         await asyncio.gather(
             self._sense_master.notify_tick_end(self._tick_count, tick_duration),
             self._instinct_master.notify_tick_end(self._tick_count, tick_duration),

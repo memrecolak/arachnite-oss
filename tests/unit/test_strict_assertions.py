@@ -161,7 +161,7 @@ class TestSafetyMonitorRegistryStrict:
         reg = SafetyMonitorRegistry.default(bus)
         violations = await reg.check_all(1, _state(
             reflex_fired=True,
-            decision_entered=True,
+            reflex_routed_through_decision=True,
             reflex_action_dispatched=False,
         ))
 
@@ -182,7 +182,7 @@ class TestSafetyMonitorRegistryStrict:
         reg = SafetyMonitorRegistry.default(bus)
         violations = await reg.check_all(1, _state(
             reflex_fired=True,
-            decision_entered=True,
+            reflex_routed_through_decision=True,
             reflex_action_dispatched=True,
         ))
 
@@ -195,7 +195,7 @@ class TestSafetyMonitorRegistryStrict:
         reg = SafetyMonitorRegistry.default(bus)
         violations = await reg.check_all(1, _state(
             reflex_fired=True,
-            decision_entered=False,
+            reflex_routed_through_decision=False,
             reflex_action_dispatched=False,
         ))
 

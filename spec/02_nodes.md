@@ -1252,7 +1252,7 @@ class NodeFaultReflex\(BaseReflexInstinctNode\):
 
 ## __6\.5 Runtime Safety Monitors__
 
-The safety monitor subsystem provides continuous runtime verification of the safety properties formalised in the CSP models under ``formal/``\. Monitors are lightweight checkers that verify invariants after each tick and emit `SafetyViolationSignal` on the `SignalBus` when an invariant is breached\. The runtime does not run them automatically: build a `SafetyMonitorRegistry`, and call `check_all\(tick, state\)` from your run loop after each tick \(see the safety\-monitors tutorial\)\. `check_all\(\)` returns the violations directly; violations are also published on the bus but are not injected into `ctx\.signals`\.
+The safety monitor subsystem provides continuous runtime verification of the safety properties formalised in the CSP models under ``formal/``\. Monitors are lightweight checkers that verify invariants after each tick and emit `SafetyViolationSignal` on the `SignalBus` when an invariant is breached\. The runtime does not run them automatically: build a `SafetyMonitorRegistry`, and after each tick call `check_all\(rt\.tick\_count, rt\.monitor\_state\(\)\)` \(see the safety\-monitors tutorial\)\. ``ArachniteRuntime\.monitor\_state\(\)`` builds the state from what the runtime observed in the last tick, so no field is left to the caller\. `check_all\(\)` returns the violations directly; violations are also published on the bus but are not injected into `ctx\.signals`\.
 
 ### __BaseSafetyMonitor__
 
@@ -1265,23 +1265,24 @@ Abstract base class\. Subclass and implement `check\(tick, state\)` to verify a 
 
 ### __MonitorState__
 
-Snapshot of runtime state provided to monitors each tick: tick, reflex\_fired, reflex\_action\_dispatched, decision\_entered, mandatory\_block\_active, interrupt\_accepted\_during\_block, active\_reflex\_nodes, total\_reflex\_nodes, tick\_duration\_ms, tick\_budget\_ms\.
+Snapshot of runtime state provided to monitors each tick: tick, reflex\_fired, reflex\_action\_dispatched, reflex\_routed\_through\_decision, decision\_entered \(deprecated, ignored\), mandatory\_block\_active, interrupt\_accepted\_during\_block, resources\_with\_multiple\_owners, active\_reflex\_nodes, total\_reflex\_nodes, tick\_duration\_ms, tick\_budget\_ms\.
 
 ### __SafetyMonitorRegistry__
 
-Manages a set of monitors\. `SafetyMonitorRegistry\.default\(bus\)` creates all five standard monitors\.
+Manages a set of monitors\. `SafetyMonitorRegistry\.default\(bus\)` creates all six standard monitors\.
 
 ### __Built\-in Monitors__
 
 | Monitor | Property | Severity |
 |---|---|---|
-| `ReflexBypassMonitor` | reflex\_fired ⟹ ¬decision\_entered | CRITICAL |
-| `MandatoryBlockMonitor` | mandatory\_block ⟹ ¬interrupted | CRITICAL |
-| `ReflexDispatchMonitor` | reflex\_fired ⟹ action\_dispatched | CRITICAL |
+| `ReflexBypassMonitor` | reflex\_fired ⟹ ¬reflex\_routed\_through\_decision | CRITICAL |
+| `MandatoryBlockMonitor` | no deliberative interrupt honoured strictly inside a mandatory block | CRITICAL |
+| `ReflexDispatchMonitor` | reflex\_fired ⟹ reflex\_action\_dispatched | CRITICAL |
+| `ActuatorExclusivityMonitor` | resources\_with\_multiple\_owners = 0 | CRITICAL |
 | `ReflexAvailabilityMonitor` | all reflex nodes available | WARNING |
 | `TickBudgetMonitor` | 3\+ consecutive tick overruns | WARNING |
 
-The caller fills ``MonitorState`` with these meanings: ``decision\_entered`` — the **reflex proposal** passed through the decision layer \(the decide stage itself runs on every tick, after the reflex stage\); ``interrupt\_accepted\_during\_block`` — a **deliberative** interrupt took effect inside a mandatory block \(a ``PREEMPT`` reflex or ``emergency\_stop\(\)`` ending a block is declared behaviour, §17\.5, not a violation\); ``reflex\_action\_dispatched`` — ``launch\_reflex\(\)`` returned ``LAUNCHED``, ``ARMED`` or ``DEDUPED``\.
+Field meanings, as ``monitor\_state\(\)`` fills them: ``reflex\_routed\_through\_decision`` — a **reflex node's proposal** was offered to the decision layer \(the decide stage itself runs on every tick, after the reflex stage, so \"the decide stage ran\" is not the property\); ``interrupt\_accepted\_during\_block`` — a completed action reported a **deliberative** stop strictly inside a mandatory block \(a ``PREEMPT`` reflex or ``emergency\_stop\(\)`` ending a block is declared behaviour, §17\.5, not a violation\); ``reflex\_action\_dispatched`` — every ``launch\_reflex\(\)`` since the previous tick returned ``LAUNCHED``, ``ARMED`` or ``DEDUPED``; ``resources\_with\_multiple\_owners`` — declared resources held by more than one running action \(0 by construction\); ``active\_reflex\_nodes`` — reflex nodes not FAULTED, RESTARTING or DEAD\.
 
 Violations are published as `SafetyViolationSignal` \(kind `"safety_violation"`\) with `monitor_id`, `severity`, `property_name`, and `details`\. Reflex instincts can subscribe and trigger compensating actions\.
 
