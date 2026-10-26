@@ -16,7 +16,7 @@ from arachnite.bus import SignalBus
 from arachnite.config import NodeConfig
 from arachnite.exceptions import NodeRegistrationError
 from arachnite.logging import BaseLogSink
-from arachnite.models import MergePolicy, Signal
+from arachnite.models import MergePolicy, Signal, StateUpdateSignal
 from arachnite.nodes.base import BaseNode, FaultReportingMixin
 
 
@@ -50,6 +50,38 @@ class BaseSenseNode(BaseNode):
     ) -> None:
         super().__init__(bus, config, log_sinks, agent_node_id, **kwargs)  # type: ignore[arg-type]
         self._last_read_time: float = 0.0
+        self._pushed: list[Signal] = []
+
+    async def push(self, signal: Signal) -> None:
+        """
+        Emit an event-driven observation now, outside the tick (ADR 0005).
+
+        Publishes ``signal`` on the bus immediately — an event-mode reflex
+        (``ArachniteRuntime(reflex_mode="event")``) whose
+        ``trigger_on_signals`` includes its kind is evaluated before
+        ``push()`` returns — and queues it so the next tick's ``read_all()``
+        also hands it to the ContextNode for deliberation. Call it from a
+        background task started in ``setup()`` (e.g. an interrupt-driven GPIO
+        or ToF listener). A bus subscriber that raises is logged, not
+        propagated into the listener.
+        """
+        if not isinstance(signal, StateUpdateSignal):
+            # A StateUpdateSignal already reaches ContextNode through the
+            # runtime's bus buffer; queueing it too would apply it twice.
+            self._pushed.append(signal)
+        try:
+            await self.bus.publish(signal)
+        except Exception as exc:  # noqa: BLE001
+            self.logger.error(
+                "push(): a bus subscriber raised",
+                error=str(exc),
+                error_type=type(exc).__name__,
+            )
+
+    def _drain_pushed(self) -> list[Signal]:
+        """Return (and clear) signals pushed since the last read_all()."""
+        pushed, self._pushed = self._pushed, []
+        return pushed
 
     @abstractmethod
     async def read(self) -> Signal | None:
@@ -205,6 +237,12 @@ class SenseMasterNode(FaultReportingMixin, BaseNode):
         # Publish all signals to the bus concurrently
         if signals:
             await self.bus.publish_many(signals)
+
+        # Signals pushed since the last tick (BaseSenseNode.push) were already
+        # published when they happened; they join the returned list only, so
+        # deliberation sees them once and the bus does not see them twice.
+        for node in self._nodes.values():
+            signals.extend(node._drain_pushed())
 
         self.logger.debug(
             "read_all complete",

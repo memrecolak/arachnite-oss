@@ -80,6 +80,26 @@ class TestContextNodeSnapshot:
         assert snap.tick == 2
 
 
+class TestContextNodeReflexView:
+    def test_usable_before_first_update(self) -> None:
+        view = ContextNode().reflex_view([_sig(kind="proximity")])
+        assert view.tick == 0
+        assert [s.kind for s in view.signals] == ["proximity"]
+
+    def test_carries_state_and_results_without_history(self) -> None:
+        ctx = ContextNode(history_length=5)
+        ctx.set("mode", "pick")
+        r = _result()
+        ctx.update([_sig()], result=r)
+        view = ctx.reflex_view([_sig(kind="proximity")])
+        assert view.state == {"mode": "pick"}
+        assert view.last_result is r
+        assert len(view.history) == 0
+        view.state["mode"] = "mutated"
+        assert ctx.get("mode") == "pick"          # a copy, not the live dict
+        assert ctx.tick == 1                       # does not advance the tick
+
+
 class TestContextNodeState:
     def test_set_and_get(self) -> None:
         ctx = ContextNode()

@@ -107,7 +107,7 @@ class Retract(BaseActionNode):
         self.order: list[str] | None = None
 
     async def execute(self, proposal: Proposal) -> Result:
-        self.entered_at = time.monotonic()
+        self.entered_at = time.perf_counter()
         if self.order is not None:
             self.order.append("reflex_execute")
         await self.actuator.move(self.node_id, 0.01)
@@ -124,7 +124,7 @@ class Beep(BaseActionNode):
         self.entered_at: float | None = None
 
     async def execute(self, proposal: Proposal) -> Result:
-        self.entered_at = time.monotonic()
+        self.entered_at = time.perf_counter()
         return Result(action_id=self.node_id, success=True)
 
 
@@ -161,9 +161,9 @@ def _master() -> tuple[ActionMasterNode, Actuator, PickPlace, Retract]:
 
 
 async def _until(predicate, timeout: float = 2.0) -> None:  # type: ignore[no-untyped-def]
-    deadline = time.monotonic() + timeout
+    deadline = time.perf_counter() + timeout
     while not predicate():
-        if time.monotonic() > deadline:
+        if time.perf_counter() > deadline:
             raise AssertionError("condition not reached")
         await asyncio.sleep(0.002)
 
@@ -316,7 +316,7 @@ class TestReflexPreempt:
         am, _, pick, retract = _master()
         am.launch(_p("PickPlace"))
         await _until(lambda: pick.executed[-1:] == ["lower"])
-        fired = time.monotonic()
+        fired = time.perf_counter()
         am.launch_reflex(_p("Retract", 250))
         await _until(lambda: retract.entered_at is not None)
         assert retract.entered_at is not None

@@ -142,6 +142,25 @@ class ContextNode:
             self._history[-1] if self._history else []
         )
 
+    def reflex_view(self, signals: list[Signal]) -> Context:
+        """
+        A lightweight Context for the event-driven reflex lane (ADR 0005):
+        the given ``signals``, the current state and action/result fields,
+        and an **empty** history — no per-event history copy. Never raises
+        (usable before the first update()) and does not mutate the node.
+        """
+        return Context(
+            tick          = self._tick,
+            signals       = signals,
+            history       = deque(maxlen=0),
+            state         = dict(self._state),
+            last_result   = self._last_result,
+            timestamp     = time.monotonic(),
+            action_state  = self._action_state,
+            last_results  = self._last_results,
+            action_states = self._action_states,
+        )
+
     def _build_context(self, signals: list[Signal]) -> Context:
         # Snapshot the history so that later mutations (e.g. eviction in
         # _apply_history_config) do not affect concurrent consumers.

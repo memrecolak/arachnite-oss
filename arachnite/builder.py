@@ -51,6 +51,8 @@ class RuntimeBuilder:
     - strategy: GreedyDecisionNode
     - tick_rate: 10.0 Hz
     - reflex_conflict: 'dispatch_all'
+    - reflex_mode: 'tick'
+    - strict_resources: False
     """
 
     def __init__(self) -> None:
@@ -65,6 +67,8 @@ class RuntimeBuilder:
         self._shutdown_coordinator: ShutdownCoordinator | None = None
         self._allowed_permissions: dict[str, set[Permission]] | None = None
         self._reflex_conflict: str = "dispatch_all"
+        self._reflex_mode: str = "tick"
+        self._strict_resources: bool = False
         self._overrun_warn_pct: float = 0.2
         self._overrun_warn_consecutive: int = 3
 
@@ -117,6 +121,16 @@ class RuntimeBuilder:
         self._reflex_conflict = policy
         return self
 
+    def reflex_mode(self, mode: str) -> RuntimeBuilder:
+        """Set reflex evaluation: 'tick' (default) or 'event' (ADR 0005)"""
+        self._reflex_mode = mode
+        return self
+
+    def strict_resources(self, strict: bool = True) -> RuntimeBuilder:
+        """Require every action to declare the resources it commands"""
+        self._strict_resources = strict
+        return self
+
     def permissions(self, allowed: dict[str, set[Permission]]) -> RuntimeBuilder:
         """Set allowed permissions whitelist"""
         self._allowed_permissions = allowed
@@ -154,7 +168,9 @@ class RuntimeBuilder:
         )
         decision_strategy = self._strategy_instance or self._strategy_cls(bus=self._bus)
         decision_master = DecisionMasterNode(bus=self._bus, strategy=decision_strategy)
-        action_master = ActionMasterNode(bus=self._bus)
+        action_master = ActionMasterNode(
+            bus=self._bus, strict_resources=self._strict_resources,
+        )
 
         for sense_node in self._sense_nodes:
             sense_master.register(sense_node)
@@ -176,4 +192,5 @@ class RuntimeBuilder:
             overrun_warn_consecutive=self._overrun_warn_consecutive,
             shutdown_coordinator=self._shutdown_coordinator,
             allowed_permissions=self._allowed_permissions,
+            reflex_mode=self._reflex_mode,
         )

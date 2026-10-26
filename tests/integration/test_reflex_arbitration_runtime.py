@@ -39,7 +39,7 @@ class World:
         self.events: list[tuple[float, str]] = []
 
     def log(self, what: str) -> None:
-        self.events.append((time.monotonic(), what))
+        self.events.append((time.perf_counter(), what))
 
 
 class ProximitySense(BaseSenseNode):
@@ -55,7 +55,7 @@ class ProximitySense(BaseSenseNode):
         self.world.reads += 1
         return Signal(source=self.node_id, kind=self.signal_kind,
                       value=0.01 if self.world.collision else 1.0,
-                      confidence=1.0, timestamp=time.monotonic())
+                      confidence=1.0, timestamp=time.perf_counter())
 
 
 class CollisionReflex(BaseReflexInstinctNode):
@@ -131,7 +131,7 @@ class Retract(BaseActionNode):
         self.entered_at: float | None = None
 
     async def execute(self, proposal: Proposal) -> Result:
-        self.entered_at = time.monotonic()
+        self.entered_at = time.perf_counter()
         self.world.log("retract")
         self.world.collision = False
         return Result(action_id=self.node_id, success=True)
@@ -161,19 +161,19 @@ def _build(
 
 
 async def _wait_for_step(world: World, name: str, timeout: float = 3.0) -> None:
-    deadline = time.monotonic() + timeout
+    deadline = time.perf_counter() + timeout
     while not any(e == f"step:{name}" for _, e in world.events):
-        if time.monotonic() > deadline:
+        if time.perf_counter() > deadline:
             raise AssertionError(f"step {name} never started")
         await asyncio.sleep(0.005)
 
 
 async def _collide_and_wait(world: World, retract: Retract) -> float:
     world.collision = True
-    world.collision_at = time.monotonic()
-    deadline = time.monotonic() + 3.0
+    world.collision_at = time.perf_counter()
+    deadline = time.perf_counter() + 3.0
     while retract.entered_at is None:
-        if time.monotonic() > deadline:
+        if time.perf_counter() > deadline:
             raise AssertionError("reflex never executed")
         await asyncio.sleep(0.002)
     return retract.entered_at - world.collision_at
@@ -306,8 +306,8 @@ class TestDeliberativeHandOff:
             action_master=am, bus=bus, tick_rate_hz=TICK_HZ,
         )
         await rt.start()
-        deadline = time.monotonic() + 3.0
-        while not inspect.ran_after_patrol_stopped and time.monotonic() < deadline:
+        deadline = time.perf_counter() + 3.0
+        while not inspect.ran_after_patrol_stopped and time.perf_counter() < deadline:
             await asyncio.sleep(0.01)
         await rt.stop()
 

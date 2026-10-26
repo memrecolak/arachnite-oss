@@ -91,6 +91,16 @@ class TestRuntimeBuilderBasic:
         rt = RuntimeBuilder().reflex_conflict("raise").build()
         assert rt._instinct_master.reflex_conflict == "raise"
 
+    def test_reflex_mode_defaults_to_tick(self) -> None:
+        assert RuntimeBuilder().build()._reflex_mode == "tick"
+
+    def test_reflex_mode_event(self) -> None:
+        assert RuntimeBuilder().reflex_mode("event").build()._reflex_mode == "event"
+
+    def test_strict_resources(self) -> None:
+        rt = RuntimeBuilder().strict_resources().build()
+        assert rt._action_master.strict_resources is True
+
     def test_overrun_warn(self) -> None:
         rt = RuntimeBuilder().overrun_warn(0.5).build()
         assert rt._overrun_warn == 0.5

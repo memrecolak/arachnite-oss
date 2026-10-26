@@ -130,7 +130,14 @@ class ArachniteRuntime:
         tick_instrumenter: TickInstrumenter | None = None,
         context_observers: list[Callable[[Context], None]] | None = None,
         decision_observers: list[Callable[[DecisionEvent], None]] | None = None,
+        reflex_mode: str = "tick",
+        reflex_signal_ttl_s: float | None = None,
+        reflex_eval_timeout_s: float = 0.05,
     ) -> None:
+        if reflex_mode not in ("tick", "event"):
+            raise ValueError(
+                f"reflex_mode must be 'tick' or 'event', got {reflex_mode!r}"
+            )
         self._sense_master    = sense_master
         self._context         = context
         self._instinct_master = instinct_master
@@ -241,6 +248,21 @@ class ArachniteRuntime:
         self._decision_observers: list[Callable[[DecisionEvent], None]] = (
             list(decision_observers) if decision_observers else []
         )
+
+        # Event-driven reflex lane (ADR 0005). In "event" mode, reflex nodes
+        # that declare trigger_on_signals are evaluated the moment a matching
+        # signal is published on the bus — by a polled sense node during the
+        # sense stage, or by an event-driven one via BaseSenseNode.push()
+        # outside any tick — instead of once per tick in the reflex stage.
+        self._reflex_mode = reflex_mode
+        self._reflex_signal_ttl_s = (
+            reflex_signal_ttl_s if reflex_signal_ttl_s is not None else self._interval
+        )
+        self._reflex_eval_timeout_s = reflex_eval_timeout_s
+        self._lane_active = False
+        self._lane_kinds: set[str] = set()
+        # (source, kind) -> (latest signal, monotonic receipt time)
+        self._lane_latest: dict[tuple[str, str], tuple[Signal, float]] = {}
 
     # ── Public properties ─────────────────────────────────────────────────────
 
@@ -357,6 +379,8 @@ class ArachniteRuntime:
 
         self._running = True
         self._stop_event.clear()
+        if self._reflex_mode == "event":
+            self._start_reflex_lane()
         self._loop_task = asyncio.create_task(self._loop())
 
     async def stop(self) -> None:
@@ -367,6 +391,7 @@ class ArachniteRuntime:
         """
         if not self._running:
             return
+        self._stop_reflex_lane()
         await self._shutdown_coordinator.execute(self)
         self._shutdown_phase = self._shutdown_coordinator.phase
 
@@ -382,6 +407,7 @@ class ArachniteRuntime:
         """
         self._running = False
         self._stop_event.set()
+        self._stop_reflex_lane()
         self._logger.info("Emergency stop initiated")
         # Cancel and await the tick loop BEFORE stopping actions and tearing
         # masters down, so no tick can launch anything new or race node
@@ -450,6 +476,8 @@ class ArachniteRuntime:
                 raise
             self._supervisors[1].track(node)
             await self._supervisors[1].mark_running(node.node_id)
+            if self._lane_active:
+                self._subscribe_lane_kinds()
 
     async def register_action_live(self, node: BaseActionNode) -> None:
         """
@@ -596,8 +624,96 @@ class ArachniteRuntime:
     # ── Reflex arbitration ────────────────────────────────────────────────────
 
     def _tick_reflex_nodes(self) -> list[BaseReflexInstinctNode]:
-        """Reflex nodes evaluated by the tick's reflex stage."""
-        return list(self._instinct_master.reflex_nodes)
+        """
+        Reflex nodes evaluated by the tick's reflex stage: all of them in
+        "tick" mode; in "event" mode only those without trigger_on_signals
+        (the rest belong to the event-driven lane).
+        """
+        nodes = list(self._instinct_master.reflex_nodes)
+        if self._reflex_mode == "event":
+            return [n for n in nodes if not n.trigger_on_signals]
+        return nodes
+
+    # ── Event-driven reflex lane ──────────────────────────────────────────────
+
+    def _lane_nodes(self) -> list[BaseReflexInstinctNode]:
+        return [n for n in self._instinct_master.reflex_nodes if n.trigger_on_signals]
+
+    def _subscribe_lane_kinds(self) -> None:
+        for node in self._lane_nodes():
+            for kind in node.trigger_on_signals or ():
+                if kind not in self._lane_kinds:
+                    self._lane_kinds.add(kind)
+                    self._bus.subscribe(kind, self._on_reflex_signal)
+
+    def _start_reflex_lane(self) -> None:
+        self._lane_active = True
+        self._subscribe_lane_kinds()
+
+    def _stop_reflex_lane(self) -> None:
+        self._lane_active = False
+        for kind in self._lane_kinds:
+            self._bus.unsubscribe(kind, self._on_reflex_signal)
+        self._lane_kinds.clear()
+        self._lane_latest.clear()
+
+    async def _on_reflex_signal(self, signal: Signal) -> None:
+        """
+        Bus callback of the event-driven reflex lane: evaluate the reflexes
+        triggered by ``signal`` now and launch what fires. The reflex sees
+        the freshest signal per (source, kind) of its trigger kinds received
+        within ``reflex_signal_ttl_s``. Never raises into the publisher.
+
+        The lane stays live while the runtime is paused: pausing stops
+        polled sensing and deliberation, but a pushed hazard signal still
+        gets its safety reflex.
+        """
+        if not self._lane_active or not self._running:
+            return
+        now = time.perf_counter()
+        self._lane_latest[(signal.source, signal.kind)] = (signal, now)
+        nodes = [
+            n for n in self._lane_nodes()
+            if n.enabled and signal.kind in (n.trigger_on_signals or ())
+        ]
+        if not nodes:
+            return
+        kinds: set[str] = set()
+        for node in nodes:
+            kinds.update(node.trigger_on_signals or ())
+        fresh = [
+            sig for (_, kind), (sig, received) in self._lane_latest.items()
+            if kind in kinds and now - received <= self._reflex_signal_ttl_s
+        ]
+        ctx = self._context.reflex_view(fresh)
+        try:
+            proposals = await asyncio.wait_for(
+                self._instinct_master.evaluate_reflexes(ctx, nodes=nodes),
+                timeout=self._reflex_eval_timeout_s,
+            )
+        except ReflexConflictError as exc:
+            self._logger.error(
+                "Reflex priority conflict; dispatching all in priority order",
+                priority=exc.priority,
+                instinct_ids=exc.node_ids,
+            )
+            proposals = list(exc.proposals)
+        except asyncio.TimeoutError:
+            self._logger.error(
+                "Event-lane reflex evaluation timed out",
+                signal_kind=signal.kind,
+                timeout_s=self._reflex_eval_timeout_s,
+            )
+            return
+        except Exception as exc:  # noqa: BLE001
+            self._logger.error(
+                "Event-lane reflex evaluation failed",
+                signal_kind=signal.kind,
+                error=str(exc),
+                error_type=type(exc).__name__,
+            )
+            return
+        await self._launch_reflexes(proposals)
 
     async def _launch_reflexes(self, reflex_proposals: list[Proposal]) -> None:
         """

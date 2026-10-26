@@ -225,7 +225,9 @@ class ObservabilityMixin:
     @contextmanager
     def observe(self, name: str) -> Generator[None, None, None]:
         """Context manager that records the wall-clock duration of a block."""
-        start = time.monotonic()
+        # perf_counter, not monotonic: on Windows monotonic() ticks at
+        # ~15.6 ms, which would record a 10 ms block as 0 or 15.6 ms.
+        start = time.perf_counter()
         try:
             yield
         finally:
@@ -234,7 +236,7 @@ class ObservabilityMixin:
             except KeyError:
                 buf = deque(maxlen=self._histogram_maxlen)
                 self._histograms[name] = buf
-            buf.append(time.monotonic() - start)
+            buf.append(time.perf_counter() - start)
 
     def metrics(self) -> dict[str, Any]:
         """Return all current metrics as a plain dict."""
