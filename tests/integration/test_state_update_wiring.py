@@ -13,6 +13,9 @@ These tests pin that end-to-end contract:
     present in ctx.state on tick N+1,
   - delete=True published on the bus removes the key on N+1,
   - a sense node *returning* a StateUpdateSignal is applied in the SAME tick,
+  - and stays current on every subsequent tick — the copy read_all() publishes
+    for bus subscribers is never buffered back into the next tick, which would
+    make every sense-written key one tick stale,
   - a bus write wins over a same-key sense write within one drain,
   - the documented latch pattern (set this tick, read next tick) actually
     latches.
@@ -220,5 +223,89 @@ class TestBusWinsWithinDrain:
             assert captures[-1].state["shared"] == "from_sense"
             await rt.tick()  # tick 2: both in drain; bus appended last → wins
             assert captures[-1].state["shared"] == "from_bus"
+        finally:
+            await rt.stop()
+
+
+# ── A sense write is never one tick stale ─────────────────────────────────────
+#
+# read_all() publishes everything it returns, so the runtime's state_update bus
+# subscriber sees the sense copy too. Buffering that copy would re-apply tick
+# N's reading at the start of tick N+1 — appended *after* N+1's fresh sense
+# output, and therefore winning — leaving every sense-written key exactly one
+# tick behind the sensor. These tests pin the freshness contract documented on
+# StateUpdateSignal: a sense-returned write is visible in the tick it was read,
+# every tick.
+
+class _CounterSense(BaseSenseNode):
+    """Emits a monotonically increasing counter; reading N on tick N."""
+    node_id = "_CounterSense"
+    signal_kind = "state_update"
+    poll_interval_s = 0.0
+
+    def __init__(self, bus: SignalBus) -> None:
+        super().__init__(bus=bus)
+        self.reads = 0
+
+    async def read(self) -> Signal:
+        self.reads += 1
+        return _state_update(self.node_id, "counter", self.reads)
+
+
+class _PublishEchoInstinct(BaseInstinctNode):
+    """Publishes the counter it saw, under a second key, on every tick."""
+    node_id = "_PublishEchoInstinct"
+
+    async def evaluate(self, ctx: Context) -> Proposal | None:
+        await self.bus.publish(
+            _state_update(self.node_id, "echo", ctx.state.get("counter"))
+        )
+        return None
+
+
+class TestSenseWriteIsNotStale:
+
+    async def test_sense_value_is_current_on_every_tick(self) -> None:
+        rt, captures = _runtime(sense=[_CounterSense])
+        await rt.start()
+        await rt.pause()
+        try:
+            for _ in range(4):
+                await rt.tick()
+            seen = [(c.tick, c.state.get("counter")) for c in captures]
+            assert seen == [(1, 1), (2, 2), (3, 3), (4, 4)], seen
+        finally:
+            await rt.stop()
+
+    async def test_sense_signal_is_not_echoed_into_the_next_tick(self) -> None:
+        """The published copy must not reappear in tick N+1's signals list."""
+        rt, captures = _runtime(sense=[_CounterSense])
+        await rt.start()
+        await rt.pause()
+        try:
+            for _ in range(3):
+                await rt.tick()
+            for c in captures:
+                updates = [s for s in c.signals if isinstance(s, StateUpdateSignal)]
+                assert len(updates) == 1, (c.tick, updates)
+                assert updates[0].state_value == c.tick
+        finally:
+            await rt.stop()
+
+    async def test_fresh_sense_and_bus_write_coexist(self) -> None:
+        """Filtering the sense echo must not cost the bus path its N+1 landing."""
+        rt, captures = _runtime(
+            sense=[_CounterSense], instincts=[_PublishEchoInstinct]
+        )
+        await rt.start()
+        await rt.pause()
+        try:
+            for _ in range(4):
+                await rt.tick()
+            # counter: fresh every tick. echo: the previous tick's counter,
+            # published by the instinct and drained at the start of this one.
+            seen = [(c.tick, c.state.get("counter"), c.state.get("echo"))
+                    for c in captures]
+            assert seen == [(1, 1, None), (2, 2, 1), (3, 3, 2), (4, 4, 3)], seen
         finally:
             await rt.stop()

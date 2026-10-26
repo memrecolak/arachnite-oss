@@ -232,3 +232,72 @@ class TestSenseNodeNoneReturn:
         sm.register(idle)
         signals = await sm.read_all()
         assert signals == []
+
+
+# ── returned_this_tick: identifying this tick's own sense output ──────────────
+
+class TestReturnedThisTick:
+    """
+    read_all() publishes what it returns, so bus subscribers receive the sense
+    output as well. returned_this_tick() lets a subscriber that defers signals
+    to a later tick recognise — and skip — the copy the ContextNode already
+    got this tick.
+    """
+
+    @pytest.mark.asyncio
+    async def test_returned_signal_is_recognised(self) -> None:
+        bus = SignalBus()
+        sm  = SenseMasterNode(bus=bus)
+        sm.register(GoodSenseNode(bus=bus))
+        signals = await sm.read_all()
+        assert sm.returned_this_tick(signals[0]) is True
+
+    @pytest.mark.asyncio
+    async def test_equal_but_distinct_signal_is_not_recognised(self) -> None:
+        """Identity, not value: another node's same-valued signal is foreign."""
+        bus = SignalBus()
+        sm  = SenseMasterNode(bus=bus)
+        sm.register(GoodSenseNode(bus=bus))
+        signals = await sm.read_all()
+        twin = Signal(
+            source=signals[0].source, kind=signals[0].kind,
+            value=signals[0].value, confidence=signals[0].confidence,
+            timestamp=signals[0].timestamp,
+        )
+        assert sm.returned_this_tick(twin) is False
+
+    @pytest.mark.asyncio
+    async def test_record_is_dropped_on_the_next_read(self) -> None:
+        """The record covers one tick only."""
+        bus = SignalBus()
+        sm  = SenseMasterNode(bus=bus)
+        sm.register(GoodSenseNode(bus=bus))
+        first = (await sm.read_all())[0]
+        await sm.read_all()
+        assert sm.returned_this_tick(first) is False
+
+    @pytest.mark.asyncio
+    async def test_subscriber_sees_the_record_during_publish(self) -> None:
+        """The record must be in place before the signals hit the bus."""
+        bus = SignalBus()
+        sm  = SenseMasterNode(bus=bus)
+        sm.register(GoodSenseNode(bus=bus))
+        seen: list[bool] = []
+
+        async def _on_signal(signal: Signal) -> None:
+            seen.append(sm.returned_this_tick(signal))
+
+        bus.subscribe("thermal", _on_signal)
+        await sm.read_all()
+        assert seen == [True]
+
+    @pytest.mark.asyncio
+    async def test_empty_master_recognises_nothing(self) -> None:
+        bus = SignalBus()
+        sm  = SenseMasterNode(bus=bus)
+        assert await sm.read_all() == []
+        sm.register(GoodSenseNode(bus=bus))
+        stale = (await sm.read_all())[0]
+        sm.unregister("GoodSenseNode")
+        assert await sm.read_all() == []
+        assert sm.returned_this_tick(stale) is False

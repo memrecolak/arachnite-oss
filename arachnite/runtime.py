@@ -210,6 +210,9 @@ class ArachniteRuntime:
         # ContextNode.update() — so they are drained into the signals list at
         # the start of the NEXT tick (N+1), identical to the node_fault path
         # above. See StateUpdateSignal in models.py for the timing contract.
+        # read_all() also publishes its signals for bus subscribers, so the
+        # callback below filters that echo out by identity — otherwise every
+        # sense-written state key would lag one tick.
         self._state_update_buffer: list[Signal] = []
         self._bus.subscribe("state_update", self._on_state_update_signal)
 
@@ -583,7 +586,17 @@ class ArachniteRuntime:
         StateUpdateSignal returned by a sense node. Because instincts and
         actions run after the ContextNode update phase, a write they publish is
         applied at N+1 (the following tick), not the tick it was published.
+
+        Sense nodes also reach this callback — read_all() publishes everything
+        it returns — but their signals have *already* been applied this tick
+        via the returned signals list, so buffering them too would re-apply a
+        stale copy at the start of the next tick, on top of (and after) that
+        tick's fresh sense reading. That echo is filtered out here by object
+        identity, which leaves every other route — instinct/action publishes,
+        signals arriving from a transport — buffered exactly as before.
         """
+        if self._sense_master.returned_this_tick(signal):
+            return
         self._state_update_buffer.append(signal)
 
     # ── Tick loop ─────────────────────────────────────────────────────────────

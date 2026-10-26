@@ -334,6 +334,11 @@ class StateUpdateSignal(Signal):
       **start of the next tick** (N+1), so it becomes visible to instincts one
       tick after it is published. This mirrors the node_fault buffering path.
 
+    A sense-returned write also stays current on every later tick: read_all()
+    publishes what it returns, but the runtime recognises that copy and does
+    not buffer it back into the next tick, where it would land after (and so
+    overwrite) the next tick's fresh reading.
+
     The N+1 lag for bus publishes is intrinsic, not an implementation choice:
     instincts and actions run *after* ContextNode.update() within a tick, so a
     write they emit cannot be applied before that same tick's update phase,

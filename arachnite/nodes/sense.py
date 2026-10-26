@@ -104,6 +104,12 @@ class SenseMasterNode(FaultReportingMixin, BaseNode):
         super().__init__(bus, config, log_sinks, agent_node_id)
         self._nodes: dict[str, BaseSenseNode] = {}
         self._merge_policies: dict[str, MergePolicy] = merge_policies or {}
+        # The exact Signal objects the most recent read_all() published and
+        # returned. Held as a strong reference (not just a set of ids) so the
+        # ids below cannot be recycled by a later object while the runtime is
+        # still consulting them — see returned_this_tick().
+        self._returned_signals: list[Signal] = []
+        self._returned_signal_ids: frozenset[int] = frozenset()
 
     def register(self, node: BaseSenseNode) -> None:
         """Add a SenseNode to this master. Raises NodeRegistrationError on duplicate."""
@@ -151,7 +157,17 @@ class SenseMasterNode(FaultReportingMixin, BaseNode):
         (if configured) to resolve conflicts when multiple nodes emit
         the same signal kind.  Publishes the (possibly merged) signals
         to the bus and returns the list for ContextNode.
+
+        The published objects are also recorded for one tick (see
+        returned_this_tick) so a bus subscriber — notably the runtime's
+        StateUpdateSignal buffer — can tell this tick's sense output apart
+        from a genuine bus write by another node.
         """
+        # Drop the previous tick's record first: whatever happens below, the
+        # signals of the tick that just ended are no longer "this tick's".
+        self._returned_signals = []
+        self._returned_signal_ids = frozenset()
+
         if not self._nodes:
             return []
 
@@ -179,6 +195,13 @@ class SenseMasterNode(FaultReportingMixin, BaseNode):
         if self._merge_policies and signals:
             signals = self._apply_merge(signals)
 
+        # Record what this stage is about to hand to ContextNode *before*
+        # publishing: bus callbacks run inside publish_many(), so the record
+        # has to be visible to them.
+        if signals:
+            self._returned_signals = list(signals)
+            self._returned_signal_ids = frozenset(id(s) for s in signals)
+
         # Publish all signals to the bus concurrently
         if signals:
             await self.bus.publish_many(signals)
@@ -189,6 +212,23 @@ class SenseMasterNode(FaultReportingMixin, BaseNode):
             duration_ms=round((time.monotonic() - start) * 1000, 2),
         )
         return signals
+
+    def returned_this_tick(self, signal: Signal) -> bool:
+        """
+        True if ``signal`` is one of the objects the most recent read_all()
+        returned to the ContextNode (and published on the bus).
+
+        Sense output travels two routes at once: the returned list, which
+        ContextNode.update() applies in the same tick, and the bus, for
+        subscribers. A bus subscriber that defers what it receives to a later
+        tick — the runtime's StateUpdateSignal buffer does exactly that — must
+        not defer the sense copy as well, or a stale echo of tick N would be
+        re-applied on top of tick N+1's fresh reading. Identity comparison keeps
+        this exact: a same-valued signal published by another node, or the same
+        signal arriving from a transport (a decoded copy), is a different
+        object and is handled normally.
+        """
+        return id(signal) in self._returned_signal_ids
 
     def _apply_merge(self, signals: list[Signal]) -> list[Signal]:
         """Apply configured merge policies to resolve same-kind conflicts."""

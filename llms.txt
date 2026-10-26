@@ -504,7 +504,12 @@ await bus.publish(StateUpdateSignal(
     value=None, confidence=1.0, timestamp=time.monotonic(),
     key="world_model", state_value={"temp": 42, "faces": 1},
 ))
-# Instincts see the updated state in ctx.state["world_model"] the same tick
+# Published on the bus → the runtime buffers it and instincts see it in
+# ctx.state["world_model"] at the start of the NEXT tick (N+1): instincts and
+# actions run after ContextNode.update(), so it cannot land any earlier.
+# A sense node RETURNING one from read() is applied in the same tick instead,
+# and stays current — the copy read_all() publishes for bus subscribers is
+# recognised by the runtime and not buffered back into the next tick.
 # ctx.state is a shallow copy — mutations do not affect ContextNode's internal state
 ```
 

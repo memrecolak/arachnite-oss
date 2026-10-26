@@ -168,6 +168,10 @@ class SenseMasterNode\(BaseNode\):
 
     async def read\_all\(self\) \-> list\[Signal\]: \.\.\.
 
+    def returned\_this\_tick\(self, signal: Signal\) \-> bool: \.\.\.
+
+`returned_this_tick()` reports whether a signal is one of the objects the most recent `read_all()` returned \(and published\), by identity\. A bus subscriber that defers what it receives to a later tick uses it to skip this tick’s own sense output — see **StateUpdateSignal** below\.
+
 ### __Signal Merge Policies__
 
 When multiple SenseNodes emit the same signal kind in a single tick, `SenseMasterNode` can resolve the conflict before the signals reach the bus\. Merge behaviour is configured per\-kind via the `merge_policies` parameter:
@@ -303,7 +307,7 @@ The state dict persists across ticks\. Nodes can use it to remember facts beyond
 
 **State persistence:** Pass `state_path` to persist the state dict across reboots\. The file is written as JSON\. Pass `flush_on_write=True` to flush automatically on every `set()`/`delete()` call \(appropriate for the Ariadne self\-model and world\-model\), or call `flush_state()` explicitly from teardown\(\)\.
 
-**StateUpdateSignal:** Any node can write to `ContextNode._state` without holding a direct reference to ContextNode by emitting a `StateUpdateSignal`\. Timing depends on the emitter\. A **sense node** returning one from `read()` has it applied in the **same tick** — it rides the sense output into `update()`, which intercepts it before the snapshot is built and before instincts run\. **Any other node** \(instinct / action / reflex\) publishing one onto the bus has it buffered by the runtime and applied at the **start of the next tick** \(N\+1\), mirroring the `node_fault` path: instincts and actions run after `update()`, so a write they emit cannot land in the tick it was published\.
+**StateUpdateSignal:** Any node can write to `ContextNode._state` without holding a direct reference to ContextNode by emitting a `StateUpdateSignal`\. Timing depends on the emitter\. A **sense node** returning one from `read()` has it applied in the **same tick** — it rides the sense output into `update()`, which intercepts it before the snapshot is built and before instincts run\. **Any other node** \(instinct / action / reflex\) publishing one onto the bus has it buffered by the runtime and applied at the **start of the next tick** \(N\+1\), mirroring the `node_fault` path: instincts and actions run after `update()`, so a write they emit cannot land in the tick it was published\. `read_all()` also publishes the sense output on the bus for subscribers; the runtime recognises that copy \(`SenseMasterNode.returned_this_tick()`\) and does **not** buffer it, since it has already been applied this tick — otherwise the echo would be re\-applied at the start of the next tick, after and therefore over that tick’s fresh reading, leaving every sense\-written key one tick stale\. A genuine bus write still wins over a same\-key sense write within one drain\.
 
 @dataclass
 
