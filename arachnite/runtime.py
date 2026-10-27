@@ -41,7 +41,7 @@ from arachnite.nodes.action import (
     LaunchStatus,
     MultiStepActionNode,
 )
-from arachnite.nodes.base import BaseNode
+from arachnite.nodes.base import BaseNode, settled_error
 from arachnite.nodes.decision import DecisionMasterNode
 from arachnite.nodes.instinct import (
     BaseInstinctNode,
@@ -63,6 +63,10 @@ _RUNTIME_CONTEXT: contextvars.ContextVar[object | None] = contextvars.ContextVar
 # Event-lane launch outcomes kept for monitor_state() between ticks (the lane
 # stays live while paused, when no tick drains them).
 _MAX_PENDING_OUTCOMES = 1024
+
+# Supervisor and bus-published state-update signals kept for the next tick.
+# Both arrive while paused or stopped too, when no tick drains them.
+_MAX_PENDING_SIGNALS = 1024
 
 # ── Tick-stage instrumentation protocol ──────────────────────────────────────
 #
@@ -265,7 +269,7 @@ class ArachniteRuntime:
         # therefore surfaces as two signals next tick — one kind='supervisor'
         # and one kind='node_fault' — matching the documented contract.
         self._allowed_permissions = allowed_permissions
-        self._supervisor_signal_buffer: list[Signal] = []
+        self._supervisor_signal_buffer: deque[Signal] = deque(maxlen=_MAX_PENDING_SIGNALS)
         self._bus.subscribe("supervisor", self._on_supervisor_signal)
         self._bus.subscribe("node_fault", self._on_supervisor_signal)
 
@@ -279,7 +283,8 @@ class ArachniteRuntime:
         # read_all() also publishes its signals for bus subscribers, so the
         # callback below filters that echo out by identity — otherwise every
         # sense-written state key would lag one tick.
-        self._state_update_buffer: list[Signal] = []
+        self._state_update_buffer: deque[Signal] = deque(maxlen=_MAX_PENDING_SIGNALS)
+        self._signals_dropped = 0
         self._bus.subscribe("state_update", self._on_state_update_signal)
 
         # Optional per-stage timing callback (the tick-stage instrumentation ADR). When ``None``
@@ -400,32 +405,50 @@ class ArachniteRuntime:
         """
         Call setup() on all master nodes, then start the tick loop.
 
-        A concurrent second call waits for the first. ``stop()`` or
-        ``emergency_stop()`` during the setups aborts the start: the masters
-        already set up are torn down and the loop never starts.
+        A concurrent second call waits for the first. A restart first waits
+        for the previous shutdown to finish completely (following an
+        emergency take-over), so its teardown cannot run after, and undo,
+        this start. ``stop()`` or ``emergency_stop()`` at any point before
+        the loop starts aborts the start: the masters already set up are
+        torn down and the loop never starts.
+
+        A pause carried over from the previous run ends here (nodes that got
+        ``on_pause()`` get ``on_resume()`` once set up again); a ``pause()``
+        issued during start() holds, and the runtime starts paused.
         """
         if self._running:
             return
         if self._starting is not None:
             await self._starting.wait()
             return
-        # A restart waits for the previous shutdown to finish completely, so
-        # its teardown cannot run after (and undo) this start.
-        previous = self._shutdown_task
-        if previous is not None and not previous.done():
-            await asyncio.wait({previous})
-        self._shutdown_task = None
-        self._shutdown_kind = None
-        self._loop_cancel_requested = False
-        self._abort_start = False
         self._starting = asyncio.Event()
+        self._abort_start = False
+        self._paused = False
         context = self._enter_context()
         try:
-            await self._start_body()
+            await self._settle_previous_shutdown()
+            if self._abort_start:
+                self._logger.info("Start aborted by a stop request")
+            else:
+                await self._start_body()
+        except BaseException:
+            # A run that never started: wait() must not block on it.
+            self._stop_event.set()
+            raise
         finally:
             self._leave_context(context)
             starting, self._starting = self._starting, None
             starting.set()
+
+    async def _settle_previous_shutdown(self) -> None:
+        """Wait for the previous run's shutdown, following any take-over, to finish."""
+        task = self._shutdown_task
+        while task is not None and not task.done():
+            await asyncio.wait({task})
+            task = self._shutdown_task
+        self._shutdown_task = None
+        self._shutdown_kind = None
+        self._loop_cancel_requested = False
 
     async def _start_body(self) -> None:
         # Collect all leaf nodes for startup validation
@@ -442,6 +465,14 @@ class ArachniteRuntime:
 
         # Dependency validation (startup-only)
         self._validate_dependencies(all_nodes)
+
+        # Nothing from the previous run reaches this run's first tick.
+        self._supervisor_signal_buffer.clear()
+        self._state_update_buffer.clear()
+        self._reflex_outcomes.clear()
+        self._action_master.drain_completed()
+        self._last_results = []
+        self._last_result = None
 
         masters: list[BaseNode] = [
             self._sense_master, self._instinct_master,
@@ -460,18 +491,24 @@ class ArachniteRuntime:
                     await m.teardown()
             raise
         if self._abort_start:
-            self._logger.info("Start aborted by a stop request")
-            for m in reversed(setup_ok):
-                with contextlib.suppress(Exception):
-                    await m.teardown()
+            await self._abort_setup(setup_ok)
             return
         # Mark all tracked nodes as running
         for sup in self._supervisors:
             for node_id in sup.all_states():
                 await sup.mark_running(node_id)
+        # Nodes still paused from the previous run are set up again: resume
+        # them, unless a pause() during this start wants them paused.
+        await self._apply_resume_hooks()
+        # A stop may have arrived during any of the awaits above.
+        if self._abort_start:
+            for sup in self._supervisors:
+                for node_id in sup.all_states():
+                    await sup.mark_stopped(node_id)
+            await self._abort_setup(setup_ok)
+            return
 
-        self._paused = False
-        self._pause_hooks_applied = False
+        # No await from here on: a stop request now finds the runtime running.
         self._stopping = False
         self._generation += 1
         self._running = True
@@ -479,6 +516,13 @@ class ArachniteRuntime:
         if self._reflex_mode == "event":
             self._start_reflex_lane()
         self._loop_task = asyncio.create_task(self._loop())
+
+    async def _abort_setup(self, setup_ok: list[BaseNode]) -> None:
+        """Tear down the masters an aborted start() had already set up."""
+        self._logger.info("Start aborted by a stop request")
+        for m in reversed(setup_ok):
+            with contextlib.suppress(Exception):
+                await m.teardown()
 
     def _abort_starting(self) -> bool:
         """A stop during start(): make start() abort. True if one was starting."""
@@ -555,9 +599,13 @@ class ArachniteRuntime:
         """
         if self._abort_starting():
             self._logger.info("Emergency stop during start: start aborted")
-            if not self._inside_runtime_work():
-                await self._wait_start()
-            return
+            previous = self._shutdown_task
+            if previous is None or previous.done() or self._shutdown_kind != "graceful":
+                if not self._inside_runtime_work():
+                    await self._wait_start()
+                return
+            # The start is still waiting for the previous run's graceful
+            # shutdown: take that over, as for a running runtime.
         current = self._shutdown_task
         if current is not None and (current.done() or self._shutdown_kind == "emergency"):
             await self._await_shutdown()
@@ -591,8 +639,12 @@ class ArachniteRuntime:
                 ShutdownPhase.DISCONNECT_TRANSPORT,
                 ShutdownPhase.COMPLETE,
             ):
-                # Already tearing nodes down: let it finish, never twice.
+                # Already tearing nodes down: let it finish, never twice, and
+                # carry its outcome (a teardown error) to this task's awaiters.
                 await asyncio.wait({graceful})
+                error = None if graceful.cancelled() else graceful.exception()
+                if error is not None:
+                    raise error
                 return
             graceful.cancel()
             await asyncio.wait({graceful})
@@ -625,7 +677,7 @@ class ArachniteRuntime:
             self._action_master.teardown(),
             return_exceptions=True,
         )
-        errors = [o for o in outcomes if isinstance(o, BaseException)]
+        errors = [e for e in (settled_error([o]) for o in outcomes) if e is not None]
         for err in errors:
             self._logger.error(
                 "Teardown raised",
@@ -675,7 +727,14 @@ class ArachniteRuntime:
                 raise exc
 
     async def wait(self) -> None:
-        """Block until stop() or emergency_stop() is called and has finished."""
+        """
+        Block until stop() or emergency_stop() is called and has finished.
+        Called while start() is in progress, it waits for that run (which a
+        stop during the start ends at once).
+        """
+        starting = self._starting
+        if starting is not None and not self._inside_runtime_work():
+            await starting.wait()
         await self._stop_event.wait()
         await self._await_shutdown()
 
@@ -694,6 +753,7 @@ class ArachniteRuntime:
         """
         if not self._running:
             self._sense_master.register(node)
+            self._supervisors[0].track(node)
             return
         # Set up before registering, so no tick reads or launches a node
         # whose setup() has not finished.
@@ -713,6 +773,7 @@ class ArachniteRuntime:
         """
         if not self._running:
             self._instinct_master.register(node)
+            self._supervisors[1].track(node)
             return
         # Set up before registering, so no tick reads or launches a node
         # whose setup() has not finished.
@@ -734,6 +795,7 @@ class ArachniteRuntime:
         """
         if not self._running:
             self._action_master.register(node)
+            self._supervisors[3].track(node)
             return
         # Set up before registering, so no tick reads or launches a node
         # whose setup() has not finished.
@@ -758,11 +820,11 @@ class ArachniteRuntime:
         its replacement.
         """
         node = self._sense_master.get_node(node_id)
-        if node is not None:
-            with contextlib.suppress(Exception):
-                await node.teardown()
+        # Unregister first: from here on no tick reads it.
         self._sense_master.unregister(node_id)
-        self._supervisors[0].untrack(node_id)
+        self._supervisors[0].untrack(node_id)  # drops a pending restart too
+        if node is not None:
+            await self._retire_node(node)
 
     async def unregister_instinct_live(self, node_id: str) -> None:
         """
@@ -772,12 +834,12 @@ class ArachniteRuntime:
         and untracks it from the supervisor.
         """
         node = self._instinct_master.get_node(node_id)
-        if node is not None:
-            with contextlib.suppress(Exception):
-                await node.teardown()
+        # Unregister first: from here on no tick evaluates it.
         self._instinct_master.unregister(node_id)
         self._decision_master.clear_pending(node_id)
-        self._supervisors[1].untrack(node_id)
+        self._supervisors[1].untrack(node_id)  # drops a pending restart too
+        if node is not None:
+            await self._retire_node(node)
 
     async def unregister_action_live(self, node_id: str) -> None:
         """
@@ -794,11 +856,19 @@ class ArachniteRuntime:
             # cancels its running run (each is a no-op if there is none).
             for _ in range(2):
                 await self._action_master.cancel(
-                    node_id, timeout=node.safe_stop_timeout_s + 0.5,
+                    node_id, timeout=node.safe_stop_bound_s() + 0.5,
                 )
-            with contextlib.suppress(Exception):
-                await node.teardown()
-        self._supervisors[3].untrack(node_id)
+        self._supervisors[3].untrack(node_id)  # drops a pending restart too
+        if node is not None:
+            await self._retire_node(node)
+
+    @staticmethod
+    async def _retire_node(node: BaseNode) -> None:
+        """Stop a removed node's background tasks (listeners), then tear it down."""
+        with contextlib.suppress(Exception):
+            await node.cancel_background_tasks()
+        with contextlib.suppress(Exception):
+            await node.teardown()
 
     # ── Pause / Resume ────────────────────────────────────────────────────────
 
@@ -814,6 +884,9 @@ class ArachniteRuntime:
             return
         self._paused = True
         if not self._inside_runtime_work():
+            # During start(), the nodes get on_pause() once they are set up
+            # (the runtime then starts paused).
+            await self._wait_start()
             await self._loop_tick_idle.wait()
         async with self._pause_hooks_lock:
             if not self._paused or self._pause_hooks_applied:
@@ -830,6 +903,10 @@ class ArachniteRuntime:
         if not self._paused:
             return
         self._paused = False
+        await self._apply_resume_hooks()
+
+    async def _apply_resume_hooks(self) -> None:
+        """Give the nodes on_resume() if they got on_pause() and are not paused again."""
         async with self._pause_hooks_lock:
             if self._paused or not self._pause_hooks_applied:
                 return  # on_pause() never ran, or paused again meanwhile
@@ -866,7 +943,7 @@ class ArachniteRuntime:
         so a node fault is surfaced in ctx.signals as both a SupervisorSignal
         and a typed NodeFaultSignal.
         """
-        self._supervisor_signal_buffer.append(signal)
+        self._buffer_signal(self._supervisor_signal_buffer, signal)
 
     async def _on_state_update_signal(self, signal: Signal) -> None:
         """
@@ -887,7 +964,13 @@ class ArachniteRuntime:
         """
         if self._sense_master.returned_this_tick(signal):
             return
-        self._state_update_buffer.append(signal)
+        self._buffer_signal(self._state_update_buffer, signal)
+
+    def _buffer_signal(self, buffer: deque[Signal], signal: Signal) -> None:
+        """Keep ``signal`` for the next tick (oldest dropped when the buffer is full)."""
+        if len(buffer) == buffer.maxlen:
+            self._signals_dropped += 1
+        buffer.append(signal)
 
     # ── Reflex arbitration ────────────────────────────────────────────────────
 
@@ -1251,15 +1334,21 @@ class ArachniteRuntime:
         #     drain, keeping fault visibility uniformly at N+1 regardless of
         #     which stage (sense/instinct/action) raised — rather than sense
         #     faults leaking into the same tick they occurred in.
-        buffered_signals = self._supervisor_signal_buffer
-        self._supervisor_signal_buffer = []
+        buffered_signals = list(self._supervisor_signal_buffer)
+        self._supervisor_signal_buffer.clear()
 
         # Drain bus-published StateUpdateSignals collected since the last tick.
         # Snapshot-and-cleared here (before read_all) for the same reason as the
         # supervisor buffer: a signal published during this tick is deferred to
         # the next tick's drain, keeping bus-write visibility uniformly at N+1.
-        buffered_state_updates = self._state_update_buffer
-        self._state_update_buffer = []
+        buffered_state_updates = list(self._state_update_buffer)
+        self._state_update_buffer.clear()
+        if self._signals_dropped:
+            self._logger.warning(
+                "Buffered supervisor/state-update signals dropped before a tick",
+                dropped=self._signals_dropped,
+            )
+            self._signals_dropped = 0
 
         # Results of actions that finished since the previous tick's context
         # (actions run as tasks across ticks — ADR 0005). Completion order.
@@ -1387,6 +1476,13 @@ class ArachniteRuntime:
         if rejected:
             await self._instinct_master.notify_rejected(rejected)
 
+        # stop()/emergency_stop()/pause() arrived during this tick: nothing
+        # deliberative is launched, so nothing is interrupted for it either
+        # (pause stops nothing; reflexes above already launched).
+        drop_deliberation = self._stopping or (self._paused and self._loop_ticking)
+        if drop_deliberation:
+            interrupts = []
+
         # Issue interrupts
         for interrupt_req in interrupts:
             target = interrupt_req.target_action_id or interrupt_req.new_proposal.action_id
@@ -1446,9 +1542,7 @@ class ArachniteRuntime:
             if existing is None or p.priority > existing.priority:
                 best[p.action_id] = p
         interrupting = {ir.new_proposal.instinct_id for ir in interrupts}
-        if best and (self._stopping or (self._paused and self._loop_ticking)):
-            # stop()/emergency_stop()/pause() arrived during this tick:
-            # launch nothing deliberative (reflexes above already launched).
+        if best and drop_deliberation:
             self._logger.info(
                 "Stopping or paused during the tick; deliberative launches dropped",
                 action_ids=sorted(best),

@@ -62,6 +62,10 @@ _TICKS  = 10_000
 class _ScalarSense(BaseSenseNode):
     node_id     = "BenchSense0"
     signal_kind = "bench"
+    # Read on every tick, so each measured tick is a complete pipeline cycle
+    # (the default 0.1 s throttle skips the read on almost every tick of a
+    # tight loop).
+    poll_interval_s = 0.0
 
     async def read(self) -> Signal:
         return Signal(source=self.node_id, kind=self.signal_kind,

@@ -10,15 +10,16 @@ from __future__ import annotations
 import asyncio
 import contextlib
 from abc import ABC
-from collections.abc import Awaitable, Callable, Coroutine
+from collections.abc import Awaitable, Callable, Coroutine, Sequence
 from pathlib import Path
-from typing import Any
+from typing import Any, TypeVar
 
 from arachnite.bus import SignalBus
 from arachnite.config import NodeConfig
 from arachnite.logging import BaseLogSink, StructuredLogger
 from arachnite.models import Permission
 
+_T = TypeVar("_T")
 
 async def gather_settled(*aws: Awaitable[Any]) -> None:
     """
@@ -26,11 +27,31 @@ async def gather_settled(*aws: Awaitable[Any]) -> None:
     of them raised. Unlike ``asyncio.gather`` it never returns early on a
     failure, so one node's raising teardown cannot leave its siblings'
     teardowns running unawaited.
+
+    A cancel of the caller propagates as usual (``gather`` raises it). An
+    awaitable that ends in its *own* CancelledError (e.g. ``task.cancel();
+    await task`` without suppressing it) is an error of that awaitable: it
+    is raised as a RuntimeError, never as a cancellation nobody requested.
     """
-    outcomes = await asyncio.gather(*aws, return_exceptions=True)
+    error = settled_error(await asyncio.gather(*aws, return_exceptions=True))
+    if error is not None:
+        raise error
+
+
+def settled_error(outcomes: Sequence[object]) -> BaseException | None:
+    """
+    The first exception among ``gather(..., return_exceptions=True)``
+    outcomes, with an awaitable's own CancelledError turned into a
+    RuntimeError (see ``gather_settled``); None if all succeeded.
+    """
     for outcome in outcomes:
+        if isinstance(outcome, asyncio.CancelledError):
+            error = RuntimeError("awaitable ended with its own CancelledError")
+            error.__cause__ = outcome
+            return error
         if isinstance(outcome, BaseException):
-            raise outcome
+            return outcome
+    return None
 
 #: Signature of the runtime-supplied fault sink: ``(node_id, error) -> None``.
 #: Wired to a :class:`~arachnite.supervisor.NodeSupervisor`'s ``on_fault``.
@@ -85,6 +106,40 @@ class FaultReportingMixin:
                     error=str(exc),
                     error_type=type(exc).__name__,
                 )
+
+    async def _gather_nodes(
+        self, what: str, calls: Sequence[tuple[str, Awaitable[_T]]],
+    ) -> list[_T | None]:
+        """
+        Await one call per leaf node concurrently. A call that raises — or
+        ends in the node's own CancelledError — is logged and reported as
+        that node's fault and yields None; its siblings are unaffected. A
+        cancel of the caller still propagates (``gather`` raises it).
+        """
+        outcomes = await asyncio.gather(*(aw for _, aw in calls), return_exceptions=True)
+        results: list[_T | None] = []
+        for (node_id, _), outcome in zip(calls, outcomes, strict=True):
+            if not isinstance(outcome, BaseException):
+                results.append(outcome)
+                continue
+            error: BaseException
+            if isinstance(outcome, asyncio.CancelledError):
+                error = RuntimeError(f"{what} of '{node_id}' ended with its own CancelledError")
+                error.__cause__ = outcome
+            elif isinstance(outcome, Exception):
+                error = outcome
+            else:
+                raise outcome  # KeyboardInterrupt, SystemExit
+            self.logger.error(
+                "Node call raised",
+                node_id=node_id,
+                call=what,
+                error=str(error),
+                error_type=type(error).__name__,
+            )
+            await self._report_fault(node_id, error)
+            results.append(None)
+        return results
 
 
 class BaseNode(ABC):

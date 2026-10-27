@@ -213,21 +213,29 @@ class InstinctMasterNode(FaultReportingMixin, BaseNode):
         await gather_settled(*(n.cancel_background_tasks() for n in all_nodes))
         await gather_settled(*(n.teardown() for n in all_nodes))
 
+    # Hook fan-outs isolate each node: one raising hook is that node's fault
+    # (reported to its supervisor), never the whole tick's.
+
     async def on_pause(self) -> None:
         all_nodes = [*self._normal_nodes.values(), *self._reflex_nodes.values()]
-        await asyncio.gather(*(n.on_pause() for n in all_nodes))
+        await self._gather_nodes("on_pause()", [(n.node_id, n.on_pause()) for n in all_nodes])
 
     async def on_resume(self) -> None:
         all_nodes = [*self._normal_nodes.values(), *self._reflex_nodes.values()]
-        await asyncio.gather(*(n.on_resume() for n in all_nodes))
+        await self._gather_nodes("on_resume()", [(n.node_id, n.on_resume()) for n in all_nodes])
 
     async def notify_tick_start(self, tick: int) -> None:
         all_nodes = [*self._normal_nodes.values(), *self._reflex_nodes.values()]
-        await asyncio.gather(*(n.on_tick_start(tick) for n in all_nodes))
+        await self._gather_nodes(
+            "on_tick_start()", [(n.node_id, n.on_tick_start(tick)) for n in all_nodes],
+        )
 
     async def notify_tick_end(self, tick: int, duration_s: float) -> None:
         all_nodes = [*self._normal_nodes.values(), *self._reflex_nodes.values()]
-        await asyncio.gather(*(n.on_tick_end(tick, duration_s) for n in all_nodes))
+        await self._gather_nodes(
+            "on_tick_end()",
+            [(n.node_id, n.on_tick_end(tick, duration_s)) for n in all_nodes],
+        )
 
     async def notify_rejected(self, rejected: list[Proposal]) -> None:
         """Notify instinct nodes that their proposals were not selected."""
@@ -267,7 +275,11 @@ class InstinctMasterNode(FaultReportingMixin, BaseNode):
                 await self._report_fault(node.node_id, exc)
                 return None
 
-        results = await asyncio.gather(*(_eval(n) for n in enabled))
+        # An evaluate() that ends in its own CancelledError is that reflex's
+        # fault: its siblings' proposals still count.
+        results = await self._gather_nodes(
+            "evaluate()", [(n.node_id, _eval(n)) for n in enabled],
+        )
         proposals = [p for p in results if p is not None]
         proposals.sort(key=lambda p: p.priority, reverse=True)
 
@@ -419,7 +431,9 @@ class InstinctMasterNode(FaultReportingMixin, BaseNode):
                 node._last_trigger_s = time.monotonic()
             return result
 
-        results = await asyncio.gather(*(_eval(n) for n in enabled))
+        results = await self._gather_nodes(
+            "evaluate()", [(n.node_id, _eval(n)) for n in enabled],
+        )
         self._last_evaluated_ids = evaluated_ids
         proposals = [p for p in results if p is not None]
         proposals.sort(key=lambda p: p.priority, reverse=True)

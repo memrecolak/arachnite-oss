@@ -31,7 +31,7 @@ before concluding something is undocumented:
 
 One pipeline cycle ("tick") in order:
 
-0. **on_tick_start(tick)** — called on all leaf nodes (sense, instinct, action) via masters; default implementation syncs `self.logger._set_tick(tick)` so every LogEvent.tick reflects the current tick (subclasses overriding must call `super().on_tick_start(tick)`). Runtime additionally syncs its own logger and the four master loggers directly each tick.
+0. **on_tick_start(tick)** — called on all leaf nodes (sense, instinct, action) via masters; default implementation syncs `self.logger._set_tick(tick)` so every LogEvent.tick reflects the current tick (subclasses overriding must call `super().on_tick_start(tick)`). Runtime additionally syncs its own logger and the four master loggers directly each tick. Masters isolate every node call (hooks, `read()`, `evaluate()`): one that raises, or ends in its own `CancelledError`, is reported as that node's fault to its supervisor and never aborts the tick.
 1. **ActionMasterNode.drain_completed()** — collects the Results of action tasks that finished since the previous tick (completion order), for this tick's context.
 2. **SenseMasterNode.read_all()** — SenseNodes read hardware → list[Signal] (poll_interval_s enforced per node; throttle timestamps are per-sensor, not batch-start). Signals pushed with `BaseSenseNode.push()` since the last tick are appended once (they were already published on the bus when pushed).
 3. **Supervisor signal injection** — buffered supervisor signals appended to signals: lifecycle transitions as `SupervisorSignal` (kind `supervisor`: RUNNING/STOPPED/RESTARTING) plus, for FAULTED/DEAD, a typed `NodeFaultSignal` (kind `node_fault`, carrying error_type/error_message). When a leaf node raises during a tick, its master reports the fault to the supervisor; the resulting signals are buffered and surface in `ctx.signals` on the **next** tick (N+1), as both a `supervisor` and a `node_fault` signal. Bus-published StateUpdateSignals buffered since the last tick are appended after them.
@@ -429,12 +429,14 @@ asyncio.run(main())
 Nodes can be added and removed while the runtime is running — no restart needed.
 
 ```python
-# Register a new node at runtime (calls setup(), starts supervisor tracking)
+# Register a new node at runtime (calls setup(), starts supervisor tracking;
+# before start() it is registered and supervised like a built-in node)
 await rt.register_sense_live(new_sensor)
 await rt.register_instinct_live(new_instinct)
 await rt.register_action_live(new_action)
 
-# Unregister (calls teardown(), removes from master, untracks from supervisor)
+# Unregister (removes from master, untracks from supervisor — cancelling a restart
+# of it still pending — cancels its background tasks, then calls teardown())
 # Uses master.get_node(node_id) to look up the node for teardown.
 # unregister_instinct_live also calls DecisionMasterNode.clear_pending(node_id)
 # to remove any pending proposal and age tracking for the removed instinct.
@@ -760,10 +762,13 @@ node's `preemption` decides what happens:
 - **`ReflexPreemption.PREEMPT` (default)**: the owner's task is cancelled at its current
   `await`, **even inside a mandatory block**. Its `on_preempted(proposal, preempted_by)`
   safe-stop hook then runs, shielded and bounded by `safe_stop_timeout_s` (default 1.0 s;
-  an overrun is logged and abandoned). Only then are its resources released and the
+  an overrunning hook is cancelled, and abandoned — left running, logged — if it has not
+  ended 0.1 s later). Only then are its resources released and the
   reflex action started. The owner's Result has `preempted=True, interrupted=True` and is
   never retried. No rollback runs unless the owner sets `rollback_on_preempt = True`,
-  because undoing a physical operation during a hazard can itself be unsafe.
+  because undoing a physical operation during a hazard can itself be unsafe. A run walks
+  at most once: a preemption during or after an interrupt/abort rollback walk does not
+  start it again. Each rollback callable is timed out at its step's `timeout_s`.
 - **`ReflexPreemption.WAIT_FOR_BLOCK`**: if the owner is inside a mandatory block, the
   reflex is **armed** and the owner is preempted at the first step boundary after the
   block, whatever its `InterruptPolicy`. Outside a block it behaves like PREEMPT. The
@@ -885,7 +890,13 @@ class ToFSense(BaseSenseNode):
   it over. Called from inside the tick or a running action, `stop()` /
   `emergency_stop()` return once the shutdown has started; so do calls from the
   shutdown's own code (a node's `teardown()`, `on_shutdown_action`) and from an
-  `on_preempted()` safe-stop. A stop during `start()` aborts the start.
+  `on_preempted()` safe-stop. A stop at any point of `start()` before the loop runs
+  aborts the start; a restart waits for the previous shutdown (following an emergency
+  take-over); `wait()` during `start()` waits for that run. A `pause()` during `start()`
+  holds (the runtime starts paused); a restart after a paused stop resumes the nodes.
+  A teardown that raises (or ends in its own `CancelledError`, reported as
+  `RuntimeError`) does not stop the shutdown from completing; the error is re-raised
+  to `stop()` / `wait()` afterwards.
   Then the nodes tear down. This is a *shutdown* path, not a hazard response: to cut
   into a mandatory block and keep the agent running, use a PREEMPT reflex.
 

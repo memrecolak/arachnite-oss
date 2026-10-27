@@ -84,7 +84,7 @@ class TestRun:
     async def test_run_paced_honours_tick_rate(self) -> None:
         """Pacing stretches wall-clock to ~ticks/rate; buckets unchanged."""
         import time as _time
-        stats: dict[str, int] = {}
+        stats: dict[str, float] = {}
         t0 = _time.perf_counter()
         buckets = await run(
             ticks=40, bucket_size=20, warmup=2,
@@ -95,13 +95,15 @@ class TestRun:
         assert elapsed >= 0.15
         assert len(buckets) == 2
         assert buckets[-1].tick_end == 39
-        assert "overrun_ticks" in stats
+        assert {"overrun_ticks", "deadline_misses", "max_start_lateness_ms"} <= set(stats)
+        assert 0 <= stats["deadline_misses"] <= 40
+        assert stats["sensor_reads"] == 40  # the soak sensor is read on every tick
 
     @pytest.mark.asyncio
-    async def test_run_unpaced_leaves_pacing_stats_empty(self) -> None:
-        stats: dict[str, int] = {}
+    async def test_run_unpaced_reports_only_sensor_reads(self) -> None:
+        stats: dict[str, float] = {}
         await run(ticks=20, bucket_size=10, warmup=0, pacing_stats=stats)
-        assert stats == {}
+        assert stats == {"sensor_reads": 20}
 
     @pytest.mark.asyncio
     async def test_run_rejects_negative_tick_rate(self) -> None:

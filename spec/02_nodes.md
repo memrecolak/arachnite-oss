@@ -190,6 +190,8 @@ class SenseMasterNode\(BaseNode\):
 
 `read_all()` never lets a raising bus subscriber \(a dashboard, a logging hook, a transport\) abort the tick: every publish completes, the `SignalBusError` is logged at ERROR, and the reflex and deliberation stages run as usual\. `returned_this_tick()` reports whether a signal is one of the objects the most recent `read_all()` returned \(and published\), by identity\. A bus subscriber that defers what it receives to a later tick uses it to skip this tick’s own sense output — see **StateUpdateSignal** below\.
 
+__Node calls are isolated\.__ Every master \(sense, instinct, action\) calls its nodes concurrently and isolates each call — ``read\(\)``, reflex and normal ``evaluate\(\)``, and the hooks ``on\_pause\(\)``, ``on\_resume\(\)``, ``on\_tick\_start\(\)``, ``on\_tick\_end\(\)``: a call that raises, or ends in the node's own ``CancelledError``, is logged and reported as that node's fault to its supervisor \(the ``CancelledError`` as a ``RuntimeError``\), and its siblings and the rest of the tick are unaffected\. A cancel of the tick itself still propagates\.
+
 ### __Signal Merge Policies__
 
 When multiple SenseNodes emit the same signal kind in a single tick, `SenseMasterNode` can resolve the conflict before the signals reach the bus\. Merge behaviour is configured per\-kind via the `merge_policies` parameter:
@@ -833,9 +835,11 @@ class BaseActionNode\(BaseNode, ABC\):
 
     safe\_stop\_timeout\_s: float = 1\.0
 
-                               \# bound on on\_preempted\(\); an overrun is
+                               \# bound on on\_preempted\(\); an overrunning
 
-                               \# logged and abandoned
+                               \# hook is cancelled, and abandoned \(logged\)
+
+                               \# if not ended 0\.1 s later
 
     @abstractmethod
 

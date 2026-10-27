@@ -123,7 +123,7 @@ from arachnite.testing import MockBus, make_context, make_proposal, make_result,
 from arachnite.toolcodec import ParsedToolCall, parse_tool_calls, render_tool_schemas
 from arachnite.web import FileLogSink, SignalDashboard
 
-__version__ = "0.12.3"
+__version__ = "0.13.0.dev0"
 __all__ = [
     # Core
     "ArachniteRuntime",

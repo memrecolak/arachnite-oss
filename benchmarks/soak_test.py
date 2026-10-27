@@ -148,8 +148,14 @@ def _rss_mb() -> float:
 class _ConstantSense(BaseSenseNode):
     node_id = "SoakSense"
     signal_kind = "soak"
+    # Read on every tick: with the default 0.1 s throttle a 10 Hz paced soak
+    # would read only on the ticks timer jitter lets through, mixing read
+    # and no-read ticks in a host- and version-dependent share.
+    poll_interval_s = 0.0
+    reads = 0
 
     async def read(self) -> Signal:
+        _ConstantSense.reads += 1
         return Signal(
             source=self.node_id, kind=self.signal_kind,
             value=1.0, confidence=1.0, timestamp=time.monotonic(),
@@ -296,7 +302,7 @@ async def run(
     warmup: int = _WARMUP_DEFAULT,
     on_bucket: Callable[[BucketStats], None] | None = None,
     tick_rate_hz: float = 0.0,
-    pacing_stats: dict[str, int] | None = None,
+    pacing_stats: dict[str, float] | None = None,
 ) -> list[BucketStats]:
     """Execute the soak and return per-bucket statistics.
 
@@ -310,10 +316,16 @@ async def run(
     keeps the legacy tight-loop drive. Pacing changes the *absolute*
     per-tick latencies (an idle process cools caches), so paced and
     unpaced soaks are distinct workloads — comparable in their drift
-    verdicts, not in their latency magnitudes. If a tick overruns its
-    period by more than one full period, the schedule skips ahead rather
-    than bursting to catch up; ``pacing_stats``, when given, receives the
-    ``overrun_ticks`` count.
+    verdicts, not in their latency magnitudes. If the schedule falls more
+    than one full period behind, it skips ahead rather than bursting to
+    catch up. ``pacing_stats``, when given, receives ``overrun_ticks`` (those
+    skip-aheads: schedule slips of more than one period),
+    ``deadline_misses`` (measured ticks that ended after the end of their
+    scheduled slot, i.e. later than scheduled start + period) and
+    ``max_start_lateness_ms`` (largest delay of a measured tick's start
+    past its scheduled start). Paced or not, it also receives
+    ``sensor_reads``: how many measured ticks read the sensor (every one
+    should, since the sensor is not throttled).
 
     The tick loop is driven manually (``setup()`` + ``tick()`` +
     ``teardown()``) per the discipline established by the audit-2026-04-16
@@ -354,11 +366,14 @@ async def run(
 
     # Optional pacing — absolute-deadline scheduling, skip-ahead on overrun.
     overruns = 0
+    deadline_misses = 0
+    max_lateness_s = 0.0
     period = 1.0 / tick_rate_hz if tick_rate_hz > 0 else 0.0
     loop = asyncio.get_running_loop()
     deadline = loop.time()
 
-    async def _pace() -> None:
+    async def _pace() -> float:
+        """Wait for the next slot; return its scheduled start (loop time)."""
         nonlocal deadline, overruns
         now = loop.time()
         wait = deadline - now
@@ -369,7 +384,9 @@ async def run(
             # loop never bursts to catch up (matches deployment tick loops).
             overruns += 1
             deadline = loop.time()
+        scheduled = deadline
         deadline += period
+        return scheduled
 
     # Warm-up — discarded wholesale.
     for _ in range(warmup):
@@ -383,12 +400,16 @@ async def run(
     bucket_index = 1
     tick_start = 0
 
+    reads_before = _ConstantSense.reads
     for _i in range(ticks):
+        scheduled = await _pace() if period > 0.0 else 0.0
         if period > 0.0:
-            await _pace()
+            max_lateness_s = max(max_lateness_s, loop.time() - scheduled)
         t0 = time.perf_counter()
         await rt.tick()
         bucket_samples.append((time.perf_counter() - t0) * 1_000.0)
+        if period > 0.0 and loop.time() > scheduled + period:
+            deadline_misses += 1
 
         if len(bucket_samples) >= bucket_size:
             tick_end = tick_start + len(bucket_samples) - 1
@@ -427,8 +448,12 @@ async def run(
     for m in (am, dm, im, sm):
         await m.teardown()
 
-    if pacing_stats is not None and period > 0.0:
-        pacing_stats["overrun_ticks"] = overruns
+    if pacing_stats is not None:
+        pacing_stats["sensor_reads"] = _ConstantSense.reads - reads_before
+        if period > 0.0:
+            pacing_stats["overrun_ticks"] = overruns
+            pacing_stats["deadline_misses"] = deadline_misses
+            pacing_stats["max_start_lateness_ms"] = round(max_lateness_s * 1_000.0, 3)
 
     return buckets
 
@@ -578,7 +603,7 @@ def main() -> None:
         print("-" * 72)
 
         t0 = time.perf_counter()
-        pacing_stats: dict[str, int] = {}
+        pacing_stats: dict[str, float] = {}
         buckets = asyncio.run(
             run(
                 ticks=ticks,
@@ -606,6 +631,9 @@ def main() -> None:
         "warmup": warmup,
         "tick_rate_hz": args.tick_rate_hz,
         "overrun_ticks": pacing_stats.get("overrun_ticks"),
+        "deadline_misses": pacing_stats.get("deadline_misses"),
+        "max_start_lateness_ms": pacing_stats.get("max_start_lateness_ms"),
+        "sensor_reads": pacing_stats.get("sensor_reads"),
         "elapsed_s": round(elapsed, 2),
         "buckets": [asdict(b) for b in buckets],
         "drift": asdict(drift),

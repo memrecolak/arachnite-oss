@@ -15,6 +15,7 @@ import sys
 import time
 import weakref
 from abc import abstractmethod
+from collections import deque
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from enum import Enum
@@ -49,6 +50,10 @@ from arachnite.nodes.base import BaseNode, FaultReportingMixin, gather_settled
 # ActionGuards to preserve the framework's "reflexes always fire" guarantee
 # (see Proposal.priority: "200+ reflex, 100-199 safety").
 REFLEX_PRIORITY_FLOOR = 200
+
+# Results of launched actions kept until a tick drains them. The event lane
+# stays live while the runtime is paused, when no tick drains them.
+MAX_PENDING_RESULTS = 1024
 
 _T = TypeVar("_T")
 
@@ -102,14 +107,18 @@ if sys.version_info >= (3, 11):
         ``timeout`` seconds. Unlike ``asyncio.wait_for`` on Python 3.10 no
         inner task is created, so a cancel can neither be swallowed nor leave
         an orphaned task running. ``stop_requested`` is used on 3.10 only.
+
+        The deadline cancels ``work`` once; clean-up it runs in response is
+        not cut short. Work that swallows that cancel and returns after the
+        deadline anyway is still a timeout (as on Python 3.10).
         """
-        async with asyncio.timeout(timeout):
-            return await work
+        async with asyncio.timeout(timeout) as scope:
+            result = await work
+        if scope.expired():
+            raise TimeoutError
+        return result
 
 else:  # pragma: no cover - exercised by the Python 3.10 CI leg
-    # Re-cancel period after a timeout fired but its cancel was swallowed.
-    _REFIRE_S = 0.005
-
     # Per-task stack of active timeout scopes; each entry is [fired].
     _SCOPES: weakref.WeakKeyDictionary[asyncio.Task[Any], list[list[bool]]] = (
         weakref.WeakKeyDictionary()
@@ -123,13 +132,18 @@ else:  # pragma: no cover - exercised by the Python 3.10 CI leg
     ) -> _T:
         """
         Python 3.10 stand-in for ``asyncio.timeout``: the timer cancels the
-        current task, and the resulting CancelledError becomes
+        current task once, and the resulting CancelledError becomes
         ``asyncio.TimeoutError`` only if this scope fired, no enclosing scope
         fired and nobody asked the action to stop (``stop_requested``).
+        Clean-up ``work`` runs in response to the cancel is not cut short,
+        and work that returns after the deadline is still a timeout.
 
-        Python 3.10 does not count cancel requests, so a cancel from outside
-        the master (e.g. event-loop shutdown) that lands in the same turn as
-        this scope's timer is reported as the timeout; on 3.11+ it propagates.
+        Two Python 3.10 limits (3.11+ has neither): 3.10 does not count
+        cancel requests, so a cancel from outside the master (e.g. event-loop
+        shutdown) that lands in the same turn as this scope's timer is
+        reported as the timeout; and a 3.10 ``asyncio.wait_for`` inside
+        ``work`` can swallow the timer's cancel, so the work then ends when
+        it next returns (still reported as a timeout).
         """
         task = asyncio.current_task()
         if timeout is None or task is None:
@@ -139,23 +153,18 @@ else:  # pragma: no cover - exercised by the Python 3.10 CI leg
         fired = [False]
         finished = [False]
         stack.append(fired)
-        loop = asyncio.get_running_loop()
 
         def _fire() -> None:
             if not finished[0]:
                 fired[0] = True
                 task.cancel()
-                # A 3.10 ``asyncio.wait_for`` inside ``work`` can swallow the
-                # cancel; keep cancelling until the scope is left.
-                handles[0] = loop.call_later(_REFIRE_S, _fire)
 
-        handles = [loop.call_later(timeout, _fire)]
+        handle = asyncio.get_running_loop().call_later(timeout, _fire)
         try:
             result = await work
             if fired[0]:
-                # The timer's cancel was swallowed inside ``work`` (e.g. by
-                # a 3.10 ``asyncio.wait_for`` finishing in the same turn):
-                # the deadline still passed, so it is still a timeout.
+                # The timer's cancel was swallowed inside ``work``: the
+                # deadline still passed, so it is still a timeout.
                 raise asyncio.TimeoutError
             return result
         except asyncio.CancelledError:
@@ -166,8 +175,30 @@ else:  # pragma: no cover - exercised by the Python 3.10 CI leg
             raise
         finally:
             finished[0] = True
-            handles[0].cancel()
+            handle.cancel()
             stack.pop()
+
+
+#: Time an overrunning ``on_preempted()`` gets, after the cancel at
+#: ``safe_stop_timeout_s``, before it is abandoned (left running, logged).
+SAFE_STOP_ABANDON_GRACE_S = 0.1
+
+# Safe-stop hooks abandoned while still running: held so they are not
+# garbage-collected mid-flight; each removes itself when it ends.
+_ABANDONED_HOOKS: set[asyncio.Future[Any]] = set()
+
+
+def _master_cancel_overflow(received: int, master: int) -> bool:
+    """
+    True if the current task got more cancels than the master sent it, i.e.
+    one came from outside the master (e.g. event-loop shutdown). Python 3.11+
+    counts cancel requests per task; 3.10 cannot, so there ``received`` (the
+    deliveries seen) is compared instead, and cancels that coalesced into
+    one delivery go unnoticed.
+    """
+    if sys.version_info >= (3, 11):
+        return _cancelling() > master
+    return received > master
 
 
 def _cancelling() -> int:
@@ -239,8 +270,10 @@ class BaseActionNode(BaseNode):
     #: Actuators this action commands (e.g. ``frozenset({"arm", "gripper"})``).
     resources: frozenset[str] = frozenset()
 
-    #: Upper bound on ``on_preempted()``. A safe-stop that overruns is
-    #: abandoned (logged) so a hung hook cannot hold a reflex back forever.
+    #: Upper bound on ``on_preempted()``. A hook that overruns it is
+    #: cancelled, and abandoned (left running, logged) if it has not ended
+    #: ``SAFE_STOP_ABANDON_GRACE_S`` later, so no hook — not even one that
+    #: swallows its cancel — can hold a reflex back for longer.
     safe_stop_timeout_s: float = 1.0
 
     #: Set by ActionMasterNode when it cancels this action (preemption,
@@ -252,6 +285,14 @@ class BaseActionNode(BaseNode):
     #: Set by ``ActionMasterNode.cancel_all()`` (shutdown / emergency stop):
     #: a safe-stop that has not started yet runs without the rollback walk.
     _shutdown_requested: bool = False
+
+    #: Cancels ActionMasterNode sent to the current run's task; more than
+    #: this many arriving means one came from outside the master.
+    _master_cancels: int = 0
+
+    def safe_stop_bound_s(self) -> float:
+        """Worst-case duration of this action's safe-stop (hook, then any walk)."""
+        return self.safe_stop_timeout_s + SAFE_STOP_ABANDON_GRACE_S
 
     async def on_preempted(self, proposal: Proposal, preempted_by: Proposal) -> None:
         """
@@ -272,29 +313,60 @@ class BaseActionNode(BaseNode):
         Run ``on_preempted()`` bounded by ``safe_stop_timeout_s``. A hook
         that raises or overruns is logged and reported, never propagated —
         the preempting reflex must not be held back by a broken safe-stop.
+        An overrunning hook is cancelled; if it has not ended
+        ``SAFE_STOP_ABANDON_GRACE_S`` later it is abandoned (left running).
         Returns ``(rolled_back, error)``.
         """
-        error: BaseException | None = None
+        hook = asyncio.ensure_future(self.on_preempted(proposal, preempted_by))
+        timed_out = False
         try:
-            await _within(
-                self.on_preempted(proposal, preempted_by), self.safe_stop_timeout_s,
+            done, _ = await asyncio.wait({hook}, timeout=self.safe_stop_timeout_s)
+            if not done:
+                timed_out = True
+                hook.cancel()
+                done, _ = await asyncio.wait({hook}, timeout=SAFE_STOP_ABANDON_GRACE_S)
+        except asyncio.CancelledError:
+            hook.cancel()
+            raise
+        if not done:
+            self.logger.error(
+                "Safe-stop hook ignored its cancellation; abandoned",
+                timeout_s=self.safe_stop_timeout_s,
             )
-        except asyncio.TimeoutError:
+            _ABANDONED_HOOKS.add(hook)
+            hook.add_done_callback(self._abandoned_hook_done)
+            return False, ActionTimeoutError(
+                self.node_id, "on_preempted", self.safe_stop_timeout_s,
+            )
+        if timed_out:
             self.logger.error(
                 "Safe-stop hook timed out",
                 timeout_s=self.safe_stop_timeout_s,
             )
-            error = ActionTimeoutError(
+            return False, ActionTimeoutError(
                 self.node_id, "on_preempted", self.safe_stop_timeout_s,
             )
-        except Exception as exc:  # noqa: BLE001
+        if hook.cancelled():
+            self.logger.error("Safe-stop hook ended with CancelledError")
+            return False, RuntimeError(
+                f"safe-stop of '{self.node_id}' ended with CancelledError",
+            )
+        exc = hook.exception()
+        if exc is not None:
             self.logger.error(
                 "Safe-stop hook raised",
                 error=str(exc),
                 error_type=type(exc).__name__,
             )
-            error = exc
-        return False, error
+        return False, exc
+
+    def _abandoned_hook_done(self, hook: asyncio.Future[Any]) -> None:
+        _ABANDONED_HOOKS.discard(hook)
+        exc = None if hook.cancelled() else hook.exception()
+        self.logger.warning(
+            "Abandoned safe-stop hook ended",
+            error=str(exc) if exc is not None else None,
+        )
 
     @abstractmethod
     async def execute(self, proposal: Proposal) -> Result:
@@ -354,10 +426,12 @@ class MultiStepActionNode(BaseActionNode):
         # reservation, so an interrupt requested before execute() starts
         # is kept rather than wiped by execute()'s own reset.
         self._run_prepared: bool = False
-        # True while an interrupt/abort rollback walk runs: a preemption
-        # arriving then must not start the walk again (rollback_on_preempt),
-        # or completed steps would be undone twice.
-        self._unwinding: bool = False
+        # This run's rollback walk (interrupt, abort or rollback_on_preempt):
+        # None before one starts, then "running", "done" or "failed". A run
+        # walks at most once — a preemption arriving during or after a walk
+        # does not start another, or completed steps would be undone twice.
+        self._walk: str | None = None
+        self._walk_error: BaseException | None = None
         # True while ActionMasterNode runs this action. A WAIT_FOR_BLOCK
         # hand-off then only records the reflex in _handoff_by; the master
         # runs the safe-stop outside the action's timeout and retries.
@@ -371,7 +445,8 @@ class MultiStepActionNode(BaseActionNode):
         self._reflex_preempt_by   = None
         self._completed_steps     = []
         self._current_step        = None
-        self._unwinding           = False
+        self._walk                = None
+        self._walk_error          = None
         self._handoff_by          = None
         self._managed             = True
         self._run_prepared        = True
@@ -390,7 +465,8 @@ class MultiStepActionNode(BaseActionNode):
         """Drop per-run state after a cancelled run so nothing looks in-flight."""
         self._current_step      = None
         self._reflex_preempt_by = None
-        self._unwinding         = False
+        self._walk              = None
+        self._walk_error        = None
         self._handoff_by        = None
         self._managed           = False
         self._run_prepared      = False
@@ -454,7 +530,9 @@ class MultiStepActionNode(BaseActionNode):
         Run the rollback callable of every completed non-interruptible step,
         most recent first. Every rollback is attempted even if an earlier one
         raises; the failures are then raised together as one ``RollbackError``
-        so no partial walk goes unreported.
+        so no partial walk goes unreported. Each rollback is bounded by its
+        step's ``timeout_s`` (the action's if unset); one that overruns is a
+        failure, so a walk — and a safe-stop that includes it — is bounded.
         """
         all_steps = self.steps()
         non_interruptible = {s.name for s in all_steps if not s.interruptible}
@@ -466,8 +544,17 @@ class MultiStepActionNode(BaseActionNode):
             step = steps_by_name[step_result.step_name]
             if step.rollback is None:
                 continue
+            bound = step.timeout_s or self.timeout_s
             try:
-                await step.rollback()
+                await _within(
+                    step.rollback(), bound,
+                    stop_requested=lambda: self._cancel_requested,
+                )
+            except asyncio.TimeoutError:
+                self.logger.error("Rollback timed out", step=step.name, timeout_s=bound)
+                failures.append((
+                    step.name, ActionTimeoutError(self.node_id, step.name, bound),
+                ))
             except Exception as exc:  # noqa: BLE001
                 self.logger.error(
                     "Rollback raised",
@@ -566,6 +653,8 @@ class MultiStepActionNode(BaseActionNode):
             self._interrupt_request   = None
             self._reflex_preempt_by   = None
             self._completed_steps     = []
+            self._walk                = None
+            self._walk_error          = None
             self._managed             = False
             self._handoff_by          = None
             self._cancel_requested    = False
@@ -730,15 +819,15 @@ class MultiStepActionNode(BaseActionNode):
         error: BaseException | None = None
 
         if self.interrupt_policy == InterruptPolicy.ROLLBACK:
-            # Not reset in a finally: if a preemption cancels the walk, the
-            # flag must still be set when the safe-stop runs.
-            self._unwinding = True
+            # Left "running" if a preemption cancels the walk: the safe-stop
+            # then does not start it again, and the run is never retried.
+            self._walk = "running"
             try:
                 await self.on_interrupted(self._completed_steps.copy(), pending, proposal)
                 rolled_back = True
             except RollbackError as exc:
                 error = exc
-            self._unwinding = False
+            self._end_walk(error)
 
         self._current_step = None
         return Result(
@@ -762,17 +851,40 @@ class MultiStepActionNode(BaseActionNode):
         """
         Safe-stop hook, then the rollback walk if ``rollback_on_preempt``.
         ``allow_rollback=False`` (shutdown / emergency_stop) skips the walk,
-        and so does a preemption that cut into a rollback walk already in
-        progress — restarting it would undo completed steps twice.
+        and so does a run that has already walked (or started to): walking
+        again would undo completed steps twice.
         """
         rolled_back, error = await super()._run_safe_stop(proposal, preempted_by)
-        if self.rollback_on_preempt and allow_rollback and not self._unwinding:
+        if self.rollback_on_preempt and allow_rollback and self._walk is None:
+            self._walk = "running"
+            walk_error: RollbackError | None = None
             try:
                 await self._rollback_completed(self._completed_steps.copy())
                 rolled_back = True
             except RollbackError as exc:
+                walk_error = exc
                 error = error or exc
+            self._end_walk(walk_error)
         return rolled_back, error
+
+    def _end_walk(self, error: BaseException | None) -> None:
+        self._walk = "failed" if error is not None else "done"
+        self._walk_error = error
+
+    def walk_cut_short(self) -> bool:
+        """True if this run's rollback walk started but never reached its end."""
+        return self._walk == "running"
+
+    def safe_stop_bound_s(self) -> float:
+        """Worst-case safe-stop: the hook, then the walk if ``rollback_on_preempt``."""
+        bound = super().safe_stop_bound_s()
+        if self.rollback_on_preempt:
+            bound += sum(
+                s.timeout_s or self.timeout_s
+                for s in self.steps()
+                if not s.interruptible and s.rollback is not None
+            )
+        return bound
 
     async def _handle_reflex_preempt(
         self,
@@ -826,14 +938,18 @@ class MultiStepActionNode(BaseActionNode):
         if failed.error is not None:
             error.__cause__ = failed.error
         rolled_back = False
-        self._unwinding = True  # see _handle_interrupt: not reset on cancel
+        self._walk = "running"  # see _handle_interrupt
+        walk_error: RollbackError | None = None
         try:
             rolled_back = await self.on_aborted(
                 self._completed_steps[:-1], step, proposal,
             )
         except RollbackError as exc:
-            error = exc
-        self._unwinding = False
+            error = walk_error = exc
+        if rolled_back or walk_error is not None:
+            self._end_walk(walk_error)
+        else:
+            self._walk = None  # on_aborted() undid nothing
 
         self._current_step = None
         return Result(
@@ -941,7 +1057,8 @@ class ActionMasterNode(FaultReportingMixin, BaseNode):
         self._preempted_by: dict[str, Proposal] = {}
         self._tasks: dict[str, asyncio.Task[Result]] = {}
         self._buffered: set[asyncio.Task[Result]] = set()
-        self._completed: list[Result] = []
+        self._completed: deque[Result] = deque(maxlen=MAX_PENDING_RESULTS)
+        self._results_dropped = 0
         self._idle = asyncio.Event()
         self._idle.set()
         self._guards: list[ActionGuard] = []
@@ -1149,17 +1266,30 @@ class ActionMasterNode(FaultReportingMixin, BaseNode):
         await gather_settled(*(n.cancel_background_tasks() for n in self._nodes.values()))
         await gather_settled(*(n.teardown() for n in self._nodes.values()))
 
+    # Hook fan-outs isolate each node: one raising hook is that node's fault
+    # (reported to its supervisor), never the whole tick's.
+
     async def on_pause(self) -> None:
-        await asyncio.gather(*(n.on_pause() for n in self._nodes.values()))
+        await self._gather_nodes(
+            "on_pause()", [(n.node_id, n.on_pause()) for n in self._nodes.values()],
+        )
 
     async def on_resume(self) -> None:
-        await asyncio.gather(*(n.on_resume() for n in self._nodes.values()))
+        await self._gather_nodes(
+            "on_resume()", [(n.node_id, n.on_resume()) for n in self._nodes.values()],
+        )
 
     async def notify_tick_start(self, tick: int) -> None:
-        await asyncio.gather(*(n.on_tick_start(tick) for n in self._nodes.values()))
+        await self._gather_nodes(
+            "on_tick_start()",
+            [(n.node_id, n.on_tick_start(tick)) for n in self._nodes.values()],
+        )
 
     async def notify_tick_end(self, tick: int, duration_s: float) -> None:
-        await asyncio.gather(*(n.on_tick_end(tick, duration_s) for n in self._nodes.values()))
+        await self._gather_nodes(
+            "on_tick_end()",
+            [(n.node_id, n.on_tick_end(tick, duration_s)) for n in self._nodes.values()],
+        )
 
     # ── Conflicts ────────────────────────────────────────────────────────
 
@@ -1233,7 +1363,7 @@ class ActionMasterNode(FaultReportingMixin, BaseNode):
                     action_id=action_id,
                     reason=verdict.reason,
                 )
-                self._completed.append(Result(
+                self._buffer_result(Result(
                     action_id=action_id,
                     success=False,
                     error=ActionVetoed(action_id, verdict.reason),
@@ -1324,7 +1454,12 @@ class ActionMasterNode(FaultReportingMixin, BaseNode):
             reflex_action=by.action_id,
             reflex=by.instinct_id,
         )
-        self._running_nodes[owner_id]._cancel_requested = True
+        self._cancel_run(self._running_nodes[owner_id], task)
+
+    def _cancel_run(self, node: BaseActionNode, task: asyncio.Task[Result]) -> None:
+        """Cancel a run on the master's behalf; counted, to tell foreign cancels apart."""
+        node._cancel_requested = True
+        node._master_cancels += 1
         task.cancel()
 
     def _admit_armed(self) -> None:
@@ -1369,6 +1504,7 @@ class ActionMasterNode(FaultReportingMixin, BaseNode):
             self._owners[resource] = action_id
         node._cancel_requested = False
         node._shutdown_requested = False
+        node._master_cancels = 0
         if isinstance(node, MultiStepActionNode):
             node._prepare_run()
         self._idle.clear()
@@ -1424,12 +1560,19 @@ class ActionMasterNode(FaultReportingMixin, BaseNode):
                 # arrived during it (after a foreign cancel) still counts.
                 preempted = action_id in self._preempted_by
                 requested = node._cancel_requested
+                foreign = _master_cancel_overflow(1 + absorbed, node._master_cancels)
                 stopped_at: str | None = None
                 step_results: list[StepResult] = []
                 if isinstance(node, MultiStepActionNode):
                     if node._current_step is not None:
                         stopped_at = node._current_step.name
                     step_results = node._completed_steps.copy()
+                    # A walk this run already completed (its Result was
+                    # swallowed with the cancel) still counts.
+                    if node._walk == "done":
+                        rolled_back = True
+                    elif node._walk == "failed":
+                        error = error or node._walk_error
                     node._clear_run_state()
                 if not preempted:
                     self.logger.info(
@@ -1437,11 +1580,11 @@ class ActionMasterNode(FaultReportingMixin, BaseNode):
                         action_id=action_id,
                         stopped_at=stopped_at,
                     )
-                    if not requested:
-                        raise  # a cancel from outside the master: propagate
-                # The master's cancel (and any that arrived during the
-                # safe-stop) is consumed: the run ends with a Result.
-                _uncancel(1 + absorbed)
+                if foreign or not (preempted or requested):
+                    raise  # a cancel from outside the master: propagate
+                # The master's cancels (also any that arrived during the
+                # safe-stop) are consumed: the run ends with a Result.
+                _uncancel(_cancelling())
                 result = Result(
                     action_id       = action_id,
                     success         = False,
@@ -1458,13 +1601,16 @@ class ActionMasterNode(FaultReportingMixin, BaseNode):
                 # timeout and never retried, exactly once.
                 by = node._handoff_by
                 node._handoff_by = None
+                sent_before = node._master_cancels
                 (rolled_back, error), absorbed = await _run_shielded(
                     node._run_safe_stop(
                         proposal, by, allow_rollback=not node._shutdown_requested,
                     ),
                     if_cancelled=lambda: (False, self._safe_stop_cancelled(node)),
                 )
-                _uncancel(absorbed)
+                if _master_cancel_overflow(absorbed, node._master_cancels - sent_before):
+                    raise asyncio.CancelledError()  # a foreign cancel: propagate
+                _uncancel(_cancelling())
                 result = Result(
                     action_id       = result.action_id,
                     success         = False,
@@ -1547,7 +1693,7 @@ class ActionMasterNode(FaultReportingMixin, BaseNode):
                     error_type=type(exc).__name__,
                 )
             else:
-                self._completed.append(task.result())
+                self._buffer_result(task.result())
         self._maybe_idle()
 
     def _release_unstarted(self, task: asyncio.Task[Result], *, buffered: bool) -> None:
@@ -1582,15 +1728,29 @@ class ActionMasterNode(FaultReportingMixin, BaseNode):
                 preempted   = preempted,
             )
             if buffered:
-                self._completed.append(result)
+                self._buffer_result(result)
             else:
                 self._unstarted_results[task] = result  # for the dispatch() caller
         self._release(action_id)
 
     def drain_completed(self) -> list[Result]:
         """Return (and clear) the Results of launched actions finished so far."""
-        completed, self._completed = self._completed, []
+        completed = list(self._completed)
+        self._completed.clear()
+        if self._results_dropped:
+            self.logger.warning(
+                "Action Results dropped before a tick could take them",
+                dropped=self._results_dropped,
+                kept=len(completed),
+            )
+            self._results_dropped = 0
         return completed
+
+    def _buffer_result(self, result: Result) -> None:
+        """Keep a finished Result for drain_completed() (oldest dropped when full)."""
+        if len(self._completed) == self._completed.maxlen:
+            self._results_dropped += 1
+        self._completed.append(result)
 
     async def wait_idle(self, timeout: float | None = None) -> bool:
         """
@@ -1635,8 +1795,7 @@ class ActionMasterNode(FaultReportingMixin, BaseNode):
         task = self._tasks.get(action_id)
         if task is None or task.done():
             return
-        self._running_nodes[action_id]._cancel_requested = True
-        task.cancel()
+        self._cancel_run(self._running_nodes[action_id], task)
         await asyncio.wait({task}, timeout=timeout)
 
     def _redirect_handoffs(self, dropped: Proposal) -> None:
@@ -1664,19 +1823,25 @@ class ActionMasterNode(FaultReportingMixin, BaseNode):
         """
         self._closed = True
         self._drop_armed()
-        tasks = [t for t in self._tasks.values() if not t.done()]
-        for node in self._running_nodes.values():
-            node._cancel_requested = True
+        tasks = []
+        for action_id, task in list(self._tasks.items()):
+            node = self._running_nodes.get(action_id)
+            if task.done() or node is None:
+                continue
             node._shutdown_requested = True
-        for task in tasks:
-            task.cancel()
+            self._cancel_run(node, task)
+            tasks.append(task)
         if tasks:
             await asyncio.wait(tasks, timeout=timeout)
         self._maybe_idle()
 
     def safe_stop_budget_s(self) -> float:
-        """Time to allow cancelled actions to finish their safe-stop."""
-        budgets = [n.safe_stop_timeout_s for n in self._running_nodes.values()]
+        """
+        Time to allow cancelled actions to finish their safe-stop: the
+        longest ``safe_stop_bound_s()`` of the running actions (hook, abandon
+        grace, and the rollback walk where ``rollback_on_preempt``) + 0.5 s.
+        """
+        budgets = [n.safe_stop_bound_s() for n in self._running_nodes.values()]
         return max(budgets, default=0.0) + 0.5
 
     # ── Single dispatch (awaiting; runtime-less use) ─────────────────────
@@ -1811,8 +1976,7 @@ class ActionMasterNode(FaultReportingMixin, BaseNode):
                 # the master (safe-stop, flag seen at every step boundary)
                 # and wait until it has released — through further cancels
                 # of the caller too — then propagate.
-                node._cancel_requested = True
-                task.cancel()
+                self._cancel_run(node, task)
                 while not task.done():
                     with contextlib.suppress(asyncio.CancelledError):
                         await asyncio.wait({task})
@@ -1890,13 +2054,15 @@ class ActionMasterNode(FaultReportingMixin, BaseNode):
                 raise asyncio.CancelledError()
             last_result = result
             # Never retry an interrupted/preempted run (the stop was requested,
-            # not a fault) or a failed rollback (the plant is in an unknown
-            # partial state — re-running from step 1 could compound it).
+            # not a fault) or a failed or unfinished rollback walk (e.g. one
+            # the action timeout cut): the plant is in an unknown partial
+            # state, and re-running from step 1 could compound it.
             if (
                 result.success
                 or result.interrupted
                 or result.preempted
                 or isinstance(result.error, RollbackError)
+                or (isinstance(node, MultiStepActionNode) and node.walk_cut_short())
             ):
                 break
 

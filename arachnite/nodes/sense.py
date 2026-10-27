@@ -195,17 +195,30 @@ class SenseMasterNode(FaultReportingMixin, BaseNode):
         await gather_settled(*(n.cancel_background_tasks() for n in self._nodes.values()))
         await gather_settled(*(n.teardown() for n in self._nodes.values()))
 
+    # Hook fan-outs isolate each node: one raising hook is that node's fault
+    # (reported to its supervisor), never the whole tick's.
+
     async def on_pause(self) -> None:
-        await asyncio.gather(*(n.on_pause() for n in self._nodes.values()))
+        await self._gather_nodes(
+            "on_pause()", [(n.node_id, n.on_pause()) for n in self._nodes.values()],
+        )
 
     async def on_resume(self) -> None:
-        await asyncio.gather(*(n.on_resume() for n in self._nodes.values()))
+        await self._gather_nodes(
+            "on_resume()", [(n.node_id, n.on_resume()) for n in self._nodes.values()],
+        )
 
     async def notify_tick_start(self, tick: int) -> None:
-        await asyncio.gather(*(n.on_tick_start(tick) for n in self._nodes.values()))
+        await self._gather_nodes(
+            "on_tick_start()",
+            [(n.node_id, n.on_tick_start(tick)) for n in self._nodes.values()],
+        )
 
     async def notify_tick_end(self, tick: int, duration_s: float) -> None:
-        await asyncio.gather(*(n.on_tick_end(tick, duration_s) for n in self._nodes.values()))
+        await self._gather_nodes(
+            "on_tick_end()",
+            [(n.node_id, n.on_tick_end(tick, duration_s)) for n in self._nodes.values()],
+        )
 
     async def read_all(self) -> list[Signal]:
         """
@@ -250,7 +263,11 @@ class SenseMasterNode(FaultReportingMixin, BaseNode):
                 await self._report_fault(node.node_id, exc)
                 return await node.on_error(exc)
 
-        results = await asyncio.gather(*(_read_one(n) for n in self._nodes.values()))
+        # A read() that ends in its own CancelledError (or an on_error()
+        # that raises) is that sensor's fault, not the tick's.
+        results = await self._gather_nodes(
+            "read()", [(n.node_id, _read_one(n)) for n in self._nodes.values()],
+        )
         signals: list[Signal] = [s for s in results if s is not None]
 
         # Apply merge policies before publishing

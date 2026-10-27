@@ -3,18 +3,21 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import sys
 import time
 from collections.abc import Callable
 
 import pytest
 
-from arachnite import SignalBus
+from arachnite import BaseSenseNode, RuntimeBuilder, ShutdownPhase, Signal, SignalBus
 from arachnite.exceptions import (
     ActionNotFoundError,
     ActionTimeoutError,
     NodeRegistrationError,
     ResourceConflictError,
     RollbackError,
+    StepAbortError,
 )
 from arachnite.logging import BaseLogSink
 from arachnite.models import (
@@ -1492,7 +1495,12 @@ class TestThirdReviewRegressions:
 
     @pytest.mark.asyncio
     async def test_step_timeout_holds_when_the_step_swallows_its_cancel(self) -> None:
-        """X4: a step whose inner wait_for swallows the timer's cancel is still cut on time"""
+        """
+        X4: a step whose inner wait_for swallows the timer's cancel still fails (timeout).
+        On 3.11+ it is cut on time. On 3.10 a stdlib ``asyncio.wait_for`` can swallow
+        the timer's one cancel (R4-A1: no re-cancel, so clean-up is never cut), so the
+        step ends when it next returns — a documented 3.10 limitation.
+        """
 
         class Stepper(MultiStepActionNode):
             node_id = "S"
@@ -1516,7 +1524,8 @@ class TestThirdReviewRegressions:
         am.register(Stepper(am.bus))
         started = time.perf_counter()
         result = await am.dispatch(_p("S"))
-        assert time.perf_counter() - started < 0.5
+        if sys.version_info >= (3, 11):
+            assert time.perf_counter() - started < 0.5
         assert result.success is False
 
     @pytest.mark.asyncio
@@ -1599,3 +1608,483 @@ class TestThirdReviewRegressions:
             await am.dispatch_many([_p("A"), _p("Nope")])
         assert am.running_action_ids() == set()
         assert am.resource_owners() == {}
+
+
+# ── Fourth review round (action findings R4-A1–A8) ────────────────────────────
+
+class _OwnCancelTeardown(BaseActionNode):
+    """Teardown ends in its own CancelledError (``bg.cancel(); await bg``)."""
+    node_id = "Leaky"
+
+    async def setup(self) -> None:
+        self._bg = asyncio.ensure_future(asyncio.sleep(100.0))
+
+    async def execute(self, proposal: Proposal) -> Result:
+        return Result(action_id=self.node_id, success=True)
+
+    async def teardown(self) -> None:
+        self._bg.cancel()
+        await self._bg
+
+
+class _SlowTeardown(BaseActionNode):
+    """A sibling whose teardown takes a moment."""
+    node_id = "Other"
+
+    def __init__(self, bus: SignalBus) -> None:
+        super().__init__(bus)
+        self.torn_down = False
+
+    async def execute(self, proposal: Proposal) -> Result:
+        return Result(action_id=self.node_id, success=True)
+
+    async def teardown(self) -> None:
+        await asyncio.sleep(0.02)
+        self.torn_down = True
+
+
+class _IdleSense(BaseSenseNode):
+    node_id         = "Idle"
+    signal_kind     = "idle"
+    poll_interval_s = 0.0
+
+    async def read(self) -> Signal:
+        return Signal(source=self.node_id, kind=self.signal_kind, value=0,
+                      confidence=1.0, timestamp=time.monotonic())
+
+
+class TestFourthReviewRegressions:
+    @pytest.mark.asyncio
+    async def test_clean_up_on_a_timeout_cancel_is_not_cut_short(self) -> None:
+        """
+        R4-A1: clean-up run on an action or step timeout's cancel (a park) completes.
+        Regression on Python 3.10 only: the old 3.10 timeout re-cancelled every 5 ms
+        after the deadline; 3.11+ always cancelled once (passes on old code there).
+        """
+
+        class Parker(BaseActionNode):
+            node_id   = "Parker"
+            resources = frozenset({"arm"})
+            timeout_s = 0.05
+
+            def __init__(self, bus: SignalBus) -> None:
+                super().__init__(bus)
+                self.parked = False
+
+            async def execute(self, proposal: Proposal) -> Result:
+                try:
+                    await asyncio.sleep(10.0)
+                except asyncio.CancelledError:
+                    await asyncio.sleep(0.05)          # park the arm
+                    self.parked = True
+                    raise
+                return Result(action_id=self.node_id, success=True)
+
+        class StepParker(MultiStepActionNode):
+            node_id   = "StepParker"
+            resources = frozenset({"gripper"})
+            timeout_s = 10.0
+
+            def __init__(self, bus: SignalBus) -> None:
+                super().__init__(bus)
+                self.parked = False
+
+            def steps(self) -> list[ActionStep]:
+                return [ActionStep("move", timeout_s=0.05)]
+
+            async def execute_step(
+                self, step: ActionStep, proposal: Proposal, completed: list[StepResult],
+            ) -> StepResult:
+                try:
+                    await asyncio.sleep(10.0)
+                finally:
+                    await asyncio.sleep(0.05)          # stop the motor
+                    self.parked = True
+                return StepResult(step_name=step.name, success=True)
+
+        am = ActionMasterNode(bus=SignalBus())
+        parker, step_parker = Parker(am.bus), StepParker(am.bus)
+        am.register(parker)
+        am.register(step_parker)
+        action_result, step_result = await asyncio.gather(
+            am.dispatch(_p("Parker")), am.dispatch(_p("StepParker")),
+        )
+        assert parker.parked is True
+        assert step_parker.parked is True
+        assert isinstance(action_result.error, ActionTimeoutError)
+        assert step_result.success is False
+        assert isinstance(step_result.error, StepAbortError)
+
+    @pytest.mark.asyncio
+    async def test_step_returning_after_swallowing_its_timeout_is_a_timeout(self) -> None:
+        """
+        R4-A2: a step that catches its timeout cancel and returns late fails as a timeout.
+        Regression on Python 3.11+ (reported a success); the old 3.10 re-cancel loop cut
+        such a step, so the old code passes there.
+        """
+
+        class Stubborn(MultiStepActionNode):
+            node_id   = "Stubborn"
+            resources = frozenset({"arm"})
+            timeout_s = 10.0
+
+            def steps(self) -> list[ActionStep]:
+                return [ActionStep("s1", timeout_s=0.05)]
+
+            async def execute_step(
+                self, step: ActionStep, proposal: Proposal, completed: list[StepResult],
+            ) -> StepResult:
+                with contextlib.suppress(asyncio.CancelledError):
+                    await asyncio.sleep(0.2)           # finishes the motion anyway
+                await asyncio.sleep(0.05)
+                return StepResult(step_name=step.name, success=True)
+
+        am = ActionMasterNode(bus=SignalBus())
+        am.register(Stubborn(am.bus))
+        result = await am.dispatch(_p("Stubborn"))
+        assert result.success is False
+        assert isinstance(result.error, StepAbortError)
+
+    @pytest.mark.asyncio
+    async def test_safe_stop_hook_swallowing_its_cancel_is_abandoned(self) -> None:
+        """
+        R4-A3: a hook that swallows its cancel holds a reflex back for at most
+        safe_stop_timeout_s + SAFE_STOP_ABANDON_GRACE_S; it is abandoned and logged.
+        """
+        from arachnite.nodes import action as action_module
+
+        # The documented grace (0.1 s); read from the module when it exists.
+        SAFE_STOP_ABANDON_GRACE_S = getattr(action_module, "SAFE_STOP_ABANDON_GRACE_S", 0.1)
+
+        class Owner(BaseActionNode):
+            node_id             = "Owner"
+            resources           = frozenset({"arm"})
+            timeout_s           = 10.0
+            safe_stop_timeout_s = 0.05
+
+            def __init__(self, bus: SignalBus, sink: BaseLogSink) -> None:
+                super().__init__(bus, log_sinks=[sink])
+                self.started = asyncio.Event()
+                self.hard_brake_done = asyncio.Event()
+
+            async def execute(self, proposal: Proposal) -> Result:
+                self.started.set()
+                await asyncio.sleep(10.0)
+                return Result(action_id=self.node_id, success=True)
+
+            async def on_preempted(self, proposal: Proposal, preempted_by: Proposal) -> None:
+                try:
+                    await asyncio.sleep(10.0)                  # soft brake
+                except asyncio.CancelledError:
+                    await self.hard_brake_done.wait()          # brake harder, ignore the cancel
+
+        sink = _CaptureSink()
+        am = ActionMasterNode(bus=SignalBus())
+        owner = Owner(am.bus, sink)
+        am.register(owner)
+        reflex = _gated(am, "R", {"arm"}, hold=False)
+        am.launch(_p("Owner"))
+        await owner.started.wait()
+        started = time.perf_counter()
+        am.launch_reflex(_p("R", 250))
+        try:
+            await asyncio.wait_for(reflex.started.wait(), 2.0)
+            latency = time.perf_counter() - started
+        finally:
+            owner.hard_brake_done.set()                        # the abandoned hook ends
+        assert latency < owner.safe_stop_timeout_s + SAFE_STOP_ABANDON_GRACE_S + 0.15
+        assert await am.wait_idle(1.0)
+        await _until(lambda: "Abandoned safe-stop hook ended" in sink.messages)
+        assert "Safe-stop hook ignored its cancellation; abandoned" in sink.messages
+        result = _results_by_id(am)["Owner"]
+        assert result.preempted is True
+        assert isinstance(result.error, ActionTimeoutError)
+
+    @pytest.mark.asyncio
+    async def test_preempt_after_a_walk_that_swallowed_the_cancel_undoes_once(self) -> None:
+        """R4-A4: a PREEMPT in an interrupt walk whose undo swallows the cancel: undone once"""
+
+        class Seq(MultiStepActionNode):
+            node_id             = "Seq"
+            resources           = frozenset({"arm"})
+            timeout_s           = 10.0
+            interrupt_policy    = InterruptPolicy.ROLLBACK
+            rollback_on_preempt = True
+
+            def __init__(self, bus: SignalBus) -> None:
+                super().__init__(bus)
+                self.undone: list[str] = []
+                self.in_block = asyncio.Event()
+                self.in_walk = asyncio.Event()
+                self.ack: asyncio.Future[str] = asyncio.get_running_loop().create_future()
+
+            def _undo(self, name: str):  # type: ignore[no-untyped-def]
+                async def _rollback() -> None:
+                    self.undone.append(name)
+                    if name == "b" and not self.in_walk.is_set():
+                        self.in_walk.set()
+                        # Motor ack; an undo must finish, so the cancel is swallowed.
+                        with contextlib.suppress(asyncio.CancelledError):
+                            await self.ack
+                return _rollback
+
+            def steps(self) -> list[ActionStep]:
+                return [
+                    ActionStep("a", interruptible=False, rollback=self._undo("a")),
+                    ActionStep("b", interruptible=False, rollback=self._undo("b")),
+                    ActionStep("c"),
+                ]
+
+            async def execute_step(
+                self, step: ActionStep, proposal: Proposal, completed: list[StepResult],
+            ) -> StepResult:
+                if step.name == "b":
+                    self.in_block.set()
+                await asyncio.sleep(0.02)
+                return StepResult(step_name=step.name, success=True)
+
+        am = ActionMasterNode(bus=SignalBus())
+        seq = Seq(am.bus)
+        am.register(seq)
+        _gated(am, "R", {"arm"}, hold=False)
+        am.launch(_p("Seq"))
+        await seq.in_block.wait()
+        am.interrupt_all(InterruptRequest(
+            new_proposal=_p("Other", 60), requesting_instinct_id="i",
+        ))
+        await seq.in_walk.wait()
+        seq.ack.set_result("ok")             # the ack and the reflex land in the same turn
+        am.launch_reflex(_p("R", 250))
+        assert await am.wait_idle(2.0)
+        assert seq.undone == ["b", "a"]
+        result = _results_by_id(am)["Seq"]
+        assert result.preempted is True
+        assert result.rolled_back is True
+
+    @pytest.mark.asyncio
+    async def test_teardown_waits_for_a_rollback_on_preempt_walk(self) -> None:
+        """R4-A5: teardown() during a preemption's rollback walk waits for it to finish"""
+
+        class SlowUndo(MultiStepActionNode):
+            node_id             = "Seq"
+            resources           = frozenset({"arm"})
+            timeout_s           = 10.0
+            rollback_on_preempt = True
+            safe_stop_timeout_s = 0.05
+
+            def __init__(self, bus: SignalBus) -> None:
+                super().__init__(bus)
+                self.log: list[tuple[str, str, bool]] = []
+                self.in_last = asyncio.Event()
+                self.torn_down = False
+
+            def _undo(self, name: str):  # type: ignore[no-untyped-def]
+                async def _rollback() -> None:
+                    self.log.append(("begin", name, self.torn_down))
+                    await asyncio.sleep(0.35)          # reverse a physical motion
+                    self.log.append(("end", name, self.torn_down))
+                return _rollback
+
+            def steps(self) -> list[ActionStep]:
+                return [
+                    ActionStep("a", interruptible=False, rollback=self._undo("a"), timeout_s=1.0),
+                    ActionStep("b", interruptible=False, rollback=self._undo("b"), timeout_s=1.0),
+                    ActionStep("c", interruptible=False),
+                ]
+
+            async def execute_step(
+                self, step: ActionStep, proposal: Proposal, completed: list[StepResult],
+            ) -> StepResult:
+                if step.name == "c":
+                    self.in_last.set()
+                    await asyncio.sleep(1.0)
+                await asyncio.sleep(0.02)
+                return StepResult(step_name=step.name, success=True)
+
+            async def teardown(self) -> None:
+                self.torn_down = True                  # e.g. close the motor driver
+
+        am = ActionMasterNode(bus=SignalBus())
+        seq = SlowUndo(am.bus)
+        am.register(seq)
+        _gated(am, "R", {"arm"}, hold=False)
+        am.launch(_p("Seq"))
+        await seq.in_last.wait()
+        am.launch_reflex(_p("R", 250))
+        await _until(lambda: bool(seq.log))     # the safe-stop's walk runs
+        await am.teardown()                     # shutdown / emergency_stop path
+        assert am.running_action_ids() == set()
+        assert am.resource_owners() == {}
+        assert seq.log == [
+            ("begin", "b", False), ("end", "b", False),
+            ("begin", "a", False), ("end", "a", False),
+        ]
+        assert seq.torn_down is True
+
+    @pytest.mark.asyncio
+    async def test_rollback_overrunning_its_step_timeout_fails_the_walk(self) -> None:
+        """R4-A5: an undo that overruns its step's timeout_s is a rollback failure, not a hang"""
+
+        class Jammed(MultiStepActionNode):
+            node_id          = "Jammed"
+            resources        = frozenset({"arm"})
+            timeout_s        = 1.0
+            interrupt_policy = InterruptPolicy.ROLLBACK
+
+            async def _jammed_undo(self) -> None:
+                await asyncio.Event().wait()           # the undo never ends
+
+            def steps(self) -> list[ActionStep]:
+                return [
+                    ActionStep("a", interruptible=False, rollback=self._jammed_undo,
+                               timeout_s=0.05),
+                    ActionStep("b", interruptible=False, timeout_s=1.0),
+                ]
+
+            async def execute_step(
+                self, step: ActionStep, proposal: Proposal, completed: list[StepResult],
+            ) -> StepResult:
+                await asyncio.sleep(0.01)
+                fail = step.name == "b"
+                return StepResult(step_name=step.name, success=not fail, abort_sequence=fail)
+
+        am = ActionMasterNode(bus=SignalBus())
+        am.register(Jammed(am.bus))
+        started = time.perf_counter()
+        result = await am.dispatch(_p("Jammed"))
+        assert time.perf_counter() - started < 0.6
+        assert result.success is False
+        assert isinstance(result.error, RollbackError)
+        assert [(name, type(exc)) for name, exc in result.error.failures] == [
+            ("a", ActionTimeoutError),
+        ]
+
+    @pytest.mark.parametrize("path", ["hand-off", "master-cancel"])
+    @pytest.mark.asyncio
+    async def test_foreign_cancel_during_a_safe_stop_propagates(self, path: str) -> None:
+        """R4-A6: a cancel from outside the master during a safe-stop ends the run cancelled"""
+
+        class Seq(MultiStepActionNode):
+            node_id   = "Seq"
+            resources = frozenset({"arm"})
+            timeout_s = 10.0
+
+            def __init__(self, bus: SignalBus) -> None:
+                super().__init__(bus)
+                self.in_block = asyncio.Event()
+                self.in_stop = asyncio.Event()
+
+            def steps(self) -> list[ActionStep]:
+                return [ActionStep("a", interruptible=False), ActionStep("b")]
+
+            async def execute_step(
+                self, step: ActionStep, proposal: Proposal, completed: list[StepResult],
+            ) -> StepResult:
+                if step.name == "a":
+                    self.in_block.set()
+                await asyncio.sleep(0.05)
+                return StepResult(step_name=step.name, success=True)
+
+            async def on_preempted(self, proposal: Proposal, preempted_by: Proposal) -> None:
+                self.in_stop.set()
+                await asyncio.sleep(0.05)
+
+        am = ActionMasterNode(bus=SignalBus())
+        seq = Seq(am.bus)
+        am.register(seq)
+        _gated(am, "R", {"arm"}, hold=False)
+        am.launch(_p("Seq"))
+        await seq.in_block.wait()
+        task = am._tasks["Seq"]
+        stopper: asyncio.Future[None] | None = None
+        if path == "hand-off":
+            am.launch_reflex(_p("R", 250), ReflexPreemption.WAIT_FOR_BLOCK)
+        else:
+            stopper = asyncio.ensure_future(am.cancel("Seq"))
+        await seq.in_stop.wait()
+        task.cancel()                            # foreign, e.g. the loop shutting down
+        await asyncio.wait({task}, timeout=1.0)
+        assert task.cancelled()
+        if stopper is not None:
+            await stopper
+        assert await am.wait_idle(1.0)
+        assert am.resource_owners() == {}
+
+    @pytest.mark.asyncio
+    async def test_walk_cut_by_the_action_timeout_is_not_retried(self) -> None:
+        """R4-A7: an abort walk the action timeout cuts short is never retried from step 1"""
+
+        class Seq(MultiStepActionNode):
+            node_id          = "Seq"
+            resources        = frozenset({"arm"})
+            interrupt_policy = InterruptPolicy.ROLLBACK
+            timeout_s        = 0.15
+            max_retries      = 1
+
+            def __init__(self, bus: SignalBus) -> None:
+                super().__init__(bus)
+                self.log: list[str] = []
+
+            async def _undo_a(self) -> None:
+                self.log.append("undo a begin")
+                await asyncio.sleep(1.0)
+                self.log.append("undo a end")
+
+            def steps(self) -> list[ActionStep]:
+                return [
+                    ActionStep("a", interruptible=False, rollback=self._undo_a, timeout_s=1.0),
+                    ActionStep("b", interruptible=False, timeout_s=1.0),
+                ]
+
+            async def execute_step(
+                self, step: ActionStep, proposal: Proposal, completed: list[StepResult],
+            ) -> StepResult:
+                self.log.append(f"do {step.name}")
+                await asyncio.sleep(0.02)
+                fail = step.name == "b"
+                return StepResult(step_name=step.name, success=not fail, abort_sequence=fail)
+
+        am = ActionMasterNode(bus=SignalBus())
+        seq = Seq(am.bus)
+        am.register(seq)
+        result = await am.dispatch(_p("Seq"))
+        assert seq.log == ["do a", "do b", "undo a begin"]
+        assert result.success is False
+        assert isinstance(result.error, ActionTimeoutError)
+
+    @pytest.mark.asyncio
+    async def test_teardown_ending_in_its_own_cancel_is_an_error(self) -> None:
+        """R4-A8: a node teardown ending in its own CancelledError raises RuntimeError"""
+        am = ActionMasterNode(bus=SignalBus())
+        am.register(_OwnCancelTeardown(am.bus))
+        other = _SlowTeardown(am.bus)
+        am.register(other)
+        await am.setup()
+        raised: BaseException | None = None
+        try:
+            await am.teardown()
+        except BaseException as exc:  # the old code raised CancelledError
+            raised = exc
+        assert isinstance(raised, RuntimeError)
+        assert isinstance(raised.__cause__, asyncio.CancelledError)
+        assert other.torn_down is True
+
+    @pytest.mark.asyncio
+    async def test_stop_completes_when_a_teardown_ends_in_its_own_cancel(self) -> None:
+        """R4-A8: runtime.stop() reaches COMPLETE, then re-raises the teardown's RuntimeError"""
+        rt = (
+            RuntimeBuilder()
+            .sense(_IdleSense)
+            .action(_OwnCancelTeardown)
+            .action(_SlowTeardown)
+            .tick_rate(50.0)
+            .build()
+        )
+        await rt.start()
+        await asyncio.sleep(0.03)
+        with pytest.raises(RuntimeError, match="own CancelledError"):
+            await rt.stop()
+        assert rt._shutdown_coordinator.phase is ShutdownPhase.COMPLETE
+        other = rt._action_master.get_node("Other")
+        assert isinstance(other, _SlowTeardown)
+        assert other.torn_down is True

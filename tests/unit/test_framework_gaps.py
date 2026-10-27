@@ -673,6 +673,10 @@ class TestSupervisorSignalsInContext:
         node = DummySense(bus=rt.bus)
         await rt.register_sense_live(node)
         await rt.start()
+        await rt.pause()  # prevent background loop from draining the buffer
+        # The node is supervised like a built-in one: start() marks it RUNNING
+        assert len(rt._supervisor_signal_buffer) == 1
+        await rt.tick()
         # tick with no supervisor signals should not inject anything extra
         assert len(rt._supervisor_signal_buffer) == 0
         await rt.tick()
@@ -728,7 +732,12 @@ class TestSupervisorSignalsInContext:
         # (Bug B pattern from audit 2026-04-16).
         await rt.pause()
 
-        # First tick — no supervisor signal
+        # The watcher is supervised like a built-in node: this tick carries
+        # start()'s RUNNING transition
+        await rt.tick()
+        assert seen_supervisor[-1] is True
+
+        # Next tick — no supervisor signal
         await rt.tick()
         assert seen_supervisor[-1] is False
 

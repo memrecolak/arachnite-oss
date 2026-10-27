@@ -50,6 +50,7 @@ class NodeSupervisor:
         self._restart_counts: dict[str, int]          = {}
         self._nodes:          dict[str, BaseNode]     = {}
         self._restart_tasks:  set[asyncio.Task[None]] = set()
+        self._restart_targets: dict[asyncio.Task[None], BaseNode] = {}
 
     # ── Node tracking ─────────────────────────────────────────────────────────
 
@@ -60,9 +61,13 @@ class NodeSupervisor:
         self._restart_counts[node.node_id] = 0
 
     def untrack(self, node_id: str) -> None:
-        self._nodes.pop(node_id, None)
+        """Stop supervising a node; a restart of it still pending is cancelled."""
+        node = self._nodes.pop(node_id, None)
         self._states.pop(node_id, None)
         self._restart_counts.pop(node_id, None)
+        for task, target in list(self._restart_targets.items()):
+            if target is node:
+                task.cancel()
 
     def state_of(self, node_id: str) -> NodeState:
         """Return the current NodeState for a tracked node."""
@@ -204,8 +209,10 @@ class NodeSupervisor:
         """
         await asyncio.sleep(self._restart_delay)
         node = self._nodes.get(node_id)
-        if node is None:
-            return
+        current = asyncio.current_task()
+        expected = self._restart_targets.get(current) if current is not None else None
+        if node is None or (expected is not None and node is not expected):
+            return  # untracked, or replaced by a new node under the same id
 
         await self._transition(node_id, NodeState.RESTARTING)
         self._restart_counts[node_id] = self._restart_counts.get(node_id, 0) + 1
@@ -237,7 +244,14 @@ class NodeSupervisor:
             name=f"supervisor_restart_{node_id}",
         )
         self._restart_tasks.add(task)
-        task.add_done_callback(self._restart_tasks.discard)
+        # The node this restart is for: a replacement registered under the
+        # same id later is not torn down by it.
+        self._restart_targets[task] = self._nodes[node_id]
+        task.add_done_callback(self._restart_task_done)
+
+    def _restart_task_done(self, task: asyncio.Task[None]) -> None:
+        self._restart_tasks.discard(task)
+        self._restart_targets.pop(task, None)
 
     async def cancel_restart_tasks(self) -> None:
         """Cancel all in-flight restart tasks. Called during shutdown."""
@@ -246,6 +260,7 @@ class NodeSupervisor:
         if self._restart_tasks:
             await asyncio.gather(*self._restart_tasks, return_exceptions=True)
         self._restart_tasks.clear()
+        self._restart_targets.clear()
 
     @property
     def restart_task_count(self) -> int:

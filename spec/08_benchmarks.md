@@ -90,7 +90,7 @@ This excludes `asyncio.sleep()` scheduling overhead from the tick loop. The metr
 
 | Parameter | Value |
 |-----------|-------|
-| SenseNodes | 3 (returning scalar float values) |
+| SenseNodes | 3 (returning scalar float values; `poll_interval_s = 0`, so every measured tick reads all three) |
 | InstinctNodes | 1 normal + 1 reflex (neither fires) |
 | DecisionNode | WeightedDecisionNode |
 | ActionNodes | 1 (no-op, returns `Result(success=True)`) |
@@ -169,11 +169,11 @@ T_worst_conflict = T_detect + T_eval + T_admit
 
 where T_admit, per the decision table of §17.12, is:
 
-- `safe_stop_timeout_s` of the owner under `PREEMPT`, or under `WAIT_FOR_BLOCK` when the owner is outside a mandatory block;
-- R_block + `safe_stop_timeout_s` under `WAIT_FOR_BLOCK` with the owner inside a block, where R_block = Σ timeout_s of the current step and the non-interruptible steps contiguous with it (the owner's `mandatory_block_remaining_s`);
+- `safe_stop_timeout_s` of the owner (+ 0.1 s for a hook that overruns and is abandoned) under `PREEMPT`, or under `WAIT_FOR_BLOCK` when the owner is outside a mandatory block;
+- R_block + that safe-stop term under `WAIT_FOR_BLOCK` with the owner inside a block, where R_block = Σ timeout_s of the current step and the non-interruptible steps contiguous with it (the owner's `mandatory_block_remaining_s`);
 - the remaining run of the owner, ≤ (max_retries + 1) × timeout_s, when the owner is itself a reflex action.
 
-A rollback walk (`rollback_on_preempt=True`) adds its own duration, which the framework does not bound. The deliberative counterpart — the time before a deliberative interrupt can take effect, at most R_block — is probed by §22.12.
+A rollback walk (`rollback_on_preempt=True`) adds its own duration, bounded by the sum of the `timeout_s` of the steps it undoes (each rollback callable is timed out at its step's `timeout_s`). The deliberative counterpart — the time before a deliberative interrupt can take effect, at most R_block — is probed by §22.12.
 
 ### 22\.3\.4 Source
 
@@ -544,7 +544,7 @@ where *K* is the final bucket index. Drift is declared (`drift_detected = True`)
 
 | Parameter | Value |
 |-----------|-------|
-| SenseNodes | 1 (`_ConstantSense` returning a scalar float) |
+| SenseNodes | 1 (`_ConstantSense` returning a scalar float; `poll_interval_s = 0`, read on every tick — the JSON `sensor_reads` field counts the measured ticks that read it) |
 | InstinctNodes | 1 (no-op, never proposes) |
 | DecisionNode | `WeightedDecisionNode` |
 | ActionNodes | 1 (no-op, returns `Result(success=True)`) |
@@ -555,6 +555,9 @@ where *K* is the final bucket index. Drift is declared (`drift_detected = True`)
 | Tick driver | Manual `setup()` / `tick()` / `teardown()` per the v2 driver discipline (audit 2026-04-16, Bug B) |
 | Timer | `time.perf_counter()` |
 | Quick preset | `--quick` overrides to *T* = 10,000, *B* = 1,000, *W* = 500 — used by `benchmarks/suite.py` to keep CI sub-minute |
+| Pacing | `--tick-rate-hz R` (default 0: tight loop) schedules tick starts on an absolute grid of period 1/R; the sleep happens before the timed window |
+
+With pacing, the JSON reports three schedule statistics: `deadline_misses`, the measured ticks that ended after the end of their scheduled slot (later than scheduled start + period); `max_start_lateness_ms`, the largest delay of a measured tick's start past its scheduled start; and `overrun_ticks`, the times the schedule fell more than one full period behind and skipped ahead instead of bursting to catch up (a slip of between one and two periods is caught up and is not counted there, but is a deadline miss).
 
 ### 22\.13\.3 Statistical Treatment
 
