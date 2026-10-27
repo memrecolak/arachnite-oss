@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import os
 import warnings
+from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -181,10 +183,9 @@ class TestDeploymentManifestValidate:
             ],
         }
         # EmergencyReflex on agent-A targets "EmergencyStop" which is NOT registered
-        # as an action on any agent → co-location violation
-        manifest = DeploymentManifest.from_dict(bad_manifest)
+        # as an action on any agent → co-location violation, now caught at load
         with pytest.raises(ManifestValidationError):
-            manifest.validate()
+            DeploymentManifest.from_dict(bad_manifest)
 
     def test_unknown_agent_raises_key_error(self) -> None:
         manifest = DeploymentManifest.from_dict(_VALID_MANIFEST)
@@ -369,8 +370,10 @@ class TestAutoDetectReflex:
                 "nodes": {
                     "instinct": [
                         # No "reflex": True — should be auto-detected
-                        {"kind": "tests.conftest.EmergencyReflex", "action_id": "EmergencyStop"},
+                        {"kind": "tests.conftest.EmergencyReflex", "action_id": "RecordingAction"},
                     ],
+                    # co-located target, so the manifest passes load-time validation
+                    "action": [{"kind": "tests.conftest.RecordingAction"}],
                 },
             }],
         }
@@ -395,9 +398,8 @@ class TestDuplicateNodeId:
                 },
             }],
         }
-        manifest = DeploymentManifest.from_dict(manifest_data)
         with pytest.raises(ManifestValidationError, match="duplicate"):
-            manifest.validate()
+            DeploymentManifest.from_dict(manifest_data)
 
 
 class TestManifestAccessors:
@@ -588,3 +590,180 @@ class TestValidateColocationActionSection:
         ]
         with pytest.raises(ManifestValidationError, match="no ActionNode"):
             validate_colocation(assignments)
+
+
+# ── Review 6 (distributed): node_id resolution, load-time enforcement ────────
+
+_R6 = "tests.conftest."
+
+
+def _r6_colocated() -> dict[str, object]:
+    """Reflex 'r6.hot_reflex' and its target node_id 'Brake' (class R6BrakeActuator)."""
+    return {"agents": [{"id": "edge", "nodes": {
+        "sense": [f"{_R6}R6TempSense"],
+        "instinct": [{"kind": f"{_R6}R6HotReflex", "action_id": "Brake"}],
+        "action": [f"{_R6}R6BrakeActuator"],
+    }}]}
+
+
+def _r6_split_name_clash() -> dict[str, object]:
+    """Real 'Brake' action on cloud; edge only has a class NAMED Brake (node_id BrakeLog)."""
+    return {"agents": [
+        {"id": "edge", "nodes": {
+            "sense": [f"{_R6}R6TempSense"],
+            "instinct": [{"kind": f"{_R6}R6HotReflex", "action_id": "Brake"}],
+            "action": [f"{_R6}Brake"],
+        }},
+        {"id": "cloud", "nodes": {"action": [f"{_R6}R6BrakeActuator"]}},
+    ]}
+
+
+def _r6_split() -> dict[str, object]:
+    return {"agents": [
+        {"id": "edge", "nodes": {
+            "sense": [f"{_R6}R6TempSense"],
+            "instinct": [{"kind": f"{_R6}R6HotReflex", "action_id": "Brake"}],
+        }},
+        {"id": "cloud", "nodes": {"action": [f"{_R6}R6BrakeActuator"]}},
+    ]}
+
+
+class TestR6ManifestNodeIdAndLoadValidation:
+    """R6-F2: co-location uses node_ids, and validation is enforced at load/start."""
+
+    def test_assignment_node_id_is_the_class_node_id(self) -> None:
+        """R6-F2: NodeAssignment.node_id is the class's node_id, not its class name"""
+        manifest = DeploymentManifest.from_dict(_r6_colocated())
+        ids = {a.node_class.__name__: a.node_id for a in manifest.assignments_for("edge")}
+        assert ids == {"R6TempSense": "r6.temp", "R6HotReflex": "r6.hot_reflex",
+                       "R6BrakeActuator": "Brake"}
+
+    def test_colocated_reflex_whose_action_class_name_differs_passes(self) -> None:
+        """R6-F2: a correct manifest is not rejected because node_id != class name"""
+        DeploymentManifest.from_dict(_r6_colocated()).validate()   # must not raise
+
+    def test_split_reflex_hidden_by_class_name_clash_is_rejected(self) -> None:
+        """R6-F2: an unrelated class named like the target does not mask a split reflex"""
+        with pytest.raises(ManifestValidationError, match="r6.hot_reflex"):
+            DeploymentManifest.from_dict(_r6_split_name_clash()).validate()
+
+    def test_split_reflex_rejected_at_load(self) -> None:
+        """R6-F2: from_dict() itself rejects a reflex split from its action"""
+        with pytest.raises(ManifestValidationError, match="Brake"):
+            DeploymentManifest.from_dict(_r6_split())
+
+    def test_split_reflex_rejected_by_from_yaml(self, tmp_path: Path) -> None:
+        """R6-F2: from_yaml() validates too"""
+        yaml = pytest.importorskip("yaml")
+        path = tmp_path / "m.yaml"
+        path.write_text(yaml.safe_dump(_r6_split()), encoding="utf-8")
+        with pytest.raises(ManifestValidationError):
+            DeploymentManifest.from_yaml(path)
+
+    def test_permission_violation_rejected_at_load(self) -> None:
+        """R6-F2: the permission whitelist is enforced at load, not only by validate()"""
+        with pytest.raises(ManifestValidationError, match="network"):
+            DeploymentManifest.from_dict({"agents": [{"id": "edge", "nodes": {
+                "sense": [{"kind": f"{_R6}R6NetSense", "permissions": []}]}}]})
+
+    def test_duplicate_node_id_from_two_classes_rejected(self) -> None:
+        """R6-F2: two classes sharing a node_id on one agent are duplicates"""
+        with pytest.raises(ManifestValidationError, match="duplicate node_id 'Shared'"):
+            DeploymentManifest.from_dict({"agents": [{"id": "a", "nodes": {
+                "action": [f"{_R6}R6SharedIdA", f"{_R6}R6SharedIdB"]}}]})
+
+    def test_from_manifest_revalidates(self) -> None:
+        """R6-F2: AgentNode.from_manifest re-validates a manifest built directly"""
+        from arachnite.distributed.agent_node import AgentNode
+        ok = DeploymentManifest.from_dict(_r6_colocated())
+        # Same nodes, but the action moved to another agent: bypasses the load check.
+        moved = [
+            _manifest_module.NodeAssignment(
+                node_class=a.node_class,
+                agent_node_id="cloud" if a.node_id == "Brake" else a.agent_node_id,
+                node_section=a.node_section, config=a.config, is_reflex=a.is_reflex,
+                reflex_action_id=a.reflex_action_id,
+            )
+            for a in ok.assignments
+        ]
+        configs = [ok.agent_config("edge"),
+                   _manifest_module.AgentNodeConfig("cloud", "", "local", 10.0, [], {})]
+        bad = DeploymentManifest(ok.mesh_config, configs, moved)
+        with pytest.raises(ManifestValidationError):
+            AgentNode.from_manifest(bad, "edge")
+
+    async def test_mesh_start_revalidates(self) -> None:
+        """R6-F2: MeshRuntime.start re-validates and starts nothing on failure"""
+        from arachnite.distributed.mesh import MeshRuntime
+        ok = DeploymentManifest.from_dict(_r6_colocated())
+        no_action = [a for a in ok.assignments if a.node_id != "Brake"]
+        bad = DeploymentManifest(ok.mesh_config, [ok.agent_config("edge")], no_action)
+        mesh = MeshRuntime(bad)
+        with pytest.raises(ManifestValidationError):
+            await mesh.start()
+        running = [a for a in mesh.agents.values() if a.is_running]
+        await mesh.stop()
+        assert not mesh.started
+        assert running == []
+
+    def test_unknown_section_and_wrong_section_class_rejected(self) -> None:
+        """R6-F12-10: a section typo or an action class under 'instinct' is an error"""
+        with pytest.raises(ManifestValidationError, match="unknown node section 'sensors'"):
+            DeploymentManifest.from_dict({"agents": [{"id": "e", "nodes": {
+                "sensors": [f"{_R6}R6TempSense"]}}]})
+        with pytest.raises(ManifestValidationError, match="not a BaseInstinctNode"):
+            DeploymentManifest.from_dict({"agents": [{"id": "e", "nodes": {
+                "instinct": [f"{_R6}R6BrakeActuator"]}}]})
+
+
+class TestR6ManifestTransportSettings:
+    """R6-F12-19/20: manifest transport settings are honoured or rejected, never ignored."""
+
+    def test_mesh_broker_and_mqtt_credentials_reach_the_transport(self) -> None:
+        """R6-F12-19: mesh mqtt_broker and transport_config auth/TLS/reconnect are applied"""
+        pytest.importorskip("aiomqtt")
+        from arachnite.distributed.agent_node import AgentNode
+        m = DeploymentManifest.from_dict({
+            "mesh": {"mqtt_broker": "192.168.1.10:1884",
+                     "nats_server": "nats://cloud.example.com:4222"},
+            "agents": [
+                {"id": "pi", "transport": "mqtt",
+                 "transport_config": {"username": "robot", "password": "${R6_MQTT_PW:-pw}",
+                                      "tls": True, "max_reconnect_attempts": 99,
+                                      "reconnect_interval_s": 0.5},
+                 "nodes": {"sense": [f"{_R6}R6TempSense"]}},
+                {"id": "brain", "transport": "nats", "nodes": {}},
+                {"id": "pi2", "transport": "mqtt",
+                 "transport_config": {"broker_host": "10.0.0.2"}, "nodes": {}},
+            ]})
+        mq: Any = AgentNode.from_manifest(m, "pi").transport
+        assert (mq._host, mq._port, mq._username, mq._password, mq._tls) == (
+            "192.168.1.10", 1884, "robot", "pw", True)
+        assert (mq._max_reconnect, mq._reconnect_interval) == (99, 0.5)
+        # an agent's own broker_host wins over the mesh default (port still from it)
+        mq2: Any = AgentNode.from_manifest(m, "pi2").transport
+        assert (mq2._host, mq2._port) == ("10.0.0.2", 1884)
+        pytest.importorskip("nats")
+        na: Any = AgentNode.from_manifest(m, "brain").transport
+        assert na._servers == ["nats://cloud.example.com:4222"]
+
+    def test_unknown_transport_config_key_rejected(self) -> None:
+        """R6-F12-19: a transport_config key the transport cannot use is an error"""
+        with pytest.raises(ManifestValidationError, match="ca_file"):
+            DeploymentManifest.from_dict({"agents": [{
+                "id": "pi", "transport": "mqtt",
+                "transport_config": {"ca_file": "/etc/ca.pem"}, "nodes": {}}]})
+
+    def test_unknown_transport_kind_rejected(self) -> None:
+        """R6-F12-20: validate() checks the transport kind (spec §11.2)"""
+        with pytest.raises(ManifestValidationError, match="unknown transport 'zeromq'"):
+            DeploymentManifest.from_dict({"agents": [{
+                "id": "pi", "transport": "zeromq", "nodes": {}}]})
+
+    def test_on_transport_fault_rejected_not_ignored(self) -> None:
+        """R6-F12-20: the unimplemented on_transport_fault option is refused"""
+        with pytest.raises(ManifestValidationError, match="on_transport_fault"):
+            DeploymentManifest.from_dict({"agents": [{
+                "id": "pi", "transport": "local", "nodes": {},
+                "on_transport_fault": {"reflex": "TransportFaultReflex",
+                                       "action": "SafeModeActionNode"}}]})

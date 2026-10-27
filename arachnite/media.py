@@ -50,11 +50,13 @@ from typing import Any
 from arachnite.exceptions import PathTraversalError
 
 _SAFE_NAME = re.compile(r"^[a-zA-Z0-9_][a-zA-Z0-9_.\-]*$")
+# A file extension: '.ext' segments only — no separators, no '..', no spaces.
+_SAFE_EXTENSION = re.compile(r"^(\.[a-zA-Z0-9_\-]+)+$")
 
 
 def _validate_path_component(value: str, param_name: str) -> None:
     """Reject path components that could escape the media base directory"""
-    if not _SAFE_NAME.match(value):
+    if not _SAFE_NAME.fullmatch(value):
         raise PathTraversalError(
             f"Unsafe {param_name}: {value!r}. "
             f"Must match [a-zA-Z0-9_][a-zA-Z0-9_.\\-]*"
@@ -134,24 +136,39 @@ class MediaStore:
             data = str(data).encode()
 
         ext = extension or self._extensions.get(kind, ".bin")
+        if not _SAFE_EXTENSION.fullmatch(ext):
+            raise PathTraversalError(
+                f"Unsafe extension: {ext!r}. Must be one or more '.name' "
+                "segments of [a-zA-Z0-9_-]"
+            )
         kind_dir = self._base / kind
         kind_dir.mkdir(parents=True, exist_ok=True)
+        base_resolved = self._base.resolve()
 
         tick_part = f"_tick{tick}" if tick is not None else ""
         ts = f"{time.monotonic():.4f}".replace(".", "_")
-        filename = f"{source}{tick_part}_{ts}{ext}"
-        path = kind_dir / filename
+        # Two stores within the same 100 us timestamp bucket would get the same
+        # name: create the file exclusively and add a counter on a clash, so a
+        # store never overwrites (or hands out the path of) another one.
+        n = 0
+        while True:
+            suffix = f"_{n}" if n else ""
+            path = kind_dir / f"{source}{tick_part}_{ts}{suffix}{ext}"
 
-        # Defense-in-depth: verify resolved path stays under base directory
-        resolved = path.resolve()
-        base_resolved = self._base.resolve()
-        if not str(resolved).startswith(str(base_resolved)):
-            raise PathTraversalError(
-                f"Resolved path {resolved} escapes base directory {base_resolved}"
-            )
-
-        path.write_bytes(data)
-        return resolved
+            # Defense-in-depth: verify resolved path stays under base directory
+            # (a path test, not a string-prefix test: '<base>_evil' is outside).
+            resolved = path.resolve()
+            if not resolved.is_relative_to(base_resolved):
+                raise PathTraversalError(
+                    f"Resolved path {resolved} escapes base directory {base_resolved}"
+                )
+            try:
+                with open(resolved, "xb") as fh:
+                    fh.write(data)
+            except FileExistsError:
+                n += 1
+                continue
+            return resolved
 
     def load(self, path: str | Path) -> bytes:
         """Read raw bytes from a previously stored file."""

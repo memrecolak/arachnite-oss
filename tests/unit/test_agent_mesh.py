@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
 import sys
+from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
@@ -10,8 +12,9 @@ import pytest
 from arachnite.distributed.agent_node import AgentNode, _build_transport
 from arachnite.distributed.manifest import DeploymentManifest
 from arachnite.distributed.mesh import MeshRuntime
+from arachnite.exceptions import TransportConnectionError
 from arachnite.health import HealthMonitor
-from arachnite.models import NodeState
+from arachnite.models import NodeState, Signal
 from arachnite.transport.local import LocalTransport
 
 # ── Shared manifest fixtures ──────────────────────────────────────────────────
@@ -369,3 +372,107 @@ class TestBuildTransport:
         monkeypatch.setitem(sys.modules, "arachnite.transport.redis", mock_mod)
         result = _build_transport("redis", "a1", {})
         assert result is mock_transport
+
+
+# ── Review 6 (distributed): mesh wiring, partial starts, mesh health ─────────
+
+_R6_TWO = {"agents": [
+    {"id": "A", "tick_rate_hz": 50.0, "nodes": {"sense": ["tests.conftest.R6TempSense"]}},
+    {"id": "B", "tick_rate_hz": 50.0, "nodes": {"instinct": ["tests.conftest.R6SignalRecorder"]}},
+]}
+
+
+class _R6FlakyTransport(LocalTransport):
+    """Fails its first connect() (a broker that is briefly unreachable)."""
+
+    def __init__(self, agent_node_id: str) -> None:
+        super().__init__(agent_node_id=agent_node_id)
+        self.failures = 1
+
+    async def connect(self) -> None:
+        if self.failures:
+            self.failures -= 1
+            raise TransportConnectionError("Flaky", "broker unreachable")
+        await super().connect()
+
+
+class TestR6MeshRuntime:
+    """R6-F12-07/16/11: local agents connected, clean partial starts, mesh health."""
+
+    async def test_local_agents_of_a_mesh_exchange_signals(self) -> None:
+        """R6-F12-07: 'transport: local' agents of one MeshRuntime share a transport"""
+        mesh = MeshRuntime(DeploymentManifest.from_dict(_R6_TWO))
+        got: list[Signal] = []
+
+        async def collect(signal: Signal) -> None:
+            got.append(signal)
+
+        await mesh.start()
+        try:
+            mesh.agent("B").runtime.bus.subscribe("cross", collect)
+            await asyncio.sleep(0.01)
+            await mesh.agent("A").runtime.bus.publish(Signal(
+                source="A", kind="cross", value=1, confidence=1.0, timestamp=0.0))
+        finally:
+            await mesh.stop()
+        assert [s.value for s in got] == [1]
+
+    async def test_failed_start_stops_the_agents_it_started(self) -> None:
+        """R6-F12-16: a partial start leaves nothing running; a retry starts cleanly"""
+        flaky = _R6FlakyTransport("B")
+        mesh = MeshRuntime(DeploymentManifest.from_dict(_R6_TWO), transports={"B": flaky})
+        with pytest.raises(TransportConnectionError):
+            await mesh.start()
+        await asyncio.sleep(0.05)
+        assert not mesh.started
+        assert [aid for aid, a in mesh.agents.items() if a.is_running] == []
+        await mesh.start()                     # retry after the broker recovers
+        assert mesh.started and mesh.agent("A").is_running
+        await mesh.stop()
+        assert not mesh.agent("A").is_running
+
+    async def test_partial_start_does_not_orphan_running_agents(self) -> None:
+        """R6-F12-16: agents of the failed attempt are stopped, not left running"""
+        flaky = _R6FlakyTransport("B")
+        mesh = MeshRuntime(DeploymentManifest.from_dict(_R6_TWO), transports={"B": flaky})
+        built: list[AgentNode] = []
+        real_from_manifest = AgentNode.from_manifest
+
+        def spy(*args: Any, **kwargs: Any) -> AgentNode:
+            agent = real_from_manifest(*args, **kwargs)
+            built.append(agent)
+            return agent
+
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(AgentNode, "from_manifest", staticmethod(spy))
+            with pytest.raises(TransportConnectionError):
+                await mesh.start()
+            first_generation = list(built)
+            await mesh.start()
+            await mesh.stop()
+        await asyncio.sleep(0.05)
+        assert first_generation
+        assert [a.node_id for a in first_generation if a.is_running] == []
+
+    async def test_remote_node_fault_updates_mesh_health(self, fake_nats_server: Any) -> None:
+        """R6-F12-11: a fault on agent A shows up in agent B's mesh health view"""
+        manifest = DeploymentManifest.from_dict({"agents": [
+            {"id": "A", "transport": "nats", "nodes": {"sense": ["tests.conftest.R6TempSense"]}},
+            {"id": "B", "transport": "nats",
+             "nodes": {"instinct": ["tests.conftest.R6SignalRecorder"]}},
+        ]})
+        mesh = MeshRuntime(manifest)
+        await mesh.start()
+        try:
+            a, b = mesh.agent("A"), mesh.agent("B")
+            assert b.health.mesh_healthy()
+            sv = a.runtime._supervisors[0]
+            await sv.on_fault("r6.temp", RuntimeError("i2c bus hung"))
+            await asyncio.sleep(0.01)
+            remote = {k: dict(v) for k, v in b.health.remote_states().items()}
+            healthy = b.health.mesh_healthy()
+            await sv.cancel_restart_tasks()
+        finally:
+            await mesh.stop()
+        assert remote["A"]["r6.temp"] in (NodeState.FAULTED, NodeState.RESTARTING)
+        assert healthy is False

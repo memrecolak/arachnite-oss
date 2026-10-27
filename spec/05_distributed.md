@@ -6,7 +6,7 @@ Arachnite supports deployment across multiple physical devices and cloud environ
 
 The core principle is that the Transport layer sits beneath the SignalBus\. Every node continues to call bus\.publish\(\) and bus\.subscribe\(\) exactly as before\. The transport handles serialisation and delivery, whether that means an in\-process queue or an MQTT broker on the other side of a WiFi link\.
 
-> **How the bridge works:** `SignalBus(transport=transport, agent_node_id=…)` attaches a transport\. `publish()` then dispatches to local subscribers **and** forwards the signal to the transport; signals arriving from the transport are dispatched to local subscribers\. Nodes keep calling `publish()`/`subscribe()` unchanged\. After the transport is connected, the bus must subscribe its inbound handler for each locally\-subscribed kind — call `await bus.start_transport()` once; `AgentNode.start()` does this automatically\. Loop/echo prevention: each forwarded signal is tagged with its originating `agent_node_id`, and the inbound handler drops messages that originated from this same agent \(so a broker echo, or a shared `LocalTransport`, never double\-delivers\)\. Note: every published signal is currently forwarded to the transport regardless of whether a remote agent has subscribed to that kind — the publish\-side "transmit only subscribed kinds" filtering \(spec §11\) is not yet implemented\.
+> **How the bridge works:** `SignalBus(transport=transport, agent_node_id=…)` attaches a transport\. `publish()` then dispatches to local subscribers **and** forwards the signal to the transport; signals arriving from the transport are dispatched to local subscribers\. Nodes keep calling `publish()`/`subscribe()` unchanged\. After the transport is connected, the bus must subscribe its inbound handler for each locally\-subscribed kind — call `await bus.start_transport()` once; `AgentNode.start()` does this automatically\. Loop/echo prevention: each forwarded signal is tagged with its originating `agent_node_id`, and the inbound handler drops messages that originated from this same agent \(so a broker echo, or a shared `LocalTransport`, never double\-delivers\)\. The bus's `agent_node_id` defaults to the transport's `agent_node_id`, so it must be unique per AgentNode across the mesh \(two buses with the same id drop each other's signals as echoes\)\. Transport interest follows local interest: a kind's inbound handler is subscribed on the transport while the kind has a local subscriber and withdrawn when the last one unsubscribes; when `'*'` is wanted only `'*'` is subscribed, so each remote signal arrives once; a transport subscription that fails is logged and retried with backoff\. `AgentNode.stop()` calls `bus.stop_transport()`, which withdraws the bus's subscriptions \(a transport shared with other buses stops delivering to it\)\. Remote signals also reach the receiving agent's **tick**: see §10\.5\. Note: every published signal is currently forwarded to the transport regardless of whether a remote agent has subscribed to that kind — the publish\-side "transmit only subscribed kinds" filtering \(spec §11\) is not yet implemented\.
 
 ## __10\.1 Deployment Patterns__
 
@@ -185,15 +185,27 @@ Arachnite enforces this at startup via the co\-location validator\. When a Deplo
 
 \#
 
-\# Normal InstinctNodes have no co\-location constraint —
+\# Normal InstinctNodes have no co\-location constraint on their
 
-\# their proposals travel over the bus to any AgentNode\.
+\# inputs — remote signals enter their ctx\.signals \(§10\.5\)\. Their
 
-The constraint covers the reflex's **inputs** as well, but the validator checks only the reflex → action edge\. A reflex in the tick's reflex stage sees ``ctx\.signals``, which hold the signals returned by the **local** SenseMasterNode \(plus buffered supervisor, node\_fault and state\_update signals\); a sense signal arriving from another AgentNode over the transport never enters ``ctx\.signals``, so a reflex fed only by a remote sensor never fires\. In ``reflex\_mode='event'`` the reflex lane subscribes on the bus and would also receive transport\-delivered signals, but then network latency is on the reflex path\. The SenseNodes that feed a reflex MUST therefore be assigned to the reflex's AgentNode — a deployment rule the manifest author is responsible for\.
+\# proposals, like every proposal, are dispatched to the LOCAL
+
+\# ActionMasterNode, so the action a proposal names must be on the
+
+\# same AgentNode as the instinct \(proposals do not cross the bus\)\.
+
+The validator matches node **ids**: a reflex's ``action\_id`` is compared with each action's ``node\_id`` \(the class attribute, which is what ``Proposal\.action\_id`` must equal\), never with its class name; the duplicate check uses node\_ids too\. Validation runs when the manifest is loaded \(``from\_dict``/``from\_yaml``\) and again in ``AgentNode\.from\_manifest`` and ``MeshRuntime\.start``, so a violating manifest never starts\.
+
+The constraint covers the reflex's **inputs** as well, but the validator checks only the reflex → action edge\. A reflex in the tick's reflex stage sees ``ctx\.signals``; a sense signal from another AgentNode enters them only at the receiving agent's **next** tick \(§10\.5\), after crossing the network\. In ``reflex\_mode='event'`` the reflex lane subscribes on the bus and also receives transport\-delivered signals, but then network latency is on the reflex path\. The SenseNodes that feed a reflex MUST therefore be assigned to the reflex's AgentNode — a deployment rule the manifest author is responsible for\.
 
 ## __10\.5 Signal Routing__
 
-When a signal is published on one AgentNode, the transport delivers it to all AgentNodes that have a subscriber for that signal kind\. Each AgentNode filters signals and delivers only those relevant to its own nodes\. Signal serialisation uses msgpack by default for compact binary encoding; JSON is available as a fallback for debuggability\.
+When a signal is published on one AgentNode, the transport delivers it to all AgentNodes that have a subscriber for that signal kind\. Each AgentNode filters signals and delivers only those relevant to its own nodes\. Signal serialisation uses msgpack by default for compact binary encoding; JSON is available as a fallback for debuggability\. Dicts with int/float keys \(in the value or the metadata\) round\-trip; msgpack's str\-only key default is not used on decode\.
+
+__Wildcard and delivery semantics \(every transport\)\.__ Kind ``'*'`` receives every signal: MQTT subscribes ``{topic\_prefix}#``, NATS ``{subject\_prefix}\.>`` \(kinds containing dots included\), Redis ``PSUBSCRIBE {channel\_prefix}:\*``\. A callback subscribed under both a kind and ``'*'`` is called **once** per signal, and a raising callback is logged without stopping delivery to the others — on ``LocalTransport`` too, which also iterates a snapshot so a callback that unsubscribes itself does not make the next one be skipped\.
+
+__Remote signals in the receiving agent's tick\.__ ``AgentNode`` attaches a remote listener to its bus \(``SignalBus\.add\_remote\_listener``\); while one is attached the bus subscribes ``'*'`` on the transport, so every kind any peer publishes is received\. Each signal that arrives from another AgentNode \(never a local one — the listener only sees transport\-delivered signals that pass echo suppression\) is handed to ``ArachniteRuntime\.inject\_remote\_signal`` and drained into the **next** tick's ``ctx\.signals``, after the local sense output\. The buffer holds 1024 signals; when more arrive between two ticks the oldest are dropped with a warning at the tick\. ``supervisor``/``node\_fault`` signals are not injected a second time \(the runtime's own bus subscriptions already buffer them, local or remote\), and a remote ``state\_update`` is never applied: ``ctx\.state`` is per agent, so a peer's ``StateUpdateSignal`` reaches bus subscribers but does not write this agent's state\. Event\-lane reflexes see remote signals through their bus subscription as before\. Restrict what a peer sends with its ``wire\_kinds`` egress allowlist \(below\)\. A bus built by hand gets the same behaviour with ``bus\.add\_remote\_listener\(runtime\.inject\_remote\_signal\)``\.
 
 \# Signal envelope on the wire \(msgpack\-encoded\):
 
@@ -213,11 +225,19 @@ When a signal is published on one AgentNode, the transport delivers it to all Ag
 
         'confidence': 0\.97,
 
-        'timestamp':  1234567\.89
+        'timestamp':  1234567\.89,
+
+        'metadata':   \{\.\.\.\},
+
+        'type': 'NodeFaultSignal',  \# optional: Signal subclass, see below
+
+        'ext':  \{\.\.\.\}             \# optional: that subclass's fields
 
     \}
 
 \}
+
+``type``/``ext`` carry the fields of ``SupervisorSignal`` \(node\_id, previous/current state, restart\_count\), ``NodeFaultSignal`` \(those plus error\_type/error\_message; the exception object itself does not cross\) and ``StateUpdateSignal`` \(key, codec\-encoded state\_value, delete\), so the receiver rebuilds the same subclass\. A user subclass travels as its nearest framework ancestor \(or as a plain ``Signal``\)\. Decoders that predate these keys ignore them\.
 
 ### __Keeping Signal Kinds Local \(Egress Allowlist\)__
 
@@ -259,7 +279,7 @@ __Recommended\.__ In privacy\- or bandwidth\-sensitive deployments, prefer an ex
 
 ## __10\.6 Distributed Supervisor Health__
 
-SupervisorSignals flow over the transport like any other signal\. This means a NodeFaultReflex on one AgentNode can react to a node failure on a different AgentNode\. The HealthMonitor on each AgentNode receives RemoteNodeState updates from other agents via the bus and maintains a mesh\-wide health picture\.
+SupervisorSignals flow over the transport like any other signal\. This means a NodeFaultReflex on one AgentNode can react to a node failure on a different AgentNode\. The HealthMonitor on each AgentNode receives RemoteNodeState updates from other agents via the bus and maintains a mesh\-wide health picture: ``AgentNode``'s remote listener \(§10\.5\) calls ``HealthMonitor\.update\_remote\(\)`` for every remote ``SupervisorSignal``/``NodeFaultSignal``, keyed by the originating agent \(``metadata\['\_\_origin\_agent\_\_'\]``\) and the signal's ``node\_id``/``current\_state``\.
 
 @dataclass
 
@@ -307,9 +327,11 @@ mesh:
 
   transport\_default: mqtt          \# used if agent doesn't specify
 
-  mqtt\_broker: '192\.168\.1\.10:1883'
+  mqtt\_broker: '192\.168\.1\.10:1883' \# default broker for mqtt agents \('host' or 'host:port'\)
 
-  nats\_server: 'nats://cloud\.example\.com:4222'
+  nats\_server: 'nats://cloud\.example\.com:4222'   \# default servers for nats agents
+
+  redis\_url: 'redis://cache\.local:6379'         \# default url for redis agents
 
 agents:
 
@@ -415,25 +437,47 @@ agents:
 
         \- LogActionNode
 
+Per agent, ``transport\_config`` overrides the mesh defaults and accepts exactly these keys \(any other key is a ``ManifestValidationError``; values may use ``$\{VAR\}`` interpolation\):
+
+\- ``mqtt``: broker\_host, broker\_port, topic\_prefix, qos, username, password, tls, reconnect\_interval\_s, max\_reconnect\_attempts
+
+\- ``nats``: servers, subject\_prefix, reconnect\_interval\_s, max\_reconnect\_attempts
+
+\- ``redis``: url, channel\_prefix, db, password, reconnect\_interval\_s, max\_reconnect\_attempts
+
+\- ``local``: none \(the section is ignored\)
+
 ## __11\.2 Loading and Validating a Manifest__
 
 from arachnite\.distributed import DeploymentManifest, MeshRuntime
 
 manifest = DeploymentManifest\.from\_yaml\('arachnite\-manifest\.yaml'\)
 
-\# Validates:
+\# Loading validates \(and raises ManifestValidationError\); validate\(\) runs
+
+\# again in AgentNode\.from\_manifest\(\) and MeshRuntime\.start\(\):
 
 \#   \- all referenced node classes are importable
 
+\#   \- node sections are sense/instinct/decision/action, and each class
+
+\#     extends its section's base class
+
 \#   \- every reflex node declares its target action\_id and is co\-located
 
-\#     with that action node \(the sense nodes feeding it are not checked\)
+\#     with the action whose node\_id it names \(the sense nodes feeding
+
+\#     it are not checked\)
 
 \#   \- no duplicate node\_ids within an AgentNode
 
-\#   \- transport configs are complete
+\#   \- declared permissions are within each node's whitelist \(§11\.3\.1\)
 
-manifest\.validate\(\)   \# raises ManifestValidationError on failure
+\#   \- transport kinds are known and transport\_config keys are valid;
+
+\#     on\_transport\_fault \(not implemented, §11\.6\) is rejected
+
+manifest\.validate\(\)   \# explicit re\-check, e\.g\. after building one by hand
 
 \# Build and start the full mesh \(runs on a coordinator machine\)
 
@@ -443,7 +487,7 @@ await mesh\.start\(\)    \# starts each AgentNode in its own process/thread
 
 \# Or start just one AgentNode on the current machine:
 
-agent = manifest\.build\_agent\('pi\-body'\)
+agent = AgentNode\.from\_manifest\(manifest, 'pi\-body'\)
 
 await agent\.start\(\)
 
@@ -464,6 +508,10 @@ class NodeAssignment:
     is\_reflex: bool = False
 
     reflex\_action\_id: str | None = None  \# manifest action\_id of a reflex node
+
+    @property
+
+    def node\_id\(self\) \-> str: \.\.\.     \# node\_class\.node\_id \(not the class name\)
 
 ### __11\.3\.1 Permission Whitelist__
 
@@ -498,7 +546,7 @@ __Programmatic path:__ `ArachniteRuntime\(allowed\_permissions=\{"NodeId": \{Per
 
 ## __11\.4 MeshRuntime__
 
-MeshRuntime coordinates a multi\-agent deployment from a single entry point\. It reads the manifest, builds all AgentNodes, and either starts them as subprocesses \(for deployment on one machine with multiple logical agents\) or connects them over the transport layer when they run on physically separate devices\.
+MeshRuntime coordinates a multi\-agent deployment from a single entry point\. It reads the manifest, builds all AgentNodes, and starts them in the current process as asyncio tasks; agents meant for other devices are started there independently \(``AgentNode\.from\_manifest``\) and meet over the transport layer\.
 
 class MeshRuntime:
 
@@ -506,7 +554,15 @@ class MeshRuntime:
 
     async def start\(self\) \-> None:
 
-        """Start all AgentNodes defined in the manifest\.
+        """Validate the manifest, then start all AgentNodes in it\.
+
+        Agents with transport 'local' \(and no override\) share one
+
+        in\-process LocalTransport, so they exchange signals\. If any
+
+        agent fails to start, every agent of the attempt is stopped
+
+        and the first error is raised \(a retry starts clean\)\.
 
         Local agents start as asyncio tasks\.
 
@@ -626,11 +682,11 @@ agents:
 
 ## __11\.6 Network Failure Handling__
 
-When a transport loses connectivity, the affected AgentNode cannot receive signals from the mesh\. The NodeSupervisor detects this as a transport fault and transitions the transport to FAULTED state\. A TransportFaultReflex — a built\-in optional reflex — can be configured to trigger a safe\-mode action when the connection drops, ensuring the edge device does not continue operating on stale data\.
+When a transport loses connectivity, the affected AgentNode cannot receive signals from the mesh\. Transports are **not** supervised: no NodeSupervisor tracks a transport, and there is no built\-in TransportFaultReflex\. An edge device that must not keep operating on stale remote data needs a node of its own for that \(e\.g\. an instinct that watches the age of the last remote signal in ``ctx\.signals``\)\. The ``on\_transport\_fault`` manifest key that earlier drafts described is rejected by ``validate\(\)`` rather than silently ignored\.
 
-__Reconnect vs\. intentional disconnect\.__ MQTTTransport and RedisTransport maintain automatic reconnection on connection loss\. An internal `\_stopped` flag distinguishes intentional disconnects \(via `disconnect\(\)`\) from unexpected connection loss\. When `disconnect\(\)` is called, the flag is set so that any in\-flight or pending reconnection attempt exits immediately instead of re\-establishing the connection\. `connect\(\)` clears the flag\.
+__Reconnect vs\. intentional disconnect\.__ MQTTTransport and RedisTransport maintain automatic reconnection on connection loss\. An internal `\_stopped` flag distinguishes intentional disconnects \(via `disconnect\(\)`\) from unexpected connection loss\. When `disconnect\(\)` is called, the flag is set and a pending or running reconnect task is cancelled, so the transport stays down; a (re)connect attempt re\-checks the flag before each try\. `connect\(\)` clears the flag\. `connect\(\)` itself retries up to `max\_reconnect\_attempts` times, `reconnect\_interval\_s` apart, then raises `TransportConnectionError`; RedisTransport verifies the server with a `PING` \(``from\_url\(\)`` is lazy\)\. NATSTransport relies on nats\-py's own reconnect; after a `disconnect\(\)`/`connect\(\)` cycle it subscribes every registered kind again on the new connection\.
 
-\# Built\-in reflex for transport loss \(opt\-in via manifest\):
+\# NOT SUPPORTED — rejected by validate\(\) \(kept to document the key\):
 
 agents:
 

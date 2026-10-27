@@ -151,3 +151,23 @@ def test_public_api_exported_from_root() -> None:
     assert "parse_tool_calls" in arachnite.__all__
     assert "render_tool_schemas" in arachnite.__all__
     assert "ParsedToolCall" in arachnite.__all__
+
+
+# ── Review 6: the never-raises contract ───────────────────────────────────────
+
+class TestR6ToolCodecNeverRaises:
+    """R6-F12-17: malformed model text yields no call instead of raising or a bad name."""
+
+    def test_deeply_nested_arguments_do_not_raise(self) -> None:
+        """R6-F12-17: RecursionError from json.loads is treated as malformed input"""
+        depth = 200_000   # above the parser's nesting limit on 3.10-3.14
+        deep = '{"name":"x","arguments":{"a":' + "[" * depth + "]" * depth + "}}"
+        assert parse_tool_calls(deep) == []
+        assert parse_tool_calls("<tool_call>" + deep + "</tool_call>") == []
+
+    def test_non_string_name_is_not_a_call(self) -> None:
+        """R6-F12-17: a dict/int 'name' is rejected, so ParsedToolCall.name is always str"""
+        assert parse_tool_calls('{"name": {"$ne": null}, "arguments": {}}') == []
+        assert parse_tool_calls('<tool_call>{"name": 7, "arguments": {}}</tool_call>') == []
+        calls = parse_tool_calls('{"name": "ok", "arguments": {}}')
+        assert [c.name for c in calls] == ["ok"]

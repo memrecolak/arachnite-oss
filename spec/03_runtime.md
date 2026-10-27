@@ -184,7 +184,13 @@ async def tick\(self\) \-> None:
 
     \#    actions that finished since the previous tick \(completion order\)\.
 
-    buffered = self\.\_supervisor\_signal\_buffer \+ self\.\_state\_update\_buffer
+    \#    Signals from other AgentNodes \(inject\_remote\_signal, spec §10\.5\)
+
+    \#    come first, right after the local sense output\.
+
+    buffered = \(self\.\_remote\_signal\_buffer \+ self\.\_supervisor\_signal\_buffer
+
+                \+ self\.\_state\_update\_buffer\)
 
     completed = self\.\_action\_master\.drain\_completed\(\)
 

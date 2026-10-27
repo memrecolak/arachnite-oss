@@ -199,10 +199,14 @@ def parse_tool_calls(content: str | None) -> list[ParsedToolCall]:
 
 
 def _loads(blob: str) -> Any:
-    """``json.loads`` that returns ``None`` instead of raising on malformed input."""
+    """``json.loads`` that returns ``None`` instead of raising on malformed input.
+
+    RecursionError counts as malformed: deeply nested model output (or an
+    echoed, prompt-injected tool result) must not escape the codec.
+    """
     try:
         return json.loads(blob)
-    except ValueError:
+    except (ValueError, RecursionError):
         return None
 
 
@@ -279,6 +283,6 @@ def _call_from_dict(parsed: dict[str, Any], *, source: ToolCallSource) -> Parsed
         args = parsed.get("args", {})
     if isinstance(args, str):
         args = _loads(args)
-    if not name or not isinstance(args, dict):
+    if not isinstance(name, str) or not name or not isinstance(args, dict):
         return None
     return ParsedToolCall(name=name, arguments=args, source=source)

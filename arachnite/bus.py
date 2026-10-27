@@ -15,6 +15,7 @@ from itertools import chain
 from typing import TYPE_CHECKING
 
 from arachnite.exceptions import SignalBusError
+from arachnite.logging import StructuredLogger
 from arachnite.models import Signal
 
 if TYPE_CHECKING:
@@ -22,12 +23,19 @@ if TYPE_CHECKING:
 
 Callback = Callable[[Signal], Awaitable[None]]
 
+#: Synchronous observer of signals delivered from the transport (remote ones).
+RemoteListener = Callable[[Signal], None]
+
 # Metadata key stamped on a signal when it is forwarded to the transport, so
 # that the publisher can recognise and drop its own message when a broker (or a
 # shared LocalTransport) echoes it back. The networked transports also set this
 # on decode (see BaseTransport._decode_signal); setdefault keeps whichever value
 # was assigned first, so the originating agent id is preserved end to end.
 ORIGIN_AGENT_KEY = "__origin_agent__"
+
+# First and maximum delay between retries of a failed transport subscription.
+_TRANSPORT_RETRY_S = 1.0
+_TRANSPORT_RETRY_MAX_S = 30.0
 
 
 class SignalBus:
@@ -52,9 +60,19 @@ class SignalBus:
       from the transport are dispatched to local subscribers — so nodes keep
       calling publish()/subscribe() exactly as before. ``transport=None`` (the
       default) is a pure in-process bus with no behaviour change.
+    - ``agent_node_id`` defaults to the transport's ``agent_node_id`` (or
+      ``"local"`` without a transport). It is the echo-suppression key, so it
+      must be unique per AgentNode across the mesh.
     - After the transport is connected, call ``await bus.start_transport()``
       once so the bus subscribes its inbound handler for every kind that has a
-      local subscriber. ``AgentNode.start()`` does this automatically.
+      local subscriber. ``AgentNode.start()`` does this automatically, and
+      ``AgentNode.stop()`` calls ``stop_transport()``.
+    - Transport interest follows local interest: a kind's inbound handler is
+      subscribed on the transport while the kind has a local subscriber (or
+      when a remote listener is attached, see ``add_remote_listener``), and
+      withdrawn when the last one unsubscribes. When '*' is wanted, only '*'
+      is subscribed on the transport, so each remote signal arrives once. A
+      transport subscription that fails is logged and retried with backoff.
 
     Egress allowlist (``wire_kinds``):
     - By default a transport-bridged bus forwards *every* published kind to the
@@ -70,7 +88,7 @@ class SignalBus:
     def __init__(
         self,
         transport: BaseTransport | None = None,
-        agent_node_id: str = "local",
+        agent_node_id: str | None = None,
         wire_kinds: set[str] | None = None,
     ) -> None:
         # kind -> list of callbacks
@@ -79,10 +97,19 @@ class SignalBus:
 
         # Transport bridge (spec §10). When None this bus is purely in-process.
         self._transport = transport
+        if agent_node_id is None:
+            # Default to the transport's id: a shared literal default would make
+            # every peer's signals look like this bus's own echo.
+            agent_node_id = transport.agent_node_id if transport is not None else "local"
         self._agent_node_id = agent_node_id
         self._transport_kinds: set[str] = set()    # kinds we want from the wire
         self._transport_active: set[str] = set()   # kinds subscribed on transport
         self._transport_started = False
+        self._remote_listeners: list[RemoteListener] = []
+        self._transport_lock = asyncio.Lock()
+        self._sync_task: asyncio.Task[None] | None = None
+        self._sync_wakeup = asyncio.Event()
+        self._logger = StructuredLogger(node_id="SignalBus", agent_node_id=agent_node_id)
 
         # Egress allowlist. None => forward every kind (back-compat default);
         # a set => only these kinds (or '*') may egress to the transport.
@@ -106,24 +133,27 @@ class SignalBus:
         # Mirror the interest onto the transport so remote signals of this kind
         # are delivered here. Registration is async; if the transport is already
         # started we schedule it, otherwise start_transport() flushes it later.
-        if self._transport is not None and kind not in self._transport_kinds:
+        if self._transport is not None:
             self._transport_kinds.add(kind)
-            if self._transport_started:
-                with contextlib.suppress(RuntimeError):
-                    asyncio.get_running_loop().create_task(
-                        self._activate_transport_kind(kind)
-                    )
+            self._schedule_transport_sync()
 
     def unsubscribe(self, kind: str, callback: Callback) -> None:
         """Remove a previously registered callback."""
         with contextlib.suppress(ValueError):
             self._subscribers[kind].remove(callback)
         self._subscriber_set[kind].discard(callback)
+        if self._transport is not None and not self._subscribers[kind]:
+            # Last local subscriber gone: withdraw the transport interest too.
+            self._transport_kinds.discard(kind)
+            self._schedule_transport_sync()
 
     def clear(self) -> None:
         """Remove all subscribers. Useful between test cases."""
         self._subscribers.clear()
         self._subscriber_set.clear()
+        if self._transport is not None:
+            self._transport_kinds.clear()
+            self._schedule_transport_sync()
 
     # ── Publishing ────────────────────────────────────────────────────────────
 
@@ -210,20 +240,146 @@ class SignalBus:
         Subscribe the bus's inbound handler on the transport for every kind that
         currently has a local subscriber. Call once after the transport is
         connected (AgentNode.start() does this). Idempotent and a no-op when no
-        transport is attached.
+        transport is attached. A subscription the transport refuses is logged
+        and retried in the background.
         """
         if self._transport is None:
             return
         self._transport_started = True
-        for kind in list(self._transport_kinds):
-            await self._activate_transport_kind(kind)
+        if await self._sync_transport():
+            self._schedule_transport_sync(force=True)
 
-    async def _activate_transport_kind(self, kind: str) -> None:
-        """Subscribe the inbound handler for one kind on the transport (once)."""
-        if self._transport is None or kind in self._transport_active:
+    async def stop_transport(self) -> None:
+        """
+        Withdraw every transport subscription of this bus and stop retrying.
+
+        Call before disconnecting the transport (``AgentNode.stop()`` does), so
+        a transport shared with other buses stops delivering to this one. A
+        later ``start_transport()`` subscribes again. No-op without a transport.
+        """
+        if self._transport is None:
             return
+        self._transport_started = False
+        task, self._sync_task = self._sync_task, None
+        if task is not None and task is not asyncio.current_task() and not task.done():
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+        async with self._transport_lock:
+            for kind in sorted(self._transport_active):
+                with contextlib.suppress(Exception):
+                    await self._transport.unsubscribe(kind, self._on_transport_signal)
+            self._transport_active.clear()
+
+    def add_remote_listener(self, listener: RemoteListener) -> None:
+        """
+        Observe every signal that arrives from another AgentNode.
+
+        ``listener`` is called synchronously for each transport-delivered
+        signal that passes echo suppression (never for a local publish), in
+        addition to the normal dispatch to local subscribers. While a listener
+        is attached the bus subscribes '*' on the transport, so every kind any
+        peer publishes is received. ``AgentNode`` uses this to feed remote
+        signals into its runtime's next tick and its mesh health view.
+        """
+        if listener not in self._remote_listeners:
+            self._remote_listeners.append(listener)
+        if self._transport is not None:
+            self._schedule_transport_sync()
+
+    def remove_remote_listener(self, listener: RemoteListener) -> None:
+        """Detach a listener added with ``add_remote_listener``."""
+        with contextlib.suppress(ValueError):
+            self._remote_listeners.remove(listener)
+        if self._transport is not None:
+            self._schedule_transport_sync()
+
+    def is_remote(self, signal: Signal) -> bool:
+        """True if ``signal`` was published by another AgentNode's bus."""
+        origin = signal.metadata.get(ORIGIN_AGENT_KEY)
+        return origin is not None and origin != self._agent_node_id
+
+    def _transport_interest(self) -> set[str]:
+        interest = set(self._transport_kinds)
+        if self._remote_listeners:
+            interest.add("*")
+        return interest
+
+    def _transport_settled(self) -> bool:
+        interest = self._transport_interest()
+        if "*" in interest:
+            return self._transport_active == {"*"}
+        return self._transport_active == interest
+
+    def _schedule_transport_sync(self, force: bool = False) -> None:
+        """Reconcile transport subscriptions in the background, if needed."""
+        if not self._transport_started or (not force and self._transport_settled()):
+            return
+        if self._sync_task is not None and not self._sync_task.done():
+            self._sync_wakeup.set()   # cut a retry backoff short
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return   # no loop: start_transport() reconciles later
+        self._sync_task = loop.create_task(self._sync_loop())
+
+    async def _sync_loop(self) -> None:
+        """Reconcile until settled; a failed subscription is retried with backoff."""
+        delay = _TRANSPORT_RETRY_S
+        while self._transport_started:
+            if not await self._sync_transport():
+                if self._transport_settled():
+                    return
+                continue          # interest changed while we were syncing
+            self._sync_wakeup.clear()
+            with contextlib.suppress(asyncio.TimeoutError):
+                await asyncio.wait_for(self._sync_wakeup.wait(), timeout=delay)
+            delay = min(delay * 2, _TRANSPORT_RETRY_MAX_S)
+
+    async def _sync_transport(self) -> bool:
+        """
+        Bring the transport subscriptions in line with the local interest.
+
+        Returns True if a subscription failed (it stays pending for a retry).
+        With '*' wanted only '*' is subscribed; kind subscriptions are dropped
+        once '*' is active (kept, or added, while it is not, so a failing
+        wildcard does not cut off the kinds that do work).
+        """
+        transport = self._transport
+        if transport is None:
+            return False
+        async with self._transport_lock:
+            failed = False
+            interest = self._transport_interest()
+            if "*" in interest and "*" not in self._transport_active:
+                failed |= not await self._subscribe_kind(transport, "*")
+            if "*" not in self._transport_active:
+                for kind in sorted(interest - self._transport_active - {"*"}):
+                    failed |= not await self._subscribe_kind(transport, kind)
+
+            stale = {k for k in self._transport_active if k not in interest}
+            if "*" in self._transport_active:
+                stale |= self._transport_active - {"*"}
+            for kind in sorted(stale):
+                self._transport_active.discard(kind)
+                with contextlib.suppress(Exception):
+                    await transport.unsubscribe(kind, self._on_transport_signal)
+            return failed
+
+    async def _subscribe_kind(self, transport: BaseTransport, kind: str) -> bool:
+        """Subscribe the inbound handler for one kind; False (logged) on failure."""
+        try:
+            await transport.subscribe(kind, self._on_transport_signal)
+        except Exception as exc:  # noqa: BLE001
+            self._logger.warning(
+                "Transport subscription failed; will retry",
+                kind=kind,
+                error=f"{type(exc).__name__}: {exc}",
+            )
+            return False
         self._transport_active.add(kind)
-        await self._transport.subscribe(kind, self._on_transport_signal)
+        return True
 
     async def _on_transport_signal(self, signal: Signal) -> None:
         """
@@ -231,10 +387,20 @@ class SignalBus:
 
         Drops signals that originated from this same agent (our own publish
         echoed back by the broker or a shared transport). Never forwards back
-        to the transport, so there is no delivery loop.
+        to the transport, so there is no delivery loop. Remote listeners see
+        the signal before the local subscribers do.
         """
         if signal.metadata.get(ORIGIN_AGENT_KEY) == self._agent_node_id:
             return
+        for listener in list(self._remote_listeners):
+            try:
+                listener(signal)
+            except Exception as exc:  # noqa: BLE001
+                self._logger.warning(
+                    "Remote listener raised; ignoring",
+                    kind=signal.kind,
+                    error=f"{type(exc).__name__}: {exc}",
+                )
         await self._dispatch_local(signal)
 
     async def publish_many(self, signals: list[Signal]) -> None:
@@ -255,6 +421,11 @@ class SignalBus:
                 raise outcome
 
     # ── Introspection ─────────────────────────────────────────────────────────
+
+    @property
+    def agent_node_id(self) -> str:
+        """The AgentNode id this bus stamps on (and echo-filters by)."""
+        return self._agent_node_id
 
     def subscriber_count(self, kind: str) -> int:
         """Return the number of subscribers for a given kind."""

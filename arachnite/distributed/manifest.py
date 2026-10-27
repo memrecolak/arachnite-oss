@@ -19,8 +19,11 @@ from typing import Any
 from arachnite.distributed.colocation import validate_colocation
 from arachnite.exceptions import ManifestValidationError
 from arachnite.models import Permission
+from arachnite.nodes.action import BaseActionNode
 from arachnite.nodes.base import BaseNode
-from arachnite.nodes.instinct import BaseReflexInstinctNode
+from arachnite.nodes.decision import BaseDecisionNode
+from arachnite.nodes.instinct import BaseInstinctNode, BaseReflexInstinctNode
+from arachnite.nodes.sense import BaseSenseNode
 
 try:
     import yaml  # type: ignore[import-untyped,unused-ignore]
@@ -34,6 +37,33 @@ _ENV_RE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-([^}]*))?\}")
 _SECRET_PATTERNS = re.compile(
     r"(bearer_|sk-|password\s*=|api.?key\s*=|token\s*=)", re.IGNORECASE
 )
+
+
+# Manifest node sections and the base class every node listed there must extend.
+_SECTION_BASES: dict[str, type[BaseNode]] = {
+    "sense":    BaseSenseNode,
+    "instinct": BaseInstinctNode,
+    "decision": BaseDecisionNode,
+    "action":   BaseActionNode,
+}
+
+# transport_config keys each network transport understands (spec §11.1).
+# A key outside this set is a ManifestValidationError, not silently ignored.
+_TRANSPORT_CONFIG_KEYS: dict[str, frozenset[str]] = {
+    "mqtt": frozenset({
+        "broker_host", "broker_port", "topic_prefix", "qos", "username",
+        "password", "tls", "reconnect_interval_s", "max_reconnect_attempts",
+    }),
+    "nats": frozenset({
+        "servers", "subject_prefix", "reconnect_interval_s",
+        "max_reconnect_attempts",
+    }),
+    "redis": frozenset({
+        "url", "channel_prefix", "db", "password", "reconnect_interval_s",
+        "max_reconnect_attempts",
+    }),
+}
+_TRANSPORT_KINDS = frozenset({"", "local", *_TRANSPORT_CONFIG_KEYS})
 
 
 _SECRET_KEY_PATTERNS = re.compile(
@@ -121,7 +151,15 @@ class NodeAssignment:
 
     @property
     def node_id(self) -> str:
-        return self.node_class.__name__
+        """
+        The id the node registers under: its class's ``node_id`` attribute.
+
+        This is the id a ``Proposal.action_id`` / reflex ``action_id`` must
+        match, so co-location and duplicate checks use it, not the class name
+        (``BaseNode`` defaults ``node_id`` to the class name when unset).
+        """
+        node_id = getattr(self.node_class, "node_id", None)
+        return node_id if isinstance(node_id, str) and node_id else self.node_class.__name__
 
 
 @dataclass
@@ -167,8 +205,9 @@ class DeploymentManifest:
     @classmethod
     def from_yaml(cls, path: str | Path) -> DeploymentManifest:
         """
-        Load and parse a manifest from a YAML file.
-        Resolves environment variable references automatically.
+        Load, parse and validate a manifest from a YAML file.
+        Resolves environment variable references automatically and raises
+        ManifestValidationError for a manifest that fails ``validate()``.
         """
         if not _YAML_AVAILABLE:
             raise ImportError(
@@ -181,7 +220,7 @@ class DeploymentManifest:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> DeploymentManifest:
-        """Load a manifest from a Python dict (useful in tests)."""
+        """Load and validate a manifest from a Python dict (useful in tests)."""
         return cls._parse(data)
 
     @classmethod
@@ -199,7 +238,11 @@ class DeploymentManifest:
             agent_configs.append(ac)
             assignments.extend(cls._parse_assignments(ac))
 
-        return cls(mesh_config, agent_configs, assignments)
+        manifest = cls(mesh_config, agent_configs, assignments)
+        # Enforced at load time (spec §10.4): a manifest that splits a reflex
+        # from its action, or breaks its permission whitelist, never loads.
+        manifest.validate()
+        return manifest
 
     @staticmethod
     def _parse_agent(raw: dict[str, Any], mesh: dict[str, Any]) -> AgentNodeConfig:
@@ -279,13 +322,33 @@ class DeploymentManifest:
         """
         Validate the manifest. Raises ManifestValidationError on failure.
 
-        Checks:
-        - All referenced node classes are importable.
-        - Every reflex node is co-located with its target action node.
+        Runs automatically when a manifest is loaded (``from_dict`` /
+        ``from_yaml``) and again in ``AgentNode.from_manifest`` and
+        ``MeshRuntime.start``. Checks:
+        - Node sections are sense/instinct/decision/action, and each listed
+          class extends that section's base class.
         - No duplicate node_ids within an AgentNode.
-        - Required transport configs are present.
+        - Every node's declared permissions are within its manifest whitelist.
+        - Transport kinds are known and transport_config holds only keys the
+          transport understands; ``on_transport_fault`` (not implemented) is
+          rejected rather than silently ignored.
+        - Every reflex node is co-located with its target action node (by
+          node_id, the id its proposals target).
         """
         errors: list[str] = []
+
+        for agent_id, ac in self._agent_configs.items():
+            errors.extend(_section_errors(agent_id, ac))
+            errors.extend(_transport_errors(agent_id, ac, self._mesh_config))
+
+        for a in self._assignments:
+            base = _SECTION_BASES.get(a.node_section)
+            if base is not None and not issubclass(a.node_class, base):
+                errors.append(
+                    f"AgentNode '{a.agent_node_id}': node '{a.node_id}' "
+                    f"({a.node_class.__name__}) is listed under '{a.node_section}' "
+                    f"but is not a {base.__name__}."
+                )
 
         # Check for duplicate node_ids within an AgentNode
         for agent_id in self._agent_configs:
@@ -358,6 +421,64 @@ class DeploymentManifest:
             f"agents={list(self._agent_configs)}, "
             f"assignments={len(self._assignments)})"
         )
+
+
+def _section_errors(agent_id: str, ac: AgentNodeConfig) -> list[str]:
+    """Unknown node-section names (a typo would silently drop its nodes)."""
+    if not isinstance(ac.node_sections, dict):
+        return [f"AgentNode '{agent_id}': 'nodes' must be a mapping of sections."]
+    valid = ", ".join(_SECTION_BASES)
+    return [
+        f"AgentNode '{agent_id}': unknown node section '{section}' (valid: {valid})."
+        for section in ac.node_sections
+        if section not in _SECTION_BASES
+    ]
+
+
+def _transport_errors(
+    agent_id: str, ac: AgentNodeConfig, mesh: dict[str, Any],
+) -> list[str]:
+    """Transport kind, transport_config keys, and unsupported options."""
+    errors: list[str] = []
+    if ac.transport not in _TRANSPORT_KINDS:
+        errors.append(
+            f"AgentNode '{agent_id}': unknown transport '{ac.transport}' "
+            "(valid: local, mqtt, nats, redis)."
+        )
+    if not isinstance(ac.transport_config, dict):
+        errors.append(f"AgentNode '{agent_id}': 'transport_config' must be a mapping.")
+    elif ac.transport in _TRANSPORT_CONFIG_KEYS:
+        unknown = sorted(set(ac.transport_config) - _TRANSPORT_CONFIG_KEYS[ac.transport])
+        if unknown:
+            valid = ", ".join(sorted(_TRANSPORT_CONFIG_KEYS[ac.transport]))
+            errors.append(
+                f"AgentNode '{agent_id}': unknown {ac.transport} transport_config "
+                f"key(s) {unknown} (valid: {valid})."
+            )
+    broker = mesh.get("mqtt_broker")
+    if (
+        ac.transport == "mqtt"
+        and broker is not None
+        and _parse_host_port(str(broker), 1883) is None
+    ):
+        errors.append(f"mesh.mqtt_broker '{broker}' is not 'host' or 'host:port'.")
+    if ac.on_transport_fault:
+        errors.append(
+            f"AgentNode '{agent_id}': 'on_transport_fault' is not supported "
+            "(there is no built-in TransportFaultReflex); remove it and handle "
+            "transport loss with a node of your own."
+        )
+    return errors
+
+
+def _parse_host_port(value: str, default_port: int) -> tuple[str, int] | None:
+    """Split 'host' or 'host:port'; None when the port is not a number."""
+    host, sep, port = value.rpartition(":")
+    if not sep:
+        return value, default_port
+    if not host or not port.isdigit():
+        return None
+    return host, int(port)
 
 
 def _import_node_class(kind: str) -> type[BaseNode]:

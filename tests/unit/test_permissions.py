@@ -195,15 +195,14 @@ class TestManifestPermissions:
             "kind": "tests.unit.test_permissions._NetworkSense",
             "permissions": [],
         }
-        m = DeploymentManifest.from_dict({
-            "mesh": {"name": "test", "transport_default": "local"},
-            "agents": [{
-                "id": "agent-1",
-                "nodes": {"sense": [node_def]},
-            }],
-        })
         with pytest.raises(ManifestValidationError, match="network"):
-            m.validate()
+            DeploymentManifest.from_dict({
+                "mesh": {"name": "test", "transport_default": "local"},
+                "agents": [{
+                    "id": "agent-1",
+                    "nodes": {"sense": [node_def]},
+                }],
+            })
 
     def test_validate_passes_when_allowed(self) -> None:
         """Node declares {NETWORK}, manifest allows [network] — passes."""
@@ -336,20 +335,18 @@ class TestManifestPermissionsEdges:
 
     def test_violation_after_unwhitelisted_node_detected(self) -> None:
         """A node without a permissions key does not stop checking later nodes"""
-        manifest = _one_agent_manifest({"sense": [
-            {"kind": "tests.unit.test_permissions._PlainSense"},
-            {"kind": "tests.unit.test_permissions._NetworkSense", "permissions": []},
-        ]})
         with pytest.raises(ManifestValidationError, match="network"):
-            manifest.validate()
+            _one_agent_manifest({"sense": [
+                {"kind": "tests.unit.test_permissions._PlainSense"},
+                {"kind": "tests.unit.test_permissions._NetworkSense", "permissions": []},
+            ]})
 
     def test_violation_message_lists_the_allowed_set(self) -> None:
         """The manifest error names the allowed set, or '(none)' when it is empty"""
         for allowed, shown in ((["network"], "[network]"), ([], "[(none)]")):
-            manifest = _one_agent_manifest({"action": [{
-                "kind": "tests.unit.test_permissions._GpuAction",
-                "permissions": allowed,
-            }]})
             with pytest.raises(ManifestValidationError) as exc_info:
-                manifest.validate()
+                _one_agent_manifest({"action": [{
+                    "kind": "tests.unit.test_permissions._GpuAction",
+                    "permissions": allowed,
+                }]})
             assert f"not in its allowed set {shown}" in str(exc_info.value)

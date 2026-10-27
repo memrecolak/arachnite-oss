@@ -2,6 +2,11 @@
 
 from __future__ import annotations
 
+import os
+import pickle
+from typing import Any
+
+import msgpack  # type: ignore[import-untyped,unused-ignore]
 import pytest
 
 import arachnite.codec as _codec_module
@@ -14,6 +19,7 @@ from arachnite.codec import (
     default_registry,
 )
 from arachnite.exceptions import UnsafeCodecError
+from arachnite.models import Signal
 
 
 class TestMsgpackCodec:
@@ -331,3 +337,119 @@ class TestTransportNetworkSafetyCheck:
         transport = RedisTransport(codec_registry=reg)
         with pytest.raises(UnsafeCodecError, match="PickleCodec"):
             await transport.connect()
+
+
+# ── Review 6 (distributed): codec network safety, numpy fallback, map keys ───
+
+class _R6Collector:
+    def __init__(self) -> None:
+        self.seen: list[Signal] = []
+
+    async def __call__(self, signal: Signal) -> None:
+        self.seen.append(signal)
+
+
+class _R6PwnMarker:
+    """Unpickling this runs exec() — a harmless stand-in for remote code execution."""
+
+    def __reduce__(self) -> tuple[Any, ...]:
+        return (exec, ("import os; os.environ['R6_PWNED'] = '1'",))
+
+
+class TestR6CodecNetworkSafety:
+    """R6-F11: an unsafe codec cannot be slipped in after a network connect()."""
+
+    def test_register_unsafe_codec_after_network_check_raises(self) -> None:
+        """R6-F11: register() re-checks network safety once the registry is bound"""
+        reg = CodecRegistry()
+        reg.check_network_safety("NATSTransport")
+        with pytest.raises(UnsafeCodecError, match="NATSTransport"):
+            reg.register("cmd", PickleCodec())
+        assert not isinstance(reg._get_codec("cmd"), PickleCodec)
+
+    async def test_pickle_registered_after_connect_never_executes(
+        self, fake_nats_server: Any, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """R6-F11: connect(), then register PickleCodec -> refused; a forced one is not decoded"""
+        from arachnite.transport.nats import NATSTransport
+        monkeypatch.delenv("R6_PWNED", raising=False)
+        reg = CodecRegistry()
+        t = NATSTransport(agent_node_id="victim", codec_registry=reg)
+        await t.connect()
+        with pytest.raises(UnsafeCodecError):
+            reg.register("cmd", PickleCodec())
+        # Even a codec forced in behind register()'s back is refused on receive.
+        reg._codecs["cmd"] = PickleCodec()
+        got = _R6Collector()
+        await t.subscribe("cmd", got)
+        envelope = {"v": 1, "src": "attacker", "sig": {
+            "source": "x", "kind": "cmd", "value": pickle.dumps(_R6PwnMarker()),
+            "confidence": 1.0, "timestamp": 0.0, "metadata": {}}}
+        await fake_nats_server.publish("arachnite.cmd", msgpack.packb(envelope, use_bin_type=True))
+        await t.disconnect()
+        assert os.environ.get("R6_PWNED") is None
+        assert got.seen == []
+
+
+class TestR6NumpyCodecFallback:
+    """R6-F12-13: NumpyCodec (default for 'visual') must not corrupt non-array values."""
+
+    @pytest.mark.parametrize("value", [
+        "/var/arachnite_media/visual/cam_1_23.jpg",
+        b"\x89PNG\x00\x00",
+        {"label": "person", "bbox": [1, 2, 3, 4]},
+        [1, 2, 3],
+        7,
+        None,
+    ])
+    def test_non_array_values_roundtrip_unchanged(self, value: Any) -> None:
+        """R6-F12-13: str/bytes/dict/list/scalar/None survive NumpyCodec unchanged"""
+        pytest.importorskip("numpy")
+        reg = default_registry()
+        out = reg.decode("visual", reg.encode("visual", value))
+        assert type(out) is type(value)
+        assert out == value
+
+    def test_decoded_array_is_writeable(self) -> None:
+        """R6-F12-13: a received frame can be edited in place"""
+        np = pytest.importorskip("numpy")
+        codec = NumpyCodec()
+        arr = np.arange(12, dtype=np.uint16).reshape(3, 4)
+        out = codec.decode(codec.encode(arr))
+        assert out.flags.writeable
+        out[0, 0] = 99      # must not raise
+        assert np.array_equal(out[1:], arr[1:]) and out.dtype == arr.dtype
+
+    async def test_media_path_on_visual_crosses_the_wire_as_str(
+        self, fake_nats_server: Any,
+    ) -> None:
+        """R6-F12-13: a MediaStore path published on 'visual' arrives as a usable str"""
+        pytest.importorskip("numpy")
+        from arachnite.bus import SignalBus
+        from arachnite.transport.nats import NATSTransport
+        ta, tb = NATSTransport(agent_node_id="A"), NATSTransport(agent_node_id="B")
+        await ta.connect()
+        await tb.connect()
+        bus_a = SignalBus(transport=ta, agent_node_id="A")
+        bus_b = SignalBus(transport=tb, agent_node_id="B")
+        got = _R6Collector()
+        bus_b.subscribe("visual", got)
+        await bus_a.start_transport()
+        await bus_b.start_transport()
+        path = "/var/arachnite_media/visual/cam_1_23.jpg"
+        await bus_a.publish(Signal(source="Cam", kind="visual", value=path,
+                                   confidence=1.0, timestamp=0.0))
+        await ta.disconnect()
+        await tb.disconnect()
+        assert [s.value for s in got.seen] == [path]
+        assert isinstance(got.seen[0].value, str)
+
+
+class TestR6MsgpackNonStrKeys:
+    """R6-F12-22: dicts with int/float keys encode, so they must decode too."""
+
+    def test_int_and_float_keys_roundtrip(self) -> None:
+        """R6-F12-22: MsgpackCodec round-trips {0: 1.2, 1.5: 'x'}"""
+        codec = MsgpackCodec()
+        value = {0: 1.2, 1.5: "x", "s": [1]}
+        assert codec.decode(codec.encode(value)) == value
