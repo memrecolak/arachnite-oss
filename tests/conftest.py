@@ -263,6 +263,16 @@ class R6TempSense(BaseSenseNode):
                       confidence=1.0, timestamp=time.monotonic())
 
 
+class R7AttrReflex(BaseInstinctNode):
+    """A reflex by attribute only (reflex = True), not by subclassing the reflex base."""
+    node_id  = "r7.attr_reflex"
+    priority = 250
+    reflex   = True
+
+    async def evaluate(self, ctx: Context) -> Proposal | None:
+        return None
+
+
 class R6HotReflex(BaseReflexInstinctNode):
     """Reflex targeting action node_id 'Brake'."""
     node_id  = "r6.hot_reflex"

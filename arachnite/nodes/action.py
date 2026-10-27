@@ -441,6 +441,10 @@ class MultiStepActionNode(BaseActionNode):
         # does not start another, or completed steps would be undone twice.
         self._walk: str | None = None
         self._walk_error: BaseException | None = None
+        # True when a step aborted inside a mandatory block (step timeout,
+        # raise, abort_sequence): unless the rollback walk then undid the
+        # block, the run must not be retried from step 1.
+        self._block_cut: bool = False
         # True while ActionMasterNode runs this action. A WAIT_FOR_BLOCK
         # hand-off then only records the reflex in _handoff_by; the master
         # runs the safe-stop outside the action's timeout and retries.
@@ -456,6 +460,7 @@ class MultiStepActionNode(BaseActionNode):
         self._current_step        = None
         self._walk                = None
         self._walk_error          = None
+        self._block_cut           = False
         self._handoff_by          = None
         self._managed             = True
         self._run_prepared        = True
@@ -476,6 +481,7 @@ class MultiStepActionNode(BaseActionNode):
         self._reflex_preempt_by = None
         self._walk              = None
         self._walk_error        = None
+        self._block_cut         = False
         self._handoff_by        = None
         self._managed           = False
         self._run_prepared      = False
@@ -664,6 +670,7 @@ class MultiStepActionNode(BaseActionNode):
             self._completed_steps     = []
             self._walk                = None
             self._walk_error          = None
+            self._block_cut           = False
             self._managed             = False
             self._handoff_by          = None
             self._cancel_requested    = False
@@ -733,11 +740,13 @@ class MultiStepActionNode(BaseActionNode):
             # mandatory block (check_interrupt() already returns False there),
             # so a contract-violating step cannot bypass MandatoryBlockMonitor.
             if step_result.interrupted:
-                if step.interruptible:
+                if self._policy_allows_stop(step):
                     return await self._handle_interrupt(proposal, pending, start_time)
                 self.logger.warning(
-                    "Ignoring interrupted=True from non-interruptible step",
+                    "Ignoring interrupted=True from a step the policy does not let stop",
                     step=step.name,
+                    interruptible=step.interruptible,
+                    policy=self.interrupt_policy.value,
                 )
 
             # Step requested abort (abort_sequence, step timeout, or raised)
@@ -936,6 +945,25 @@ class MultiStepActionNode(BaseActionNode):
             rolled_back     = rolled_back,
         )
 
+    def _policy_allows_stop(self, step: ActionStep) -> bool:
+        """
+        Whether a step may end the run cooperatively (``interrupted=True``):
+        the same rule as ``check_interrupt()`` — an interruptible step under
+        ALWAYS or ROLLBACK, a checkpoint step under CHECKPOINT, never under
+        NEVER. Anything else is a contract violation and is ignored.
+        """
+        if not step.interruptible:
+            return False
+        if self.interrupt_policy == InterruptPolicy.NEVER:
+            return False
+        if self.interrupt_policy == InterruptPolicy.CHECKPOINT:
+            return step.checkpoint
+        return True
+
+    def block_cut_unrestored(self) -> bool:
+        """True if a step aborted inside a mandatory block and no rollback walk undid it."""
+        return self._block_cut and self._walk != "done"
+
     async def _handle_abort(
         self,
         proposal: Proposal,
@@ -944,6 +972,7 @@ class MultiStepActionNode(BaseActionNode):
     ) -> Result:
         """Finish an aborted sequence: run on_aborted() and report the outcome."""
         failed = self._completed_steps[-1]
+        self._block_cut = not step.interruptible
         error: BaseException = StepAbortError(self.node_id, step.name)
         if failed.error is not None:
             error.__cause__ = failed.error
@@ -2117,9 +2146,10 @@ class ActionMasterNode(FaultReportingMixin, BaseNode):
             last_result = result
             # Never retry an interrupted/preempted run (the stop was requested,
             # not a fault), a failed or unfinished rollback walk (e.g. one
-            # the action timeout cut), or a run the timeout cut inside a
-            # mandatory block: the plant is in an unknown partial state, and
-            # re-running from step 1 could compound it.
+            # the action timeout cut), a run the timeout cut inside a
+            # mandatory block, or one whose step aborted inside a block that
+            # no rollback walk undid: the plant is in an unknown partial
+            # state, and re-running from step 1 could compound it.
             if (
                 result.success
                 or result.interrupted
@@ -2127,6 +2157,7 @@ class ActionMasterNode(FaultReportingMixin, BaseNode):
                 or timed_out_in_block
                 or isinstance(result.error, RollbackError)
                 or (isinstance(node, MultiStepActionNode) and node.walk_cut_short())
+                or (isinstance(node, MultiStepActionNode) and node.block_cut_unrestored())
             ):
                 break
 

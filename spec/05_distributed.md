@@ -363,15 +363,11 @@ agents:
 
           reflex: true
 
-          priority: 200
-
           action\_id: EmergencyStopActionNode   \# required for reflexes
 
                                                \# \(co\-location target\)
 
         \- kind: OverheatInstinct
-
-          priority: 100
 
       action:
 
@@ -421,11 +417,7 @@ agents:
 
         \- kind: LLMGoalInstinct        \# calls remote LLM API
 
-          priority: 60
-
         \- kind: NavigationInstinct
-
-          priority: 50
 
       decision:
 
@@ -446,6 +438,9 @@ Per agent, ``transport\_config`` overrides the mesh defaults and accepts exactly
 \- ``redis``: url, channel\_prefix, db, password, reconnect\_interval\_s, max\_reconnect\_attempts
 
 \- ``local``: none \(the section is ignored\)
+
+__Node entries\.__ A node entry is a class path, or a mapping with the keys ``kind``, ``config``, ``reflex``, ``action\_id`` and ``permissions``; any other key \(e\.g\. ``priority``\) is rejected with ``ManifestValidationError`` — node attributes such as ``priority`` are set on the class\. A node is treated as a reflex — and checked for co\-location with its ``action\_id`` target — if the entry says ``reflex: true``, if its class subclasses ``BaseReflexInstinctNode``, or if its class sets ``reflex = True`` \(the rule the runtime routes by\)\.
+
 
 ## __11\.2 Loading and Validating a Manifest__
 

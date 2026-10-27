@@ -65,6 +65,9 @@ _TRANSPORT_CONFIG_KEYS: dict[str, frozenset[str]] = {
 }
 _TRANSPORT_KINDS = frozenset({"", "local", *_TRANSPORT_CONFIG_KEYS})
 
+# Keys a node entry in a manifest may carry; anything else is rejected.
+_NODE_DEF_KEYS = frozenset({"kind", "config", "reflex", "action_id", "permissions"})
+
 
 _SECRET_KEY_PATTERNS = re.compile(
     r"(password|api[_\-]?key|secret|token|bearer|private[_\-]?key)",
@@ -279,6 +282,15 @@ class DeploymentManifest:
             for node_def in node_defs:
                 if isinstance(node_def, str):
                     node_def = {"kind": node_def}
+                unknown = sorted(set(node_def) - _NODE_DEF_KEYS)
+                if unknown:
+                    # A key the loader does not read (e.g. ``priority``) would
+                    # otherwise look configured while having no effect.
+                    raise ManifestValidationError([
+                        f"Agent '{ac.agent_id}': node '{node_def.get('kind')}' has unknown "
+                        f"key(s) {unknown}; allowed: {sorted(_NODE_DEF_KEYS)}. "
+                        "Node attributes such as priority are set on the class.",
+                    ])
                 kind       = str(node_def["kind"])
                 config     = dict(node_def.get("config", {}))
                 is_reflex  = bool(node_def.get("reflex", False))
@@ -287,7 +299,13 @@ class DeploymentManifest:
                 node_class = _import_node_class(kind)
 
                 # Detect reflex from class inheritance if not explicit in manifest
-                if not is_reflex and issubclass(node_class, BaseReflexInstinctNode):
+                # The runtime routes by the class's ``reflex`` attribute, so the
+                # manifest must too: a reflex=True class is checked for
+                # co-location whether or not it subclasses the reflex base.
+                if not is_reflex and (
+                    issubclass(node_class, BaseReflexInstinctNode)
+                    or getattr(node_class, "reflex", False) is True
+                ):
                     is_reflex = True
 
                 # Parse allowed_permissions whitelist

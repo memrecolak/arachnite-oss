@@ -767,3 +767,27 @@ class TestR6ManifestTransportSettings:
                 "id": "pi", "transport": "local", "nodes": {},
                 "on_transport_fault": {"reflex": "TransportFaultReflex",
                                        "action": "SafeModeActionNode"}}]})
+
+
+class TestR7ReflexByAttribute:
+    """R7: the manifest treats a node as a reflex by the same rule the runtime routes by."""
+
+    def test_attribute_reflex_split_from_its_action_is_rejected(self) -> None:
+        """R7-C3: a reflex=True class outside the reflex base is co-location checked"""
+        with pytest.raises(ManifestValidationError, match="Brake"):
+            DeploymentManifest.from_dict({"agents": [
+                {"id": "edge", "nodes": {
+                    "instinct": [{"kind": f"{_R6}R7AttrReflex", "action_id": "Brake"}],
+                }},
+                {"id": "cloud", "nodes": {"action": [f"{_R6}R6BrakeActuator"]}},
+            ]})
+
+    def test_unknown_node_key_is_rejected(self) -> None:
+        """R7-C4: a node key the loader does not read (priority) is an error, not a no-op"""
+        with pytest.raises(ManifestValidationError, match="priority"):
+            DeploymentManifest.from_dict({"agents": [{"id": "edge", "nodes": {
+                "instinct": [{"kind": f"{_R6}R6HotReflex", "action_id": "Brake",
+                              "priority": 200}],
+                "action": [f"{_R6}R6BrakeActuator"],
+            }}]})
+

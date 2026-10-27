@@ -821,6 +821,10 @@ node's `preemption` decides what happens:
   because undoing a physical operation during a hazard can itself be unsafe. A run walks
   at most once: a preemption during or after an interrupt/abort rollback walk does not
   start it again. Each rollback callable is timed out at its step's `timeout_s`.
+  Retries (`max_retries`) never re-run a block that was cut: not after the action's own
+  timeout inside a block, nor after a step aborted inside a block unless its rollback walk
+  undid it. A step's `interrupted=True` ends the run only where the policy allows a stop
+  (interruptible step under ALWAYS/ROLLBACK, checkpoint step under CHECKPOINT, never NEVER).
 - **`ReflexPreemption.WAIT_FOR_BLOCK`**: if the owner is inside a mandatory block, the
   reflex is **armed** and the owner is preempted at the first step boundary after the
   block, whatever its `InterruptPolicy`. Outside a block it behaves like PREEMPT. The
@@ -1087,6 +1091,11 @@ auditable.
 ---
 
 ## Distributed bridge — remote signals, manifests, transports (spec §10–§11)
+
+**Manifest node entries** take only `kind`, `config`, `reflex`, `action_id`, `permissions`;
+any other key (e.g. `priority` — set it on the class) raises `ManifestValidationError`. A node
+is a reflex for the co-location check if the entry says `reflex: true`, its class subclasses
+`BaseReflexInstinctNode`, or its class sets `reflex = True` (the runtime's routing rule).
 
 **Remote signals reach the tick.** `AgentNode` attaches a remote listener to its bus
 (`SignalBus.add_remote_listener`); the bus then subscribes `'*'` on the transport, and every

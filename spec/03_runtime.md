@@ -910,7 +910,7 @@ class StepResult:
 
                                        \# check\_interrupt\(\)\)
 
-A step that sets ``interrupted=True`` is surfaced by ``execute\(\)`` as ``Result\(interrupted=True, stopped\_at\_step=\.\.\.\)`` via the normal interrupt path — **not** as a ``StepAbortError`` failure\. This distinguishes "the step chose to stop because a higher\-priority action wants control" from "the step aborted the sequence due to an error" \(``abort\_sequence``\)\.
+A step that sets ``interrupted=True`` is surfaced by ``execute\(\)`` as ``Result\(interrupted=True, stopped\_at\_step=\.\.\.\)`` via the normal interrupt path — **not** as a ``StepAbortError`` failure — but only where the policy allows a cooperative stop: an interruptible step under ``ALWAYS`` or ``ROLLBACK``, a checkpoint step under ``CHECKPOINT``, never under ``NEVER`` and never inside a mandatory block \(the same rule as ``check\_interrupt\(\)``\)\. Elsewhere the flag is a contract violation; it is logged and ignored, and the sequence continues\. This distinguishes "the step chose to stop because a higher\-priority action wants control" from "the step aborted the sequence due to an error" \(``abort\_sequence``\)\.
 
 **Aborts\.** A step aborts the sequence when it returns ``abort\_sequence=True``, when it exceeds its timeout \(default ``on\_step\_timeout\(\)``\), or when ``execute\_step\(\)`` raises — the exception is converted into an aborting ``StepResult`` and logged at ERROR\. Every abort goes through ``on\_aborted\(\)`` \(§17\.4\) and ``execute\(\)`` returns ``Result\(success=False, stopped\_at\_step=\.\.\., error=StepAbortError\)``, chained to the step's error, or ``error=RollbackError`` if the abort rollback failed\.
 
@@ -1523,7 +1523,7 @@ __Enforced by the framework\.__
 - Deliberative atomicity of mandatory blocks \(§17\.5\)\.
 - Preemption, arming, reflex\-over\-reflex waiting and de\-duplication as in the table\.
 - The bound on ``on\_preempted\(\)`` \(``safe\_stop\_timeout\_s``, then 0\.1 s before an overrunning hook is abandoned\), the per\-callable bound on rollbacks \(the step's ``timeout\_s``\), and the ``reflex\_eval\_timeout\_s`` bound on event\-lane evaluation\.
-- No retry after a run that was interrupted, was preempted, ended with a ``RollbackError`` or had its rollback walk cut short; nor while a cancel, a reflex preemption or an interrupt is pending on the node, or a reflex is armed on any of its resources\.
+- No retry after a run that was interrupted, was preempted, ended with a ``RollbackError``, had its rollback walk cut short, was cut inside a mandatory block by the action's ``timeout\_s``, or had a step abort inside a mandatory block \(step timeout, raise, ``abort\_sequence``\) that no completed rollback walk undid; nor while a cancel, a reflex preemption or an interrupt is pending on the node, or a reflex is armed on any of its resources\.
 
 __Delegated to the application\.__
 

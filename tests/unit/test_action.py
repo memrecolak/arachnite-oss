@@ -1725,3 +1725,107 @@ class TestStepTimeoutSelection:
         assert result.success is False
         assert isinstance(result.error, StepAbortError)
         assert isinstance(result.error.__cause__, ActionTimeoutError)
+
+
+# ── Review 7: block cut by a failing step; cooperative stops follow the policy ──
+
+class _R7Blocky(MultiStepActionNode):
+    """s1 | b1, b2 (mandatory block); b2 overruns its step timeout."""
+    node_id = "R7Blocky"
+    resources = frozenset({"arm"})
+    max_retries = 1
+    timeout_s = 5.0
+
+    def __init__(self, bus: SignalBus, policy: InterruptPolicy) -> None:
+        super().__init__(bus)
+        self.interrupt_policy = policy
+        self.log: list[str] = []
+
+    def steps(self) -> list[ActionStep]:
+        return [
+            ActionStep("s1", interruptible=True),
+            ActionStep("b1", interruptible=False, rollback=self._undo_b1),
+            ActionStep("b2", interruptible=False, timeout_s=0.05),
+        ]
+
+    async def _undo_b1(self) -> None:
+        self.log.append("undo-b1")
+
+    async def execute_step(
+        self, step: ActionStep, proposal: Proposal, completed: list[StepResult],
+    ) -> StepResult:
+        self.log.append(step.name)
+        if step.name == "b2" and self.log.count("b2") == 1:
+            await asyncio.sleep(1.0)  # first attempt: overruns inside the block
+        return StepResult(step_name=step.name, success=True)
+
+
+class _R7Stopper(MultiStepActionNode):
+    """Interruptible steps; step 'a' returns interrupted=True (cooperative stop)."""
+    node_id = "R7Stopper"
+
+    def __init__(self, bus: SignalBus, policy: InterruptPolicy, checkpoint: bool) -> None:
+        super().__init__(bus)
+        self.interrupt_policy = policy
+        self.checkpoint = checkpoint
+        self.log: list[str] = []
+
+    def steps(self) -> list[ActionStep]:
+        return [
+            ActionStep("a", interruptible=True, checkpoint=self.checkpoint),
+            ActionStep("b", interruptible=True),
+        ]
+
+    async def execute_step(
+        self, step: ActionStep, proposal: Proposal, completed: list[StepResult],
+    ) -> StepResult:
+        self.log.append(step.name)
+        return StepResult(step_name=step.name, success=True, interrupted=step.name == "a")
+
+
+def _r7_proposal(action_id: str) -> Proposal:
+    return Proposal(instinct_id="i", action_id=action_id, priority=50, urgency=0.5)
+
+
+class TestSeventhReviewRegressions:
+    @pytest.mark.asyncio
+    async def test_block_cut_by_a_step_timeout_is_not_retried(self) -> None:
+        """R7-C1: a step aborting inside a block, with no rollback, is not re-run"""
+        am = ActionMasterNode(bus=SignalBus())
+        node = _R7Blocky(am.bus, InterruptPolicy.ALWAYS)
+        am.register(node)
+        result = await am.dispatch(_r7_proposal("R7Blocky"))
+        assert node.log == ["s1", "b1", "b2"]
+        assert result.success is False
+
+    @pytest.mark.asyncio
+    async def test_block_undone_by_its_rollback_may_be_retried(self) -> None:
+        """R7-C1: under ROLLBACK the walk undoes the block first, so the retry is allowed"""
+        am = ActionMasterNode(bus=SignalBus())
+        node = _R7Blocky(am.bus, InterruptPolicy.ROLLBACK)
+        am.register(node)
+        result = await am.dispatch(_r7_proposal("R7Blocky"))
+        assert node.log == ["s1", "b1", "b2", "undo-b1", "s1", "b1", "b2"]
+        assert result.success is True
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("policy", "checkpoint", "stops"),
+        [
+            (InterruptPolicy.NEVER, False, False),
+            (InterruptPolicy.CHECKPOINT, False, False),
+            (InterruptPolicy.CHECKPOINT, True, True),
+            (InterruptPolicy.ALWAYS, False, True),
+        ],
+    )
+    async def test_cooperative_stop_follows_the_policy(
+        self, policy: InterruptPolicy, checkpoint: bool, stops: bool,
+    ) -> None:
+        """R7-C2: interrupted=True ends the run only where the policy allows a stop"""
+        am = ActionMasterNode(bus=SignalBus())
+        node = _R7Stopper(am.bus, policy, checkpoint)
+        am.register(node)
+        result = await am.dispatch(_r7_proposal("R7Stopper"))
+        assert node.log == (["a"] if stops else ["a", "b"])
+        assert result.interrupted is stops
+

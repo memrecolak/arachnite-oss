@@ -175,7 +175,7 @@ class CoolFan(MultiStepActionNode):
 
     async def _undo_sustain(self) -> None:
         """Rollback: spin the fan back down if interrupted after sustain."""
-        self.logger.warning("Rolling back sustain — spinning fan down")
+        self.logger.warning("Rolling back sustain - spinning fan down")
         await asyncio.sleep(0.1)
 
 
@@ -194,7 +194,7 @@ class EmergencyStop(BaseActionNode):
     async def execute(self, proposal) -> Result:  # type: ignore[override]
         reading = proposal.parameters.get("reading", "?")
         self.logger.error("EMERGENCY STOP triggered", reading=reading)
-        print(f"\n*** EMERGENCY STOP — temperature {reading} °C exceeded 85 °C ***\n")
+        print(f"\n*** EMERGENCY STOP - temperature {reading} C exceeded 85 C ***\n")
         return Result(action_id=self.node_id, success=True,
                       output={"reason": "critical_temperature", "reading": reading})
 
@@ -230,13 +230,13 @@ async def main() -> None:
     # Subscribe to all bus signals so we can print readings
     async def log_signal(sig: Signal) -> None:
         if sig.kind == "temperature":
-            bar = "█" * int(sig.value / 5)
-            print(f"  temp={sig.value:5.1f} °C  {bar}")
+            bar = "#" * int(sig.value / 5)
+            print(f"  temp={sig.value:5.1f} C  {bar}")
 
     bus.subscribe("temperature", log_signal)
 
     print("Temperature monitor running. Ctrl+C to stop.")
-    print("─" * 60)
+    print("-" * 60)
     await rt.start()
     try:
         await rt.wait()

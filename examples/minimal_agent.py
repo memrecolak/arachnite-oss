@@ -88,7 +88,7 @@ class CoolDown(BaseActionNode):
 
     async def execute(self, proposal) -> Result:  # type: ignore[override]
         reading = proposal.parameters.get("reading", "?")
-        print(f"[CoolDown] Cooling down — last reading: {reading} °C")
+        print(f"[CoolDown] Cooling down - last reading: {reading} C")
         return Result(action_id=self.node_id, success=True)
 
 
