@@ -56,7 +56,15 @@ class ArachniteRuntime:
 
         If any master's setup\(\) raises, already\-started masters are torn down
 
-        before re\-raising the exception\."""
+        before re\-raising the exception\. Within a master, every leaf setup\(\)
+
+        is awaited to completion; if one raised, the background tasks of all
+
+        that master's leaves are cancelled and the leaves whose setup\(\)
+
+        succeeded are torn down before the error propagates — a failed
+
+        start\(\) leaves no listener running\."""
 
     async def stop\(self\) \-> None:
 

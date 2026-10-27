@@ -42,6 +42,7 @@ import json
 import secrets
 import time
 from collections import deque
+from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
 
@@ -1755,6 +1756,15 @@ class SignalDashboard(BaseLogSink):
         without an ``auth_token``.  Default ``False`` — ``start()``
         raises if the host is non-loopback, no token is set, and this
         flag is False.  Use only if you understand the exposure.
+    allowed_origins:
+        Extra browser origins (``"scheme://host[:port]"``, exact match)
+        allowed to open the ``/ws`` stream.  Browsers apply no
+        same-origin policy to WebSockets, so by default a handshake is
+        accepted only from the dashboard's own origin (``Origin``
+        host:port equal to the request ``Host``) or from a client that
+        sends no ``Origin`` (scripts, CLI tools); any other web page is
+        refused with close code 1008 before a frame is sent.  ``"*"``
+        allows every origin (not recommended).  Default: none.
     """
 
     def __init__(
@@ -1772,9 +1782,13 @@ class SignalDashboard(BaseLogSink):
         ssl_certfile: str | Path | None = None,
         ssl_keyfile: str | Path | None = None,
         allow_unauthenticated: bool = False,
+        allowed_origins: Iterable[str] | None = None,
     ) -> None:
         super().__init__(level=level)
         self._bus     = bus
+        self._allowed_origins = frozenset(
+            o.rstrip("/").lower() for o in (allowed_origins or ())
+        )
         self._host    = host
         self._port    = port
         self._agent_node_id = agent_node_id
@@ -2200,6 +2214,23 @@ class SignalDashboard(BaseLogSink):
             return False
         return secrets.compare_digest(sent, self._auth_token)
 
+    def _is_ws_origin_allowed(self, ws: Any) -> bool:
+        """
+        Same-origin check for the WebSocket handshake (browsers do not apply
+        CORS to WebSockets). Allowed: no ``Origin`` header (non-browser
+        client), an ``Origin`` whose host:port equals the request ``Host``,
+        or one listed in ``allowed_origins``.
+        """
+        origin = ws.headers.get("origin")
+        if origin is None:
+            return True
+        origin = origin.strip().rstrip("/").lower()
+        if "*" in self._allowed_origins or origin in self._allowed_origins:
+            return True
+        host = (ws.headers.get("host") or "").strip().lower()
+        _, sep, netloc = origin.partition("://")
+        return bool(sep) and bool(host) and netloc == host
+
     def _build_app(self) -> Any:
         app       = FastAPI(title="Arachnite Dashboard", docs_url=None, redoc_url=None)
         dashboard = self
@@ -2245,6 +2276,10 @@ class SignalDashboard(BaseLogSink):
 
         @app.websocket("/ws")  # type: ignore[misc,untyped-decorator,unused-ignore]
         async def ws_endpoint(ws: WebSocket) -> None:
+            if not dashboard._is_ws_origin_allowed(ws):
+                # A page from another origin: refuse before any frame.
+                await ws.close(code=1008)
+                return
             if not dashboard._is_ws_authorised(ws):
                 # 1008 = policy violation. Close before accept so no
                 # frames are exchanged.

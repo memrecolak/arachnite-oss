@@ -114,6 +114,10 @@ class JSONLogSink(BaseLogSink):
         print(json.dumps(record, default=str), file=self._stream, flush=True)
 
 
+#: The level-only filter of BaseLogSink; sinks that keep it can be pre-filtered.
+_DEFAULT_ACCEPTS = BaseLogSink.accepts
+
+
 class NullLogSink(BaseLogSink):
     """Discards all log events. Useful in tests."""
 
@@ -150,7 +154,33 @@ class StructuredLogger:
     def _set_tick(self, tick: int) -> None:
         self._tick = tick
 
+    def adopt_sinks(self, sinks: list[BaseLogSink]) -> None:
+        """
+        Use ``sinks`` when this logger has no sinks of its own.
+
+        Called by the runtime with its ``log_sinks`` for every master and
+        leaf node (spec §13.2): a node constructed with its own non-empty
+        ``log_sinks`` keeps exactly those; one constructed without any logs
+        to the runtime's. Pass ``[NullLogSink()]`` to silence a node.
+        """
+        if not self._sinks:
+            self._sinks = sinks
+
     def _emit(self, level: LogLevel, msg: str, data: dict[str, Any]) -> None:
+        sinks = self._sinks
+        if not sinks:
+            return
+        # Cheap pre-filter on the hot path (per-tick debug lines): skip
+        # building the event when every sink filters by level alone (the
+        # default ``accepts``) and none takes this level. ``_value_`` is the
+        # plain member value; comparing it avoids the Python-level
+        # LogLevel comparison operators.
+        rank = level._value_
+        for sink in sinks:
+            if rank >= sink.level._value_ or type(sink).accepts is not _DEFAULT_ACCEPTS:
+                break
+        else:
+            return
         event = LogEvent(
             level         = level,
             node_id       = self._node_id,
@@ -164,7 +194,7 @@ class StructuredLogger:
         # otherwise emit synchronously (useful during setup/teardown).
         try:
             loop = asyncio.get_running_loop()
-            for sink in self._sinks:
+            for sink in sinks:
                 if sink.accepts(event):
                     loop.create_task(sink.emit(event))
         except RuntimeError:

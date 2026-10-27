@@ -451,3 +451,106 @@ class TestRestartTaskTracking:
         sv = make_supervisor(bus)
         await sv.cancel_restart_tasks()  # must not raise
         assert sv.restart_task_count == 0
+
+
+class TestReview6RestartBudget:
+    """R6-F4 / R6-F13: bounded restarts, terminal DEAD, restart hygiene."""
+
+    @staticmethod
+    async def _drain(sv: NodeSupervisor) -> None:
+        """Wait until no restart task is pending (restarts may schedule more)."""
+        for _ in range(50):
+            tasks = list(sv._restart_tasks)
+            if not tasks:
+                return
+            await asyncio.gather(*tasks, return_exceptions=True)
+        raise AssertionError("restart tasks did not settle")
+
+    @pytest.mark.asyncio
+    async def test_fault_burst_schedules_a_single_restart(self, bus: SignalBus) -> None:
+        """R6-F4: faults arriving while a restart is pending schedule no further restart"""
+        sv = make_supervisor(bus, max_restarts=3, restart_delay_s=0.0)
+        node = SimpleNode(bus=bus)
+        sv.track(node)
+        await sv.mark_running("SimpleNode")
+        for _ in range(10):  # e.g. 10 ticks inside restart_delay_s
+            await sv.on_fault("SimpleNode", RuntimeError("boom"))
+        assert sv.restart_task_count == 1
+        await self._drain(sv)
+        assert node.setup_count == 1
+        assert sv._restart_counts["SimpleNode"] == 1
+        assert sv.state_of("SimpleNode") is NodeState.RUNNING
+
+    @pytest.mark.asyncio
+    async def test_budget_bounds_total_restarts(self, bus: SignalBus) -> None:
+        """R6-F4: a node faulting in bursts is restarted at most max_restarts times, then DEAD"""
+        sv = make_supervisor(bus, max_restarts=2, restart_delay_s=0.0)
+        node = SimpleNode(bus=bus)
+        sv.track(node)
+        await sv.mark_running("SimpleNode")
+        for _ in range(6):
+            for _ in range(3):
+                await sv.on_fault("SimpleNode", RuntimeError("boom"))
+            await self._drain(sv)
+        assert node.setup_count == 2
+        assert sv._restart_counts["SimpleNode"] == 2
+        assert sv.state_of("SimpleNode") is NodeState.DEAD
+
+    @pytest.mark.asyncio
+    async def test_dead_is_terminal_for_faults(self, bus: SignalBus) -> None:
+        """R6-F4: a fault on a DEAD node neither leaves DEAD nor publishes a transition"""
+        sv = make_supervisor(bus, policy=RestartPolicy.NEVER)
+        node = SimpleNode(bus=bus)
+        sv.track(node)
+        await sv.on_fault("SimpleNode", RuntimeError("first"))
+        assert sv.state_of("SimpleNode") is NodeState.DEAD
+        seen: list[SupervisorSignal] = []
+
+        async def spy(sig: SupervisorSignal) -> None:
+            seen.append(sig)
+
+        bus.subscribe("supervisor", spy)  # type: ignore[arg-type]
+        for _ in range(3):
+            await sv.on_fault("SimpleNode", RuntimeError("again"))
+        assert seen == []
+        assert sv.state_of("SimpleNode") is NodeState.DEAD
+        assert sv.restart_task_count == 0
+        assert sv.dead_node_ids == {"SimpleNode"}
+
+    @pytest.mark.asyncio
+    async def test_manual_restart_leaves_dead_and_retrack_resets(self, bus: SignalBus) -> None:
+        """R6-F4: restart() and track() are the only ways out of DEAD; both clear the dead set"""
+        sv = make_supervisor(bus, policy=RestartPolicy.NEVER)
+        node = SimpleNode(bus=bus)
+        sv.track(node)
+        await sv.on_fault("SimpleNode", RuntimeError("boom"))
+        assert "SimpleNode" in sv.dead_node_ids
+        await sv.restart("SimpleNode")
+        assert sv.state_of("SimpleNode") is NodeState.RUNNING
+        assert "SimpleNode" not in sv.dead_node_ids
+        await sv.on_fault("SimpleNode", RuntimeError("boom"))
+        sv.track(node)
+        assert sv.state_of("SimpleNode") is NodeState.STARTING
+        assert "SimpleNode" not in sv.dead_node_ids
+
+    @pytest.mark.asyncio
+    async def test_restart_cancels_previous_background_tasks(self, bus: SignalBus) -> None:
+        """R6-F13: each restart cancels the listeners the previous setup() spawned"""
+
+        class Listener(SimpleNode):
+            async def setup(self) -> None:
+                await super().setup()
+                self.spawn_background_task(asyncio.sleep(3600), name="listener")
+
+        sv = make_supervisor(bus, max_restarts=5, restart_delay_s=0.0)
+        node = Listener(bus=bus)
+        await node.setup()
+        sv.track(node)
+        await sv.mark_running(node.node_id)
+        for _ in range(3):
+            await sv.on_fault(node.node_id, RuntimeError("boom"))
+            await self._drain(sv)
+        assert node.setup_count == 4  # the initial setup + 3 restarts
+        live = [t for t in node._background_tasks if not t.done()]
+        assert len(live) == 1
+        await node.cancel_background_tasks()

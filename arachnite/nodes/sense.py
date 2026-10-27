@@ -7,7 +7,6 @@ Spec reference: Section 5.2.
 
 from __future__ import annotations
 
-import asyncio
 import time
 from abc import abstractmethod
 from collections import deque
@@ -18,7 +17,7 @@ from arachnite.config import NodeConfig
 from arachnite.exceptions import NodeRegistrationError, SignalBusError
 from arachnite.logging import BaseLogSink
 from arachnite.models import MergePolicy, Signal, StateUpdateSignal
-from arachnite.nodes.base import BaseNode, FaultReportingMixin, gather_settled
+from arachnite.nodes.base import BaseNode, FaultReportingMixin, gather_settled, setup_nodes
 
 # Pushed signals kept per node for the next tick's deliberation. The lane
 # stays live while the runtime is paused, when no tick drains them.
@@ -189,7 +188,7 @@ class SenseMasterNode(FaultReportingMixin, BaseNode):
         return list(self._nodes.values())
 
     async def setup(self) -> None:
-        await asyncio.gather(*(n.setup() for n in self._nodes.values()))
+        await setup_nodes(list(self._nodes.values()))
 
     async def teardown(self) -> None:
         await gather_settled(*(n.cancel_background_tasks() for n in self._nodes.values()))

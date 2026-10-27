@@ -289,6 +289,7 @@ class SmartInstinct(LLMInstinctNode):
     node_id        = "SmartInstinct"
     priority       = 60
     min_interval_s = 2.0   # throttle LLM calls
+    call_timeout_s = 30.0  # default; a slower call is abandoned (None = no bound)
 
     def available_actions(self) -> dict[str, str]:
         return {"CoolDown": "Activate cooling", "Alert": "Send alert"}
@@ -297,6 +298,11 @@ class SmartInstinct(LLMInstinctNode):
     # def system_prompt(self) -> str: ...
     # def context_to_text(self, ctx: Context) -> str: ...
 ```
+
+A call that raises, times out or returns an invalid `propose_action` (args not an object,
+unknown action, urgency not a finite number in [0, 1]) **clears** the cached proposal — the
+node proposes nothing until a call succeeds again. Calls run in a daemon thread: an abandoned
+call never delays `stop()` or process exit, and no new call starts until it returns.
 
 LLMProvider exposes two surfaces: `complete(system, user, tools) -> ToolResult | None`
 (sync, tool-calling; what `LLMInstinctNode` uses) and `async complete_text(prompt, *,
@@ -411,7 +417,9 @@ asyncio.run(main())
 RuntimeBuilder defaults: GreedyDecisionNode strategy, 10 Hz tick rate, dispatch_all reflex conflict,
 `reflex_mode="tick"`, `strict_resources=False`.
 Pass node **classes** to auto-instantiate with the builder's bus, or pre-built **instances** for custom args.
-Access the shared bus via `builder.bus`. Other chainable options: `.strategy()`, `.log_sinks()`,
+Access the shared bus via `builder.bus`. `.log_sinks()` (like `ArachniteRuntime(log_sinks=...)`)
+reaches every master and leaf logger that has no sinks of its own — a node built with its own
+`log_sinks` keeps only those. Other chainable options: `.strategy()`, `.log_sinks()`,
 `.reflex_conflict()`, `.reflex_mode("tick" | "event")`, `.strict_resources()`, `.permissions()`,
 `.shutdown()`, `.overrun_warn()`, `.overrun_warn_consecutive()`.
 
@@ -606,7 +614,7 @@ from arachnite import ContextNode
 # State survives reboots:
 ctx = ContextNode(
     state_path="state/self_model.json",
-    flush_on_write=True,   # flush to disk on every set()/delete()
+    flush_on_write=True,   # flush on every set()/delete() and state-changing StateUpdateSignal
     max_state_keys=100,    # evict oldest key (by insertion order) when exceeded
                            # None (default) = no limit; enforced on set(), StateUpdateSignal, and load
 )
@@ -1231,8 +1239,16 @@ For hazard events that a reflex must see at once, have the listener call
 `await self.push(signal)` instead of queueing for `read()` (see *Event-driven reflexes*).
 
 `cancel_background_tasks()` is called by all three master nodes (SenseMasterNode,
-InstinctMasterNode, ActionMasterNode) before their own `teardown()`. Override it only if
+InstinctMasterNode, ActionMasterNode) before their own `teardown()`, by every supervisor
+restart before the node's `teardown()`/`setup()`, and by a master whose leaf `setup()` failed
+during `start()` (siblings already set up are also torn down). Override it only if
 custom cleanup ordering is required.
+
+**Supervisor restarts are bounded.** One restart per node is pending at a time (faults
+meanwhile are reported, not re-scheduled); every attempt counts against `max_restarts`. DEAD is
+terminal — masters stop running the node (`read()`/`evaluate()`/tick hooks skipped via the
+supervisor's `dead_node_ids`) and further faults publish nothing; only `restart()` or a fresh
+`track()` revives it.
 
 ---
 

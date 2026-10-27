@@ -5,7 +5,9 @@ LLMInstinctNode — a BaseInstinctNode backed by a language model.
 
 The LLM is called in the background so it never blocks the tick loop.
 The most recently completed Proposal is cached and returned on each tick
-until a newer one arrives.
+until a newer call completes. A call that fails, times out
+(``call_timeout_s``) or returns an invalid answer clears the cache, so a
+stale decision is never re-proposed.
 
 Provider selection
 ------------------
@@ -23,10 +25,14 @@ Spec reference: Section 5.4 (BaseInstinctNode extension pattern).
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import math
 import sys
+import threading
 import time
 from abc import abstractmethod
-from typing import Any
+from collections.abc import Callable
+from typing import Any, TypeVar
 
 if sys.version_info >= (3, 12):
     from typing import override
@@ -37,14 +43,58 @@ from arachnite.llm_provider import AnthropicProvider, LLMProvider
 from arachnite.models import Context, Proposal
 from arachnite.nodes.instinct import BaseInstinctNode
 
+_R = TypeVar("_R")
+
+
+def _run_in_daemon_thread(
+    fn: Callable[[], _R], name: str,
+) -> tuple[asyncio.Future[_R], threading.Thread]:
+    """
+    Run ``fn`` in a new daemon thread; return a future for its result and the thread.
+
+    Unlike ``asyncio.to_thread`` (the loop's default executor), an abandoned
+    call — timed out or cancelled at shutdown — does not hold up
+    ``asyncio.run()`` or interpreter exit: the daemon thread is simply left to
+    finish, and its result is dropped.
+    """
+    loop = asyncio.get_running_loop()
+    future: asyncio.Future[_R] = loop.create_future()
+
+    def _settle(result: Any, error: BaseException | None) -> None:
+        if future.done():
+            return
+        if error is not None:
+            future.set_exception(error)
+        else:
+            future.set_result(result)
+
+    def _runner() -> None:
+        try:
+            result: Any = fn()
+            error: BaseException | None = None
+        except BaseException as exc:  # noqa: BLE001 — handed to the awaiting task
+            result, error = None, exc
+        # A closed loop raises RuntimeError: nobody is waiting any more.
+        with contextlib.suppress(RuntimeError):
+            loop.call_soon_threadsafe(_settle, result, error)
+
+    thread = threading.Thread(target=_runner, name=name, daemon=True)
+    thread.start()
+    return future, thread
+
 
 class LLMInstinctNode(BaseInstinctNode):
     """
     An InstinctNode that delegates evaluation to a language model.
 
-    The LLM is invoked in a background thread via asyncio.to_thread() so
-    the tick loop is never blocked. The last completed Proposal is cached
-    and returned on each subsequent tick until a new LLM call finishes.
+    The LLM is invoked in a background daemon thread so the tick loop is
+    never blocked. The last completed Proposal is cached and returned on
+    each subsequent tick until a new LLM call finishes. A call that raises,
+    exceeds ``call_timeout_s`` or answers with an invalid proposal clears
+    the cache (the node proposes nothing until a call succeeds again). At
+    most one provider call is in flight per node: a timed-out call's thread
+    is abandoned (it never delays shutdown), and no new call starts until it
+    has returned, so a provider is never called concurrently by one node.
 
     Subclass contract
     -----------------
@@ -61,6 +111,7 @@ class LLMInstinctNode(BaseInstinctNode):
     model           : Anthropic model ID (default: claude-haiku-4-5-20251001)
     max_tokens      : max tokens in the LLM response (default: 256)
     min_interval_s  : minimum seconds between consecutive LLM calls (default: 10.0)
+    call_timeout_s  : seconds to wait for one LLM call; None = no bound (default: 30.0)
     api_key         : Anthropic API key; None → use ANTHROPIC_API_KEY env var
 
     Not suitable as a reflex
@@ -82,6 +133,11 @@ class LLMInstinctNode(BaseInstinctNode):
     #: Minimum seconds between consecutive LLM calls.
     min_interval_s: float = 10.0
 
+    #: Seconds to wait for one LLM call before abandoning it and clearing
+    #: the cached proposal. ``None`` waits indefinitely (not recommended:
+    #: provider SDKs default to a 600 s read timeout).
+    call_timeout_s: float | None = 30.0
+
     #: Fallback Anthropic API key when no provider is injected.
     api_key: str | None = None
 
@@ -96,6 +152,11 @@ class LLMInstinctNode(BaseInstinctNode):
         self._cached_proposal: Proposal | None = None
         self._lock = asyncio.Lock()
         self._pending: asyncio.Task[None] | None = None
+        # Thread of the latest call, and of a call abandoned on timeout or
+        # cancel (still running in the provider) — no new call starts
+        # until the abandoned one has returned.
+        self._call_thread: threading.Thread | None = None
+        self._abandoned_call: threading.Thread | None = None
         self._last_call_time: float = 0.0
 
     @override
@@ -202,11 +263,15 @@ class LLMInstinctNode(BaseInstinctNode):
         """
         Return the cached Proposal from the last completed LLM call.
         Fires a new background LLM call when the cooldown has elapsed
-        and no call is currently in flight.
+        and no call is currently in flight (including an abandoned,
+        timed-out call whose thread has not returned yet).
         """
         now = time.monotonic()
         cooldown_elapsed = (now - self._last_call_time) >= self.min_interval_s
-        no_pending = self._pending is None or self._pending.done()
+        abandoned = self._abandoned_call
+        no_pending = (self._pending is None or self._pending.done()) and (
+            abandoned is None or not abandoned.is_alive()
+        )
 
         if cooldown_elapsed and no_pending:
             self._last_call_time = now
@@ -221,26 +286,51 @@ class LLMInstinctNode(BaseInstinctNode):
     # ── Internal LLM plumbing ──────────────────────────────────────────────────
 
     async def _call_llm(self, ctx: Context) -> None:
-        """Dispatch the LLM call in a thread; update the cached proposal."""
+        """
+        Dispatch the LLM call in a daemon thread; update the cached proposal.
+
+        On failure or timeout the cached proposal is cleared: a decision made
+        on older observations is never re-proposed while the LLM is failing.
+        """
+        call = self._call_llm_sync
+        future, thread = _run_in_daemon_thread(
+            lambda: call(ctx), name=f"{self.node_id}_llm_call",
+        )
+        self._call_thread = thread
         try:
-            proposal = await asyncio.to_thread(self._call_llm_sync, ctx)
-            async with self._lock:
-                self._cached_proposal = proposal
-            if proposal:
-                self.logger.info(
-                    "LLM proposed action",
-                    action_id=proposal.action_id,
-                    priority=proposal.priority,
-                    rationale=proposal.rationale,
-                )
-            else:
-                self.logger.debug("LLM returned no action")
+            proposal = await asyncio.wait_for(future, self.call_timeout_s)
+        except asyncio.CancelledError:
+            self._abandoned_call = thread  # teardown: leave the thread behind
+            raise
+        except asyncio.TimeoutError:
+            # asyncio.TimeoutError is the builtin TimeoutError only on 3.11+.
+            self._abandoned_call = thread
+            await self._clear_cached()
+            self.logger.error("LLM call timed out", timeout_s=self.call_timeout_s)
+            return
         except Exception as exc:  # noqa: BLE001
-            self.logger.error("LLM call failed", error=str(exc))
+            await self._clear_cached()
+            self.logger.error("LLM call failed", error=str(exc), error_type=type(exc).__name__)
+            return
+        async with self._lock:
+            self._cached_proposal = proposal
+        if proposal:
+            self.logger.info(
+                "LLM proposed action",
+                action_id=proposal.action_id,
+                priority=proposal.priority,
+                rationale=proposal.rationale,
+            )
+        else:
+            self.logger.debug("LLM returned no action")
+
+    async def _clear_cached(self) -> None:
+        async with self._lock:
+            self._cached_proposal = None
 
     def _call_llm_sync(self, ctx: Context) -> Proposal | None:
         """
-        Synchronous LLM call — runs inside asyncio.to_thread().
+        Synchronous LLM call — runs in the node's call thread.
         Delegates to the injected provider (or a default AnthropicProvider).
         """
         if self._provider is not None:
@@ -316,25 +406,58 @@ class LLMInstinctNode(BaseInstinctNode):
     def _parse_tool_result(
         self, tool_name: str, tool_args: dict[str, Any]
     ) -> Proposal | None:
-        """Convert a (tool_name, tool_args) pair into a Proposal or None."""
+        """
+        Convert a (tool_name, tool_args) pair into a Proposal or None.
+
+        A malformed ``propose_action`` (arguments not an object, unknown
+        action, urgency missing a finite number in [0, 1], parameters not an
+        object) is rejected with a warning and yields None — never a raise,
+        never a clamped guess.
+        """
         if tool_name == "no_action":
             return None
 
         if tool_name == "propose_action":
+            if not isinstance(tool_args, dict):
+                self.logger.warning(
+                    "LLM tool arguments are not an object — ignoring",
+                    args_type=type(tool_args).__name__,
+                )
+                return None
             action_id = tool_args.get("action_id", "")
-            if action_id not in self.available_actions():
+            if not isinstance(action_id, str) or action_id not in self.available_actions():
                 self.logger.warning(
                     "LLM proposed unknown action — ignoring",
                     action_id=action_id,
                 )
                 return None
+            raw_urgency = tool_args.get("urgency", 0.5)
+            try:
+                urgency = math.nan if isinstance(raw_urgency, bool) else float(raw_urgency)
+            except (TypeError, ValueError):
+                urgency = math.nan
+            if not 0.0 <= urgency <= 1.0:  # also rejects NaN
+                self.logger.warning(
+                    "LLM proposed invalid urgency — ignoring",
+                    action_id=action_id,
+                    urgency=raw_urgency,
+                )
+                return None
+            parameters = tool_args.get("parameters") or {}
+            if not isinstance(parameters, dict):
+                self.logger.warning(
+                    "LLM proposed non-object parameters — ignoring",
+                    action_id=action_id,
+                )
+                return None
+            rationale = tool_args.get("rationale", "")
             return Proposal(
                 instinct_id=self.node_id,
                 action_id=action_id,
                 priority=self.priority,
-                urgency=float(tool_args.get("urgency", 0.5)),
-                parameters=tool_args.get("parameters") or {},
-                rationale=tool_args.get("rationale", ""),
+                urgency=urgency,
+                parameters=parameters,
+                rationale=rationale if isinstance(rationale, str) else str(rationale),
             )
 
         self.logger.warning("LLM called unknown tool — ignoring", tool_name=tool_name)

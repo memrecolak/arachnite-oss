@@ -9,19 +9,26 @@ from unittest.mock import AsyncMock
 import pytest
 
 import arachnite.runtime as _runtime_module
-from arachnite import ContextNode, SignalBus
+from arachnite import ContextNode, RuntimeBuilder, SignalBus
+from arachnite.logging import BaseLogSink, LogLevel, NullLogSink
 from arachnite.models import (
     ActionStep,
+    Context,
     InterruptPolicy,
     InterruptRequest,
+    LogEvent,
+    NodeState,
     Proposal,
+    RestartPolicy,
     Result,
+    Signal,
     StepResult,
+    SupervisorSignal,
 )
 from arachnite.nodes.action import ActionMasterNode, BaseActionNode, MultiStepActionNode
 from arachnite.nodes.decision import DecisionMasterNode, GreedyDecisionNode
 from arachnite.nodes.instinct import BaseInstinctNode, InstinctMasterNode
-from arachnite.nodes.sense import SenseMasterNode
+from arachnite.nodes.sense import BaseSenseNode, SenseMasterNode
 from arachnite.runtime import ArachniteRuntime
 from tests.conftest import ConstantSenseNode, RecordingAction
 
@@ -457,7 +464,7 @@ class TestLoggerTickWiring:
 
     @pytest.mark.asyncio
     async def test_runtime_master_and_leaf_loggers_synced(self) -> None:
-        from arachnite.logging import BaseLogSink, LogEvent, LogLevel
+        from arachnite.logging import BaseLogSink, LogLevel
 
         captured: list[LogEvent] = []
 
@@ -542,7 +549,7 @@ class TestReflexFiredEvent:
 
     @pytest.mark.asyncio
     async def test_reflex_fired_event_emitted_with_payload(self) -> None:
-        from arachnite.logging import BaseLogSink, LogEvent, LogLevel
+        from arachnite.logging import BaseLogSink, LogLevel
         from tests.conftest import EmergencyReflex
 
         captured: list[LogEvent] = []
@@ -1306,7 +1313,7 @@ class TestEmergencyStopLogEvents:
 
     @pytest.mark.asyncio
     async def test_emergency_stop_emits_initiated_event(self) -> None:
-        from arachnite.logging import BaseLogSink, LogEvent, LogLevel
+        from arachnite.logging import BaseLogSink, LogLevel
 
         captured: list[LogEvent] = []
 
@@ -1397,3 +1404,204 @@ class TestEmergencyStopLogEvents:
         assert time.perf_counter() - started < 0.4      # did not wait out the tick
         assert node.executed == ["grip", "walk1"]       # no step after stop()
         assert node.undone == ["grip"]                  # ROLLBACK ran
+
+
+# ── Review 6: DEAD nodes, failed start, log-sink propagation ─────────────────
+
+class _R6Recorder(BaseLogSink):
+    """Keeps every LogEvent it receives."""
+
+    def __init__(self) -> None:
+        super().__init__(LogLevel.DEBUG)
+        self.events: list[LogEvent] = []
+
+    async def emit(self, event: LogEvent) -> None:
+        self.events.append(event)
+
+    def messages(self, node_id: str | None = None) -> list[str]:
+        return [e.message for e in self.events if node_id in (None, e.node_id)]
+
+
+class _R6BrokenSensor(BaseSenseNode):
+    node_id = "R6BrokenSensor"
+    signal_kind = "x"
+    poll_interval_s = 0.0
+
+    def __init__(self, bus: SignalBus) -> None:
+        super().__init__(bus)
+        self.reads = 0
+
+    async def read(self) -> Signal | None:
+        self.reads += 1
+        raise OSError("i2c bus error")
+
+
+class _R6BrokenInstinct(BaseInstinctNode):
+    node_id = "R6BrokenInstinct"
+    priority = 50
+
+    def __init__(self, bus: SignalBus) -> None:
+        super().__init__(bus)
+        self.calls = 0
+
+    async def evaluate(self, ctx: Context) -> Proposal | None:
+        self.calls += 1
+        raise RuntimeError("evaluate failed")
+
+
+class _R6Listener(BaseSenseNode):
+    node_id = "R6Listener"
+    signal_kind = "x"
+
+    def __init__(self, bus: SignalBus) -> None:
+        super().__init__(bus)
+        self.torn_down = False
+
+    async def setup(self) -> None:
+        self.spawn_background_task(asyncio.sleep(3600), name="gpio_listener")
+
+    async def teardown(self) -> None:
+        self.torn_down = True
+
+    async def read(self) -> Signal | None:
+        return None
+
+
+class _R6SlowCamera(BaseSenseNode):
+    node_id = "R6SlowCamera"
+    signal_kind = "x"
+
+    def __init__(self, bus: SignalBus) -> None:
+        super().__init__(bus)
+        self.opened = False
+        self.torn_down = False
+
+    async def setup(self) -> None:
+        await asyncio.sleep(0.05)
+        self.opened = True
+
+    async def teardown(self) -> None:
+        self.torn_down = True
+
+    async def read(self) -> Signal | None:
+        return None
+
+
+class _R6BadImu(BaseSenseNode):
+    node_id = "R6BadImu"
+    signal_kind = "x"
+
+    async def setup(self) -> None:
+        raise OSError("IMU not found")
+
+    async def read(self) -> Signal | None:
+        return None
+
+
+class _R6Chatty(BaseInstinctNode):
+    node_id = "R6Chatty"
+    priority = 50
+
+    async def evaluate(self, ctx: Context) -> Proposal | None:
+        self.logger.warning("user node warning")
+        if ctx.tick == 1:
+            return Proposal(
+                instinct_id=self.node_id, action_id="R6Noop", priority=50, urgency=0.5,
+            )
+        return None
+
+
+class _R6Noop(BaseActionNode):
+    node_id = "R6Noop"
+
+    async def execute(self, proposal: Proposal) -> Result:
+        self.logger.info("noop ran")
+        return Result(action_id=self.node_id, success=True)
+
+
+async def _r6_let_sinks_run() -> None:
+    for _ in range(5):
+        await asyncio.sleep(0)
+
+
+class TestReview6Runtime:
+    """R6-F4 / R6-F13 / R6-F17: runtime wiring of supervisors, setup and log sinks."""
+
+    @pytest.mark.asyncio
+    async def test_dead_sense_node_is_no_longer_read(self) -> None:
+        """R6-F4: a DEAD sense node is skipped by its master and never flaps DEAD -> FAULTED"""
+        builder = RuntimeBuilder()
+        sensor = _R6BrokenSensor(builder.bus)
+        rt = builder.sense(sensor).log_sinks([NullLogSink()]).build()
+        rt._supervisors[0]._restart_policy = RestartPolicy.NEVER
+        transitions: list[tuple[NodeState, NodeState]] = []
+
+        async def spy(sig: SupervisorSignal) -> None:
+            transitions.append((sig.previous_state, sig.current_state))
+
+        rt.bus.subscribe("supervisor", spy)  # type: ignore[arg-type]
+        for _ in range(5):
+            await rt.tick()
+        assert (NodeState.DEAD, NodeState.FAULTED) not in transitions
+        assert sensor.reads == 1
+        assert rt._supervisors[0].state_of(sensor.node_id) is NodeState.DEAD
+
+    @pytest.mark.asyncio
+    async def test_dead_instinct_is_no_longer_evaluated(self) -> None:
+        """R6-F4: a DEAD instinct is skipped by its master"""
+        builder = RuntimeBuilder()
+        instinct = _R6BrokenInstinct(builder.bus)
+        rt = builder.instinct(instinct).log_sinks([NullLogSink()]).build()
+        rt._supervisors[1]._restart_policy = RestartPolicy.NEVER
+        for _ in range(5):
+            await rt.tick()
+        assert instinct.calls == 1
+        assert rt._supervisors[1].state_of(instinct.node_id) is NodeState.DEAD
+
+    @pytest.mark.asyncio
+    async def test_failed_start_leaks_no_sibling_listener(self) -> None:
+        """R6-F13: a leaf setup() failure cancels siblings' listeners and tears them down"""
+        builder = RuntimeBuilder()
+        bus = builder.bus
+        listener, camera = _R6Listener(bus), _R6SlowCamera(bus)
+        rt = (
+            builder.sense(listener).sense(camera).sense(_R6BadImu(bus))
+            .log_sinks([NullLogSink()]).build()
+        )
+        with pytest.raises(OSError, match="IMU not found"):
+            await rt.start()
+        assert [t for t in listener._background_tasks if not t.done()] == []
+        assert listener.torn_down
+        assert camera.opened and camera.torn_down  # settled before start() raised
+
+    @pytest.mark.asyncio
+    async def test_runtime_sinks_reach_master_and_leaf_loggers(self) -> None:
+        """R6-F17: runtime log_sinks receive framework and user-node events"""
+        sink = _R6Recorder()
+        rt = RuntimeBuilder().instinct(_R6Chatty).action(_R6Noop).log_sinks([sink]).build()
+        await rt.tick()
+        await rt.wait_idle()
+        await rt.tick()
+        await _r6_let_sinks_run()
+        messages = sink.messages()
+        assert "Dispatching action" in messages
+        assert "Action complete" in messages
+        assert "user node warning" in sink.messages("R6Chatty")
+        assert "noop ran" in sink.messages("R6Noop")
+
+    @pytest.mark.asyncio
+    async def test_node_own_sinks_take_precedence(self) -> None:
+        """R6-F17: a node built with its own log_sinks keeps them; runtime sinks fill the rest"""
+        builder = RuntimeBuilder()
+        own, shared = _R6Recorder(), _R6Recorder()
+        chatty = _R6Chatty(builder.bus, log_sinks=[own])
+        rt = (
+            builder.instinct(chatty).action(_R6Noop)
+            .log_sinks([shared]).build()
+        )
+        await rt.tick()
+        await rt.wait_idle()
+        await _r6_let_sinks_run()
+        assert "user node warning" in own.messages("R6Chatty")
+        assert shared.messages("R6Chatty") == []
+        assert "Dispatching action" in shared.messages()

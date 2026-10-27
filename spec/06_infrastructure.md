@@ -186,6 +186,8 @@ class SignalBusLogSink\(BaseLogSink\): \.\.\.   \# publishes LogEvents as Signal
 
 runtime = ArachniteRuntime\(\.\.\., log\_sinks=\[StdoutLogSink\(level=LogLevel\.INFO\)\]\)
 
+**Propagation and precedence\.** The sinks given to `ArachniteRuntime` \(or `RuntimeBuilder.log_sinks\(\)`\) — by default a `StdoutLogSink\(level=WARNING\)` — are the sinks of the runtime logger and of every master, decision\-strategy and leaf logger **that has no sinks of its own** \(at construction, at `start\(\)` and on `register_*_live\(\)`\)\. A node constructed with a non\-empty `log_sinks` keeps exactly those and does not also log to the runtime's; pass `\[NullLogSink\(\)\]` to silence one node\. A logger without any sink returns before building a `LogEvent`\.
+
 ## __13\.3 Framework\-Emitted Events__
 
 The framework automatically emits the following LogEvents without any developer code\. Events are identified by their `(level, message)` pair on the `LogEvent` dataclass; the "Event" column below is the conceptual name used in spec text\.
@@ -372,6 +374,10 @@ await dashboard\.stop\(\)
 
 \- log\_file writes are synchronous and wrapped in asyncio\.to\_thread\(\) to avoid blocking the event loop
 
+\- The `/ws` stream is same\-origin by default: browsers apply no same\-origin policy to WebSockets, so a handshake whose `Origin` host:port differs from the request `Host` is refused \(close code 1008, before any frame\)\. A client that sends no `Origin` \(scripts, CLI tools\) is accepted\. `allowed\_origins=\[\.\.\.\]` lists further origins \(exact `scheme://host\[:port\]`\); `"\*"` allows any \(not recommended\)\. This is independent of `auth\_token`\.
+
+\- `FrameworkConfig\.build\_log\_sinks\(\)` returns its `FileLogSink` already opened \(an unopened FileLogSink drops every event\); the caller may `close\(\)` it on shutdown\.
+
 
 # __14\. Signal Serialisation__
 
@@ -475,7 +481,7 @@ transport = MQTTTransport\(
 On constrained edge devices, Signal\.value may be large \(camera frames, audio buffers\)\. Two mechanisms control memory usage:
 
 - ContextNode\.history\_length limits the number of ticks retained\. For large signal kinds, consider a smaller history or per\-kind limits via history\_config\.
-- HistoryConfig\.max\_ticks: keep only the most recent N tick occurrences of this kind in history\. Older occurrences are evicted in place \(value set to None, metadata\["evicted"\]=True, metadata\["reason"\]="max\_ticks"\) so signals of other kinds in the same tick slot remain readable\. `None` \(default\) falls back to ContextNode\.history\_length; `0` evicts every occurrence\.
+- HistoryConfig\.max\_ticks: keep only the most recent N tick occurrences of this kind in history\. Older occurrences are evicted in place in the history slot \(value set to None, metadata\["evicted"\]=True, metadata\["reason"\]="max\_ticks"\) so signals of other kinds in the same tick slot remain readable\. Eviction applies to the rolling history only and is copy\-on\-evict: the slot's list is copied before its first replacement, so the current tick's `ctx\.signals`, the caller's list and every Context handed out earlier are never rewritten\. `None` \(default\) falls back to ContextNode\.history\_length; `0` evicts every occurrence\.
 - HistoryConfig\.value\_ttl\_s: signals older than this are evicted from history \(value set to None, confidence to 0\.0\) regardless of history\_length\. Useful for high\-frequency sensors on memory\-constrained devices\.
 - Large values are never transmitted over the bus unless a subscriber on a different AgentNode has subscribed to that kind\. The transport filters before serialising\. \(Planned optimisation: the SignalBus↔transport bridge is wired \(spec §10\), but it currently forwards every published signal to the transport; the publish\-side filtering by remote subscription described here is not yet implemented\.\)
 

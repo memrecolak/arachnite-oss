@@ -342,7 +342,7 @@ The state dict persists across ticks\. Nodes can use it to remember facts beyond
 
 **State key limit:** Pass `max_state_keys` to cap the number of keys in the state dict\. When a `set()`, `StateUpdateSignal` write, or persisted\-state load would cause the dict to exceed the limit, the oldest key by insertion order is evicted until the size is within bounds\. `None` \(the default\) means no limit\. The value MUST be `>= 1` or `None`; values `< 1` raise `ValueError` at construction time\. The corresponding `ContextSettings.max_state_keys` field in `FrameworkConfig` uses `0` to mean no limit \(converted to `None` internally\)\.
 
-**State persistence:** Pass `state_path` to persist the state dict across reboots\. The file is written as JSON\. Pass `flush_on_write=True` to flush automatically on every `set()`/`delete()` call \(appropriate for the Ariadne self\-model and world\-model\), or call `flush_state()` explicitly from teardown\(\)\.
+**State persistence:** Pass `state_path` to persist the state dict across reboots\. The file is written as JSON\. Pass `flush_on_write=True` to flush automatically on every `set()`/`delete()` call and on every `update()` whose StateUpdateSignals changed the state \(appropriate for the Ariadne self\-model and world\-model\), or call `flush_state()` explicitly from teardown\(\)\. A StateUpdateSignal that writes an unchanged value does not rewrite the file\.
 
 **StateUpdateSignal:** Any node can write to `ContextNode._state` without holding a direct reference to ContextNode by emitting a `StateUpdateSignal`\. Timing depends on the emitter\. A **sense node** returning one from `read()` has it applied in the **same tick** — it rides the sense output into `update()`, which intercepts it before the snapshot is built and before instincts run\. **Any other node** \(instinct / action / reflex\) publishing one onto the bus has it buffered by the runtime and applied at the **start of the next tick** \(N\+1\), mirroring the `node_fault` path: instincts and actions run after `update()`, so a write they emit cannot land in the tick it was published\. `read_all()` also publishes the sense output on the bus for subscribers; the runtime recognises that copy \(`SenseMasterNode.returned_this_tick()`\) and does **not** buffer it, since it has already been applied this tick — otherwise the echo would be re\-applied at the start of the next tick, after and therefore over that tick’s fresh reading, leaving every sense\-written key one tick stale\. A genuine bus write still wins over a same\-key sense write within one drain\.
 
@@ -458,7 +458,9 @@ class InstinctMasterNode\(BaseNode\):
 
 ### __LLMInstinctNode__
 
-A concrete subclass of BaseInstinctNode that delegates evaluation to a language model \(Claude by default via the Anthropic API\)\. The LLM is called in the background via asyncio\.to\_thread\(\) so the tick loop is never blocked\. The most recently completed Proposal is cached and returned on each tick until superseded\.
+A concrete subclass of BaseInstinctNode that delegates evaluation to a language model \(Claude by default via the Anthropic API\)\. The LLM is called in a background daemon thread so the tick loop is never blocked\. The most recently completed Proposal is cached and returned on each tick until superseded\.
+
+**Failure and timeout\.** A call that raises, exceeds `call_timeout_s` \(class attribute, default 30 s; `None` = unbounded\) or returns an invalid `propose_action` \(arguments not an object, unknown action, urgency not a finite number in \[0, 1\], parameters not an object\) clears the cached Proposal: the node proposes nothing until a call succeeds again, so a decision made on old observations is never re\-proposed\. A timed\-out or cancelled call's thread is abandoned \(daemon: it never delays `stop\(\)` or interpreter exit\), and no new call starts until it has returned, so one node never calls its provider concurrently\.
 
 Requires the optional dependency: pip install arachnite\[llm\]
 
@@ -812,7 +814,7 @@ Samples probabilistically from proposals weighted by urgency\. Useful for explor
 
 __ActiveInferenceDecisionNode__
 
-Selects proposals by minimising expected free energy \(EFE\), trading off pragmatic value \(goal achievement\) against epistemic value \(uncertainty reduction\)\. EFE\(p\) = \-priority\(p\) × urgency\(p\) \+ β × \(1 \- avg\_confidence\(p\)\)\. Parameters: `beta` \(0\.0 = pure exploitation equivalent to WeightedDecisionNode; \>0 = exploration\-exploitation balance\), `temperature` \(0\.0 = deterministic argmin; \>0 = softmax probabilistic selection\), `prior_confidence` \(default confidence when evidence lacks \_confidence keys\), `seed` \(reproducible softmax sampling\)\. Confidence is extracted from the proposal's `evidence` dict \(keys ending in `_confidence`\)\. Based on Friston's free\-energy principle and Pezzato et al\.'s active inference for robotics\.
+Selects proposals by minimising expected free energy \(EFE\), trading off pragmatic value \(goal achievement\) against epistemic value \(uncertainty reduction\)\. EFE\(p\) = \-priority\(p\) × urgency\(p\) \+ β × \(1 \- avg\_confidence\(p\)\)\. Parameters: `beta` \(0\.0 = pure exploitation equivalent to WeightedDecisionNode; \>0 = low\-confidence proposals are penalised by up to β\), `temperature` \(0\.0 = deterministic argmin; \>0 = softmax probabilistic selection\), `prior_confidence` \(default confidence when evidence lacks valid \_confidence keys\), `seed` \(reproducible softmax sampling\)\. `beta` and `temperature` MUST be finite and ≥ 0 and `prior_confidence` in \[0, 1\] \(else `ValueError`\)\. Confidence is extracted from the proposal's `evidence` dict \(keys ending in `_confidence`\): non\-numbers, bools and non\-finite values \(NaN, inf\) are ignored and finite values are clamped to \[0, 1\], so the uncertainty term always lies in \[0, β\]\. Because it is added to EFE, the term favours better\-evidenced proposals; at β = 1 it only separates proposals whose pragmatic values differ by less than 1\. Based on Friston's free\-energy principle and Pezzato et al\.'s active inference for robotics\.
 
 ### __Multi\-Proposal Selection \(Concurrent Dispatch\)__
 
@@ -1116,7 +1118,7 @@ Node was intentionally stopped by the runtime or supervisor\.
 
 __DEAD__
 
-Node exceeded max\_restarts and will not be restarted\.
+Node exceeded max\_restarts \(or faulted under `RestartPolicy.NEVER`\) and will not be restarted\. DEAD is terminal: further faults leave the node DEAD and publish nothing, no scheduled restart runs, and its master no longer runs it \(no `read\(\)` / `evaluate\(\)` / tick hooks — see §6\.2\)\. Only an explicit `restart\(\)` or a fresh `track\(\)` brings it back\.
 
 ## __6\.2 NodeSupervisor__
 
@@ -1175,6 +1177,10 @@ class NodeSupervisor:
         """Number of restart tasks currently in flight\."""
 
 NodeSupervisor MUST track every restart coroutine as a task in an internal `\_restart\_tasks` set\. When a restart completes or is cancelled, it MUST be removed from the set\. `cancel\_restart\_tasks\(\)` cancels all tasks in the set and awaits their cancellation\.
+
+**Bounded restarts\.** A node has at most one restart pending or in progress at a time\. A fault arriving while one is pending \(e\.g\. on every tick inside `restart_delay_s`\) is still reported — FAULTED transition, `SupervisorSignal` and `NodeFaultSignal` — but schedules nothing\. Every restart attempt counts against `max_restarts`, so a node is restarted at most `max_restarts` times before it goes DEAD\. A manual `restart\(\)` cancels a scheduled restart still pending for the node first\. Each restart cancels the node's background tasks \(`cancel_background_tasks\(\)`\) before `teardown\(\)` / `setup\(\)`, so listeners spawned by the previous `setup\(\)` never run beside the new ones\.
+
+**DEAD nodes are not run\.** `dead_node_ids` is a live, read\-only set of the tracked nodes in DEAD state\. The runtime installs it on the sense, instinct and action masters \(`set_dead_nodes\(\)`\); every per\-node fan\-out of a master \(`read\(\)`, `evaluate\(\)`, `on_tick_start/end`, `on_pause/resume`\) skips those nodes — an O\(1\) set lookup, and no work at all while the set is empty\. An action node is still dispatched when a proposal names it \(a DEAD action is only ever run on request, and refusing a reflex's safety action silently would be the worse failure\); its faults no longer change its state\.
 
 ## __6\.3 RestartPolicy__
 

@@ -5,6 +5,11 @@ FrameworkConfig — typed configuration loader for the Arachnite runtime.
 
 Reads arachnite.toml (TOML, stdlib tomllib, Python 3.11+).
 Supports ${ENV_VAR} and ${ENV_VAR:-default} interpolation in string values.
+Every value is checked against its setting's declared type; a string (the
+only form ${...} interpolation can produce) is converted, so
+``flush_on_write = "${FLUSH:-false}"`` is ``False`` and
+``tick_rate_hz = "${HZ:-20}"`` is ``20.0``. A value that does not convert
+raises ``ValueError`` naming the section and key.
 
 This config covers the *framework plumbing*: how fast to tick, which transport
 to use, logging verbosity, supervisor restart policies, and context history.
@@ -22,8 +27,9 @@ Usage::
 
     rt = ArachniteRuntime(
         ...,
-        tick_rate_hz = cfg.runtime.tick_rate_hz,
-        log_sinks    = log_sinks,
+        tick_rate_hz         = cfg.runtime.tick_rate_hz,
+        log_sinks            = log_sinks,
+        shutdown_coordinator = cfg.build_shutdown_coordinator(),
     )
 """
 
@@ -151,8 +157,11 @@ class FrameworkConfig:
     @classmethod
     def _from_dict(cls, d: dict[str, Any]) -> FrameworkConfig:
         def _pick(src: dict[str, Any], dc: type) -> dict[str, Any]:
-            valid = {f.name for f in dataclasses.fields(dc)}
-            return {k: v for k, v in src.items() if k in valid}
+            types = {f.name: f.type for f in dataclasses.fields(dc)}
+            return {
+                k: _coerce(dc.__name__, k, str(types[k]), v)
+                for k, v in src.items() if k in types
+            }
 
         rt_d   = d.get("runtime", {})
         tr_d   = d.get("transport", {})
@@ -228,7 +237,9 @@ class FrameworkConfig:
 
         if self.logging.file:
             from arachnite.web import FileLogSink  # noqa: PLC0415
-            sinks.append(FileLogSink(path=self.logging.file, level=level))
+            file_sink = FileLogSink(path=self.logging.file, level=level)
+            file_sink.open()  # an unopened FileLogSink drops every event
+            sinks.append(file_sink)
 
         return sinks
 
@@ -247,6 +258,18 @@ class FrameworkConfig:
             flush_on_write = self.context.flush_on_write,
             max_state_keys = self.context.max_state_keys or None,
         )
+
+    def build_shutdown_coordinator(self) -> Any:
+        """
+        Build a ShutdownCoordinator applying ``runtime.teardown_timeout_s``.
+
+        Usage::
+
+            rt = ArachniteRuntime(..., shutdown_coordinator=cfg.build_shutdown_coordinator())
+        """
+        from arachnite.shutdown import ShutdownCoordinator  # noqa: PLC0415
+
+        return ShutdownCoordinator(teardown_timeout_s=self.runtime.teardown_timeout_s)
 
     def build_supervisor_kwargs(self) -> dict[str, Any]:
         """
@@ -275,6 +298,60 @@ class FrameworkConfig:
             "max_restarts":    self.supervisor.max_restarts,
             "restart_delay_s": self.supervisor.restart_delay_s,
         }
+
+
+# ── Type coercion ──────────────────────────────────────────────────────────────
+
+_TRUE_STRINGS = frozenset({"true", "1", "yes", "on"})
+_FALSE_STRINGS = frozenset({"false", "0", "no", "off", ""})
+
+
+def _coerce(section: str, key: str, type_name: str, value: Any) -> Any:
+    """
+    Check ``value`` against a setting's declared type (``bool``, ``int``,
+    ``float`` or ``str``), converting strings — ``${VAR}`` interpolation only
+    ever yields strings. Raises ValueError for anything that does not fit
+    (e.g. ``"maybe"`` for a bool, ``True`` or ``"fast"`` for a float).
+    """
+    def _bad() -> ValueError:
+        return ValueError(
+            f"{section}.{key}: expected {type_name}, got {value!r}"
+        )
+
+    if type_name == "bool":
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            text = value.strip().lower()
+            if text in _TRUE_STRINGS:
+                return True
+            if text in _FALSE_STRINGS:
+                return False
+        raise _bad()
+    if type_name in ("int", "float"):
+        if isinstance(value, bool):
+            raise _bad()
+        try:
+            if type_name == "int":
+                if isinstance(value, int):
+                    return value
+                if isinstance(value, float) and value.is_integer():
+                    return int(value)
+                if isinstance(value, str):
+                    return int(value.strip())
+                raise _bad()
+            if isinstance(value, (int, float)):
+                return float(value)
+            if isinstance(value, str):
+                return float(value.strip())
+        except ValueError:
+            raise _bad() from None
+        raise _bad()
+    if type_name == "str":
+        if isinstance(value, str):
+            return value
+        raise _bad()
+    return value
 
 
 # ── Env-var interpolation ──────────────────────────────────────────────────────

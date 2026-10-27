@@ -72,8 +72,10 @@ class Context:
     The plural fields ``last_results`` and ``action_states`` support
     concurrent action execution (multiple ActionNodes running in
     parallel).  The singular ``last_result`` and ``action_state``
-    fields remain for backward compatibility and reflect the
-    highest-priority item from the plural lists.
+    fields remain for backward compatibility and hold the first item
+    of the plural lists: ``last_results`` is in completion order, so
+    ``last_result`` is the first-completed result (spec §7.2.1), not
+    the highest-priority one.
     """
     tick:         int
     signals:      list[Signal]

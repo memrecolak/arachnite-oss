@@ -31,8 +31,17 @@ The EFE for a proposal is:
 The agent selects the proposal with the LOWEST EFE (most negative = best).
 
 When beta=0, this reduces to the WeightedDecisionNode.
-When beta is high, the agent prefers actions in uncertain contexts
-(exploration over exploitation).
+Because the uncertainty term ``beta * (1 - avg_confidence)`` *adds* to G,
+a larger beta penalises low-confidence proposals: between proposals of
+similar pragmatic value the agent prefers the better-evidenced one. The
+term is bounded by ``[0, beta]`` while ``priority * urgency`` spans
+``0..priority``, so at ``beta = 1`` it only separates proposals whose
+pragmatic values differ by less than 1 (in practice: a tie-breaker).
+
+Evidence confidences are validated: a non-finite value (NaN, inf) or a
+non-number is ignored, and a finite one is clamped to [0, 1], so a
+malformed evidence entry can neither win the argmin by list position nor
+turn the uncertainty penalty into a bonus.
 """
 
 from __future__ import annotations
@@ -63,14 +72,15 @@ class ActiveInferenceDecisionNode(BaseDecisionNode):
     Lower EFE is better (selected).
 
     Args:
-        beta: Weight for epistemic value (exploration).
-              0.0 = pure exploitation (equivalent to WeightedDecisionNode).
-              1.0 = balanced exploration/exploitation.
-              >1.0 = exploration-biased.
+        beta: Weight of the uncertainty term ``1 - avg_confidence``.
+              0.0 = pragmatic value only (equivalent to WeightedDecisionNode).
+              >0.0 = low-confidence proposals are penalised by up to beta.
+              Must be finite and >= 0.
         temperature: Softmax temperature for probabilistic selection.
               0.0 = deterministic (argmin EFE).
-              >0.0 = probabilistic (softmax over -EFE).
-        prior_confidence: Default confidence when proposal has no evidence.
+              >0.0 = probabilistic (softmax over -EFE). Must be finite and >= 0.
+        prior_confidence: Default confidence when proposal has no (valid)
+              evidence. Must be in [0, 1].
         seed: Seed for the softmax sampling (temperature > 0), giving a
               reproducible sequence of choices; None uses the module-level
               ``random`` generator.
@@ -87,6 +97,12 @@ class ActiveInferenceDecisionNode(BaseDecisionNode):
         **kwargs: object,
     ) -> None:
         super().__init__(**kwargs)  # type: ignore[arg-type]
+        if not (math.isfinite(beta) and beta >= 0.0):
+            raise ValueError(f"beta must be finite and >= 0, got {beta}")
+        if not (math.isfinite(temperature) and temperature >= 0.0):
+            raise ValueError(f"temperature must be finite and >= 0, got {temperature}")
+        if not 0.0 <= prior_confidence <= 1.0:  # also rejects NaN
+            raise ValueError(f"prior_confidence must be in [0, 1], got {prior_confidence}")
         self.beta = beta
         self.temperature = temperature
         self.prior_confidence = prior_confidence
@@ -99,16 +115,23 @@ class ActiveInferenceDecisionNode(BaseDecisionNode):
     def _epistemic_value(self, p: Proposal) -> float:
         """Information gain: how much uncertainty does this action context have.
 
-        High epistemic value = high uncertainty = more to learn.
-        Computed from signal confidences referenced in the proposal's evidence.
+        High epistemic value = high uncertainty. Computed from the
+        ``*_confidence`` entries of the proposal's evidence: non-numbers
+        (including bools) and non-finite values are ignored, finite values
+        are clamped to [0, 1]; the result is always in [0, 1].
         """
         confidences: list[float] = []
 
         # Extract confidence from evidence if available
         if p.evidence:
             for key, val in p.evidence.items():
-                if key.endswith("_confidence") and isinstance(val, (int, float)):
-                    confidences.append(float(val))
+                if (
+                    key.endswith("_confidence")
+                    and isinstance(val, (int, float))
+                    and not isinstance(val, bool)
+                    and math.isfinite(val)
+                ):
+                    confidences.append(min(1.0, max(0.0, float(val))))
 
         if not confidences:
             # Fall back to prior: moderate uncertainty
