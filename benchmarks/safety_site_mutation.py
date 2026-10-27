@@ -143,6 +143,7 @@ SITES: tuple[Site, ...] = (
         tests=(
             "tests/unit/test_action.py",
             "tests/unit/test_reflex_arbitration.py",
+            "tests/unit/test_mutation_gaps_arbitration.py",
             "tests/integration/test_interrupt_policies.py",
         ),
     ),
@@ -227,6 +228,7 @@ SITES: tuple[Site, ...] = (
         ),
         tests=(
             "tests/unit/test_reflex_arbitration.py",
+            "tests/unit/test_mutation_gaps_arbitration.py",
             "tests/integration/test_reflex_arbitration_runtime.py",
             "tests/integration/test_runtime_monitor_state.py",
         ),
@@ -258,6 +260,7 @@ SITES: tuple[Site, ...] = (
         tests=(
             "tests/unit/test_action.py",
             "tests/unit/test_reflex_arbitration.py",
+            "tests/unit/test_mutation_gaps_arbitration.py",
             "tests/integration/test_reflex_arbitration_runtime.py",
         ),
         note="The preempted owner's on_preempted() runs (bounded) before the "
