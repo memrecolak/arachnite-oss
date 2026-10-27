@@ -943,3 +943,31 @@ class TestSixthReviewRegressions:
         proposals = await im.evaluate_all(_ctx())
         assert [p.instinct_id for p in proposals] == ["AlwaysProposesInstinct"]
         assert faults == ["ReturnsDict"]
+
+
+class TestSeventhReviewRegressions:
+    @pytest.mark.asyncio
+    async def test_dead_reflex_is_skipped_and_its_sibling_still_fires(self) -> None:
+        """R7-D1: a DEAD reflex among the enabled ones does not break the pairing of the rest"""
+        im = InstinctMasterNode(bus=_bus())
+        im.register(_ProposingReflex(_bus(), "DeadReflex", instinct_id="DeadReflex"))
+        im.register(_ProposingReflex(_bus(), "LiveReflex", instinct_id="LiveReflex"))
+        im.set_dead_nodes({"DeadReflex"})
+        pairs = await im.evaluate_reflex_pairs(_ctx())
+        assert [(n.node_id, p.instinct_id) for n, p in pairs] == [("LiveReflex", "LiveReflex")]
+        proposals = await im.evaluate_reflexes(_ctx())
+        assert [p.instinct_id for p in proposals] == ["LiveReflex"]
+
+    @pytest.mark.asyncio
+    async def test_gather_nodes_keeps_one_entry_per_call(self) -> None:
+        """R7-D1: _gather_nodes yields None for a DEAD node, in position, so callers can zip"""
+        im = InstinctMasterNode(bus=_bus())
+        im.set_dead_nodes({"b"})
+
+        async def value(v: str) -> str:
+            return v
+
+        results = await im._gather_nodes("test", [("a", value("A")), ("b", value("B")),
+                                                  ("c", value("C"))])
+        assert results == ["A", None, "C"]
+

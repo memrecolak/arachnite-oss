@@ -157,20 +157,28 @@ class FaultReportingMixin:
         cancel of the caller still propagates (``gather`` raises it).
 
         A node the supervisor declared DEAD is skipped: its call is never
-        started (the unstarted coroutine is closed) and yields nothing.
+        started (the unstarted coroutine is closed) and yields None.
+
+        The result list has exactly one entry per call, in order, so a
+        caller may pair it with its node list.
         """
         dead = self._dead_nodes
+        skipped: set[int] = set()
         if dead:
-            live: list[tuple[str, Awaitable[_T]]] = []
-            for node_id, aw in calls:
-                if node_id in dead and asyncio.iscoroutine(aw):
-                    aw.close()
-                else:
-                    live.append((node_id, aw))
-            calls = live
-        outcomes = await asyncio.gather(*(aw for _, aw in calls), return_exceptions=True)
+            for index, (node_id, aw) in enumerate(calls):
+                if node_id in dead:
+                    skipped.add(index)
+                    if asyncio.iscoroutine(aw):
+                        aw.close()
+        live = [c for i, c in enumerate(calls) if i not in skipped]
+        outcomes = await asyncio.gather(*(aw for _, aw in live), return_exceptions=True)
         results: list[_T | None] = []
-        for (node_id, _), outcome in zip(calls, outcomes, strict=True):
+        live_outcomes = iter(zip(live, outcomes, strict=True))
+        for index in range(len(calls)):
+            if index in skipped:
+                results.append(None)
+                continue
+            (node_id, _), outcome = next(live_outcomes)
             if not isinstance(outcome, BaseException):
                 results.append(outcome)
                 continue
