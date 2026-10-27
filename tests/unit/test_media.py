@@ -173,3 +173,65 @@ class TestMediaStorePathTraversal:
         path = store.store(b"depth data", kind="depth_v2", source="cam-01")
         assert path.is_absolute()
         assert path.exists()
+
+
+# ── Review 6: unique names and a real containment check ──────────────────────
+
+class _R6TickingClock:
+    """time stand-in whose monotonic() advances 30 us per call (realistic burst)."""
+
+    def __init__(self) -> None:
+        self.now = 1000.0
+
+    def monotonic(self) -> float:
+        self.now += 30e-6
+        return self.now
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(time, name)
+
+
+class TestR6MediaStoreSafety:
+    """R6-F12-14/15: MediaStore never overwrites a stored file or writes outside base_dir."""
+
+    def test_same_bucket_stores_get_distinct_files(
+        self, store: MediaStore, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """R6-F12-14: stores within one 100 us timestamp bucket do not collide"""
+        import arachnite.media as media_module
+        monkeypatch.setattr(media_module, "time", _R6TickingClock())
+        paths = [store.store(f"frame-{i}".encode(), kind="camera", source="Cam", tick=7)
+                 for i in range(10)]
+        assert len(set(paths)) == 10
+        assert [p.read_bytes() for p in paths] == [f"frame-{i}".encode() for i in range(10)]
+        assert store.file_count() == 10
+
+    def test_extension_cannot_traverse(self, tmp_path: Path) -> None:
+        """R6-F12-15: a path-like extension is rejected before anything is written"""
+        base, sibling = tmp_path / "media", tmp_path / "media_evil"
+        sibling.mkdir()
+        store = MediaStore(base_dir=base)
+        for ext in ("/../../../media_evil/pwn.txt", "\\..\\x.txt", ".jpg/..", "..", ".a b"):
+            with pytest.raises(PathTraversalError):
+                store.store(b"pwned", kind="camera", source="Cam", extension=ext)
+        assert list(sibling.iterdir()) == []
+
+    def test_containment_is_a_path_check_not_a_string_prefix(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """R6-F12-15: '<base>_evil/...' is outside '<base>' even though it shares a prefix"""
+        base, sibling = tmp_path / "media", tmp_path / "media_evil"
+        sibling.mkdir()
+        store = MediaStore(base_dir=base)
+        real_resolve = Path.resolve
+
+        def escaping_resolve(self: Path, strict: bool = False) -> Path:
+            resolved = real_resolve(self, strict=strict)
+            if resolved.parent == real_resolve(base / "camera"):
+                return real_resolve(sibling) / resolved.name   # a symlinked kind dir
+            return resolved
+
+        monkeypatch.setattr(Path, "resolve", escaping_resolve)
+        with pytest.raises(PathTraversalError):
+            store.store(b"x", kind="camera", source="Cam")
+        assert list(sibling.iterdir()) == []

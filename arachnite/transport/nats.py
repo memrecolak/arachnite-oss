@@ -35,6 +35,9 @@ class NATSTransport(BaseTransport):
         {subject_prefix}.{signal.kind}
     e.g.  arachnite.thermal, arachnite.visual
 
+    The wildcard kind ``'*'`` subscribes ``{subject_prefix}.>`` (every
+    subject under the prefix, including kinds that contain dots).
+
     Supports optional JetStream persistence for replay and guaranteed delivery.
     Recommended for cloud nodes and laptop-class hardware.
 
@@ -68,6 +71,10 @@ class NATSTransport(BaseTransport):
 
     # ── Connection ────────────────────────────────────────────────────────────
 
+    def _subject(self, kind: str) -> str:
+        """The NATS subject of a kind; '*' maps to the full wildcard '>'."""
+        return f"{self._subject_pfx}.{'>' if kind == '*' else kind}"
+
     async def connect(self) -> None:
         """Connect to the NATS server."""
         self._codec.check_network_safety(type(self).__name__)
@@ -83,13 +90,21 @@ class NATSTransport(BaseTransport):
             self._connected = True
             self._logger.info("Transport connected", transport=type(self).__name__)
             # Subscribe to any kinds registered before connect() was called
-            for kind, callbacks in self._subscribers.items():
+            # (or before a disconnect()/connect() cycle: disconnect() drops
+            # the old connection's Subscription objects).
+            for kind, callbacks in list(self._subscribers.items()):
                 if callbacks and kind not in self._subs:
-                    subject = f"{self._subject_pfx}.{kind}"
-                    with contextlib.suppress(Exception):
-                        sub = await self._nc.subscribe(subject, cb=self._make_handler(kind))
-                        self._subs[kind] = sub
+                    self._subs[kind] = await self._nc.subscribe(
+                        self._subject(kind), cb=self._make_handler(kind),
+                    )
         except Exception as exc:
+            # Do not leave a half-open connection behind a failed connect().
+            self._connected = False
+            self._subs.clear()
+            if self._nc is not None:
+                with contextlib.suppress(Exception):
+                    await self._nc.drain()
+                self._nc = None
             raise TransportConnectionError(
                 "NATSTransport", str(exc)
             ) from exc
@@ -98,6 +113,9 @@ class NATSTransport(BaseTransport):
         """Drain pending messages and close the connection."""
         self._logger.info("Transport disconnected", transport=type(self).__name__)
         self._connected = False
+        # The Subscription objects belong to the connection being closed; a
+        # later connect() must subscribe afresh on the new one.
+        self._subs.clear()
         if self._nc:
             with contextlib.suppress(Exception):
                 await self._nc.drain()
@@ -108,16 +126,16 @@ class NATSTransport(BaseTransport):
     async def publish(self, signal: Signal) -> None:
         if not self._connected or self._nc is None:
             raise TransportConnectionError("NATSTransport", "Not connected")
-        subject = f"{self._subject_pfx}.{signal.kind}"
+        subject = self._subject(signal.kind)
         payload = self._encode_signal(signal)
         await self._nc.publish(subject, payload)
 
     async def subscribe(self, kind: str, callback: Callback) -> None:
-        self._subscribers[kind].append(callback)
+        if callback not in self._subscribers[kind]:
+            self._subscribers[kind].append(callback)
         if kind not in self._subs and self._connected and self._nc:
-            subject = f"{self._subject_pfx}.{kind}"
             sub = await self._nc.subscribe(
-                subject,
+                self._subject(kind),
                 cb=self._make_handler(kind),
             )
             self._subs[kind] = sub
@@ -131,18 +149,35 @@ class NATSTransport(BaseTransport):
                 await sub.unsubscribe()  # type: ignore[attr-defined]
 
     def _make_handler(self, kind: str) -> Callable[[object], Awaitable[None]]:
+        """
+        Message handler of the server subscription for ``kind``.
+
+        NATS delivers a message once per matching subscription, so with both
+        ``<prefix>.<kind>`` and the wildcard ``<prefix>.>`` subscribed, each
+        message arrives twice. Each copy serves a disjoint set of callbacks:
+        the kind subscription serves the kind's callbacks (plus the '*' ones
+        while no wildcard subscription exists), the wildcard subscription
+        serves the '*' callbacks not already served by a kind subscription.
+        """
         async def handler(msg: object) -> None:
             try:
                 signal = self._decode_signal(msg.data)  # type: ignore[attr-defined]
-            except Exception:
+            except Exception as exc:
+                self._logger.warning(
+                    "Dropped undecodable NATS message",
+                    error=f"{type(exc).__name__}: {exc}",
+                )
                 return
-            callbacks = (
-                list(self._subscribers.get(signal.kind, []))
-                + list(self._subscribers.get("*", []))
-            )
-            for cb in callbacks:
-                with contextlib.suppress(Exception):
-                    await cb(signal)
+            if kind == "*":
+                callbacks = list(self._subscribers.get("*", []))
+                if signal.kind in self._subs:
+                    served = self._subscribers.get(signal.kind, [])
+                    callbacks = [cb for cb in callbacks if cb not in served]
+            else:
+                callbacks = list(self._subscribers.get(signal.kind, []))
+                if "*" not in self._subs:
+                    callbacks += list(self._subscribers.get("*", []))
+            await self._deliver(signal, callbacks)
         return handler
 
     # ── NATS event callbacks ──────────────────────────────────────────────────

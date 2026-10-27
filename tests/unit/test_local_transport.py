@@ -74,15 +74,20 @@ class TestLocalTransportPublish:
     @pytest.mark.asyncio
     async def test_publish_delivers_to_both_kind_and_wildcard(self) -> None:
         t        = LocalTransport()
-        received = []
+        kind_seen: list[Signal] = []
+        star_seen: list[Signal] = []
 
-        async def cb(sig: Signal) -> None:
-            received.append(sig)
+        async def kind_cb(sig: Signal) -> None:
+            kind_seen.append(sig)
 
-        await t.subscribe("temperature", cb)
-        await t.subscribe("*", cb)
+        async def star_cb(sig: Signal) -> None:
+            star_seen.append(sig)
+
+        await t.subscribe("temperature", kind_cb)
+        await t.subscribe("*", star_cb)
         await t.publish(_sig("temperature"))
-        assert len(received) == 2
+        assert len(kind_seen) == 1
+        assert len(star_seen) == 1
 
 
 # ── Subscribe / Unsubscribe ───────────────────────────────────────────────────
@@ -131,3 +136,54 @@ class TestBaseTransportProperties:
     def test_agent_node_id_property(self) -> None:
         t = LocalTransport(agent_node_id="my-device")
         assert t.agent_node_id == "my-device"
+
+
+# ── Review 6 (distributed): delivery semantics shared with network transports ─
+
+class TestR6LocalTransportDelivery:
+    """R6-F12-01/23: once per callback, error isolation, snapshot iteration."""
+
+    async def test_callback_under_kind_and_wildcard_called_once(self) -> None:
+        """R6-F12-01: one callback registered under 'k' and '*' is called once"""
+        t = LocalTransport()
+        received: list[Signal] = []
+
+        async def cb(sig: Signal) -> None:
+            received.append(sig)
+
+        await t.subscribe("temperature", cb)
+        await t.subscribe("*", cb)
+        await t.publish(_sig("temperature"))
+        assert len(received) == 1
+
+    async def test_raising_subscriber_does_not_stop_delivery(self) -> None:
+        """R6-F12-23: a raising subscriber neither aborts later ones nor the publisher"""
+        t = LocalTransport()
+        after: list[Signal] = []
+
+        async def boom(_s: Signal) -> None:
+            raise RuntimeError("subscriber bug")
+
+        async def later(sig: Signal) -> None:
+            after.append(sig)
+
+        await t.subscribe("k", boom)
+        await t.subscribe("k", later)
+        await t.publish(_sig("k"))   # must not raise
+        assert len(after) == 1
+
+    async def test_self_unsubscribing_subscriber_does_not_skip_the_next(self) -> None:
+        """R6-F12-23: delivery iterates a snapshot of the subscriber list"""
+        t = LocalTransport()
+        nxt: list[Signal] = []
+
+        async def one_shot(_s: Signal) -> None:
+            await t.unsubscribe("k", one_shot)
+
+        async def second(sig: Signal) -> None:
+            nxt.append(sig)
+
+        await t.subscribe("k", one_shot)
+        await t.subscribe("k", second)
+        await t.publish(_sig("k"))
+        assert len(nxt) == 1

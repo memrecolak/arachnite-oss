@@ -25,7 +25,13 @@ import pytest
 from arachnite.codec import CodecRegistry, JSONCodec, MsgpackCodec
 from arachnite.exceptions import TransportConnectionError, UnsafeCodecError
 from arachnite.logging import BaseLogSink, LogEvent, LogLevel
-from arachnite.models import Signal
+from arachnite.models import (
+    NodeFaultSignal,
+    NodeState,
+    Signal,
+    StateUpdateSignal,
+    SupervisorSignal,
+)
 from arachnite.transport.base import _WIRE_VERSION, BaseTransport
 
 Callback = Callable[[Signal], Awaitable[None]]
@@ -925,3 +931,250 @@ class TestTransportConnectDisconnectLogEvents:
         connected = [ev for ev in sink.events if ev.message == "Transport connected"]
         assert len(connected) == 1
         assert connected[0].data["transport"] == "LocalTransport"
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Review 6 (distributed): wire fidelity and broker semantics, via broker fakes
+# ═════════════════════════════════════════════════════════════════════════════
+
+class _R6Collector:
+    def __init__(self) -> None:
+        self.seen: list[Signal] = []
+
+    async def __call__(self, signal: Signal) -> None:
+        self.seen.append(signal)
+
+
+class TestR6WireFidelity:
+    """R6-F12-06/22: the wire envelope keeps Signal subclasses and non-str keys."""
+
+    def test_node_fault_signal_survives_the_wire(self) -> None:
+        """R6-F12-06: NodeFaultSignal keeps node_id, states and error type/message"""
+        t = StubTransport(agent_node_id="A")
+        sent = NodeFaultSignal(
+            source="sv", kind="node_fault", value="faulted", confidence=1.0,
+            timestamp=12.5, node_id="LidarSense", previous_state=NodeState.RUNNING,
+            current_state=NodeState.FAULTED, restart_count=2,
+            fault_error=RuntimeError("i2c timeout"),
+        )
+        got = t._decode_signal(t._encode_signal(sent))
+        assert type(got) is NodeFaultSignal
+        assert (got.node_id, got.previous_state, got.current_state, got.restart_count) == (
+            "LidarSense", NodeState.RUNNING, NodeState.FAULTED, 2)
+        assert (got.error_type, got.error_message) == ("RuntimeError", "i2c timeout")
+        assert got.kind == "node_fault" and got.value == "faulted"
+        assert got.metadata["__origin_agent__"] == "A"
+
+    def test_supervisor_signal_survives_the_wire(self) -> None:
+        """R6-F12-06: SupervisorSignal keeps node_id and states"""
+        t = StubTransport()
+        sent = SupervisorSignal(
+            source="sv", kind="supervisor", value=None, confidence=1.0, timestamp=1.0,
+            node_id="Arm", previous_state=NodeState.FAULTED,
+            current_state=NodeState.RESTARTING, restart_count=1,
+        )
+        got = t._decode_signal(t._encode_signal(sent))
+        assert type(got) is SupervisorSignal
+        assert (got.node_id, got.previous_state, got.current_state, got.restart_count) == (
+            "Arm", NodeState.FAULTED, NodeState.RESTARTING, 1)
+
+    def test_state_update_signal_survives_the_wire(self) -> None:
+        """R6-F12-06: StateUpdateSignal keeps key/state_value/delete"""
+        t = StubTransport()
+        sent = StateUpdateSignal(
+            source="I", kind="state_update", value=None, confidence=1.0,
+            timestamp=1.0, key="mode", state_value={"level": 3}, delete=False,
+        )
+        got = t._decode_signal(t._encode_signal(sent))
+        assert type(got) is StateUpdateSignal
+        assert (got.key, got.state_value, got.delete) == ("mode", {"level": 3}, False)
+        gone = t._decode_signal(t._encode_signal(StateUpdateSignal(
+            source="I", kind="state_update", value=None, confidence=1.0,
+            timestamp=1.0, key="mode", delete=True)))
+        assert isinstance(gone, StateUpdateSignal) and gone.delete is True
+
+    def test_non_str_keys_in_value_and_metadata_survive(self) -> None:
+        """R6-F12-22: int keys in value and metadata decode instead of being dropped"""
+        t = StubTransport()
+        got = t._decode_signal(t._encode_signal(
+            _sig("adc", value={0: 1.2, 1: 3.4}, metadata={7: "ch7"})))
+        assert got.value == {0: 1.2, 1: 3.4}
+        assert got.metadata[7] == "ch7"
+
+    async def test_non_str_keys_cross_nats(self, fake_nats_server: Any) -> None:
+        """R6-F12-22: a {0: 1.2} reading published over NATS reaches the subscriber"""
+        from arachnite.transport.nats import NATSTransport
+        pub, sub = NATSTransport(agent_node_id="A"), NATSTransport(agent_node_id="B")
+        await pub.connect()
+        await sub.connect()
+        got = _R6Collector()
+        await sub.subscribe("adc", got)
+        await pub.publish(_sig("adc", value={0: 1.2, 1: 3.4}))
+        assert [s.value for s in got.seen] == [{0: 1.2, 1: 3.4}]
+
+
+class TestR6NatsSemantics:
+    """R6-F12-01/05: NATS delivers once per callback and survives reconnect cycles."""
+
+    async def test_callback_under_kind_and_wildcard_called_once(
+        self, fake_nats_server: Any,
+    ) -> None:
+        """R6-F12-01: a callback on both 'k' and '*' gets one call per message, not 4"""
+        from arachnite.transport.nats import NATSTransport
+        pub, sub = NATSTransport(agent_node_id="A"), NATSTransport(agent_node_id="B")
+        await pub.connect()
+        await sub.connect()
+        both, star_only, kind_only = _R6Collector(), _R6Collector(), _R6Collector()
+        await sub.subscribe("node_fault", both)
+        await sub.subscribe("*", both)
+        await sub.subscribe("*", star_only)
+        await sub.subscribe("node_fault", kind_only)
+        await pub.publish(_sig("node_fault", "faulted"))
+        await pub.publish(_sig("other", 1))
+        assert [s.kind for s in both.seen] == ["node_fault", "other"]
+        assert [s.kind for s in star_only.seen] == ["node_fault", "other"]
+        assert [s.kind for s in kind_only.seen] == ["node_fault"]
+
+    async def test_wildcard_matches_kinds_with_dots(self, fake_nats_server: Any) -> None:
+        """R6-F12-01: '*' maps to the NATS full wildcard, so 'a.b' kinds arrive too"""
+        from arachnite.transport.nats import NATSTransport
+        pub, sub = NATSTransport(agent_node_id="A"), NATSTransport(agent_node_id="B")
+        await pub.connect()
+        await sub.connect()
+        star = _R6Collector()
+        await sub.subscribe("*", star)
+        await pub.publish(_sig("sensor.temp", 1))
+        assert [s.kind for s in star.seen] == ["sensor.temp"]
+
+    async def test_disconnect_connect_keeps_subscriptions(self, fake_nats_server: Any) -> None:
+        """R6-F12-05: after disconnect()+connect() the kinds are subscribed again"""
+        from arachnite.transport.nats import NATSTransport
+        pub, sub = NATSTransport(agent_node_id="A"), NATSTransport(agent_node_id="B")
+        await pub.connect()
+        got = _R6Collector()
+        await sub.subscribe("k", got)
+        await sub.connect()
+        await pub.publish(_sig("k", 1))
+        await sub.disconnect()
+        await sub.connect()
+        await pub.publish(_sig("k", 2))
+        assert [s.value for s in got.seen] == [1, 2]
+        assert fake_nats_server.live_subjects(sub._nc) == ["arachnite.k"]
+
+
+class TestR6MqttSemantics:
+    """R6-F12-02/03: MQTT wildcard subscriptions and disconnect-during-reconnect."""
+
+    async def test_remote_wildcard_subscriber_receives(self, fake_mqtt_broker: Any) -> None:
+        """R6-F12-02: '*' subscribes the MQTT '#' filter, so it matches every kind"""
+        from arachnite.transport.mqtt import MQTTTransport
+        pub = MQTTTransport("fake", agent_node_id="A")
+        sub = MQTTTransport("fake", agent_node_id="B")
+        await pub.connect()
+        await sub.connect()
+        star, both = _R6Collector(), _R6Collector()
+        await sub.subscribe("*", star)
+        await sub.subscribe("thermal", both)
+        await sub.subscribe("*", both)
+        await pub.publish(_sig("thermal", 42.0))
+        await asyncio.sleep(0.01)
+        await pub.disconnect()
+        await sub.disconnect()
+        assert [s.kind for s in star.seen] == ["thermal"]
+        assert len(both.seen) == 1
+
+    async def test_disconnect_during_reconnect_stays_down(self, fake_mqtt_broker: Any) -> None:
+        """R6-F12-03: disconnect() while a reconnect is retrying is not undone"""
+        from arachnite.transport.mqtt import MQTTTransport
+        broker = fake_mqtt_broker
+        t = MQTTTransport("fake", agent_node_id="A", reconnect_interval_s=0.02,
+                          max_reconnect_attempts=50)
+        await t.subscribe("k", _R6Collector())
+        await t.connect()
+        broker.up = False
+        broker.drop_all()                 # connection lost -> background reconnect
+        await asyncio.sleep(0.07)         # reconnect is now retrying
+        await t.disconnect()
+        broker.up = True                  # broker comes back
+        await asyncio.sleep(0.1)
+        assert not t.connected
+        assert broker.clients == []
+        assert t._listen_task is None or t._listen_task.done()
+
+
+
+class TestR6RedisSemantics:
+    """R6-F12-02/04: Redis pattern subscription for '*' and a verified connect()."""
+
+    async def test_remote_wildcard_subscriber_receives(self, fake_redis_server: Any) -> None:
+        """R6-F12-02: '*' is a PSUBSCRIBE, so it matches every kind, once per callback"""
+        from arachnite.transport.redis import RedisTransport
+        pub, sub = RedisTransport(agent_node_id="A"), RedisTransport(agent_node_id="B")
+        await pub.connect()
+        await sub.connect()
+        star, both = _R6Collector(), _R6Collector()
+        await sub.subscribe("*", star)
+        await sub.subscribe("thermal", both)
+        await sub.subscribe("*", both)
+        await pub.publish(_sig("thermal", 42.0))
+        await asyncio.sleep(0.01)
+        await pub.disconnect()
+        await sub.disconnect()
+        assert [s.kind for s in star.seen] == ["thermal"]
+        assert len(both.seen) == 1
+
+    async def test_connect_to_down_server_raises_after_retries(
+        self, fake_redis_server: Any,
+    ) -> None:
+        """R6-F12-04: connect() verifies the server and raises when it is down"""
+        from arachnite.transport.redis import RedisTransport
+        fake_redis_server.up = False
+        t = RedisTransport(agent_node_id="A", reconnect_interval_s=0.0,
+                           max_reconnect_attempts=3)
+        await t.subscribe("k", _R6Collector())
+        with pytest.raises(TransportConnectionError, match="3 attempts"):
+            await t.connect()
+        assert not t.connected
+        assert fake_redis_server.pings == 3
+
+
+class TestR6TransportReconnectCoverage:
+    """R6-F20: coverage of the reworked (re)connect paths through broker fakes.
+
+    Guards, not regressions: both behaviours held (vacuously, for Redis) before
+    the review-6 fixes and must keep holding after them.
+    """
+
+    async def test_reconnects_after_connection_loss(self, fake_mqtt_broker: Any) -> None:
+        """R6-F12-03: a lost connection is re-established and re-subscribed"""
+        from arachnite.transport.mqtt import MQTTTransport
+        broker = fake_mqtt_broker
+        pub = MQTTTransport("fake", agent_node_id="P")
+        t = MQTTTransport("fake", agent_node_id="A", reconnect_interval_s=0.01)
+        got = _R6Collector()
+        await t.subscribe("k", got)
+        await t.connect()
+        broker.drop_all()
+        for _ in range(100):
+            await asyncio.sleep(0.01)
+            if t.connected:
+                break
+        await pub.connect()
+        await pub.publish(_sig("k", 5))
+        await asyncio.sleep(0.01)
+        await t.disconnect()
+        await pub.disconnect()
+        assert [s.value for s in got.seen] == [5]
+
+    async def test_connect_retries_until_server_is_up(self, fake_redis_server: Any) -> None:
+        """R6-F12-04: max_reconnect_attempts is honoured by connect()"""
+        from arachnite.transport.redis import RedisTransport
+        fake_redis_server.up = False
+        t = RedisTransport(agent_node_id="A", reconnect_interval_s=0.01,
+                           max_reconnect_attempts=50)
+        task = asyncio.create_task(t.connect())
+        await asyncio.sleep(0.05)
+        fake_redis_server.up = True
+        await asyncio.wait_for(task, timeout=2.0)
+        assert t.connected
+        await t.disconnect()

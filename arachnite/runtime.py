@@ -72,6 +72,11 @@ _MAX_PENDING_OUTCOMES = 1024
 # Both arrive while paused or stopped too, when no tick drains them.
 _MAX_PENDING_SIGNALS = 1024
 
+# Kinds the runtime buffers from the bus itself (supervisor/node_fault reach
+# ctx.signals that way, a state_update is agent-local), so a remote signal of
+# one of these kinds is not injected a second time by inject_remote_signal().
+_SELF_BUFFERED_KINDS = frozenset({"supervisor", "node_fault", "state_update"})
+
 # ── Tick-stage instrumentation protocol ──────────────────────────────────────
 #
 # Tick-stage instrumentation ADR (2026-04-16; numbered 0002 in the project's
@@ -128,8 +133,9 @@ class ArachniteRuntime:
     The tick sequence each cycle:
     0. Drain Results of actions that finished since the previous tick
     1. SenseMasterNode.read_all()         → signals
-    1b. Inject buffered supervisor + node_fault signals captured since the
-        previous tick (a node raising during tick N surfaces here on tick N+1)
+    1b. Inject buffered remote signals (inject_remote_signal), then the
+        supervisor + node_fault signals captured since the previous tick (a
+        node raising during tick N surfaces here on tick N+1)
     2. ContextNode.update(signals, results) → context
     3. InstinctMasterNode.evaluate_reflex_pairs(ctx) → (reflex, proposal)
        └─ launch_reflex() each (bypass decision; preempt per the reflex
@@ -291,6 +297,12 @@ class ArachniteRuntime:
         self._state_update_buffer: deque[Signal] = deque(maxlen=_MAX_PENDING_SIGNALS)
         self._signals_dropped = 0
         self._bus.subscribe("state_update", self._on_state_update_signal)
+
+        # Signals from other AgentNodes, handed over by inject_remote_signal()
+        # (AgentNode wires it to SignalBus.add_remote_listener) and drained
+        # into the next tick's ctx.signals after the local sense output.
+        self._remote_signal_buffer: deque[Signal] = deque(maxlen=_MAX_PENDING_SIGNALS)
+        self._remote_signals_dropped = 0
 
         # Optional per-stage timing callback (the tick-stage instrumentation ADR). When ``None``
         # the tick path short-circuits on a single branch per stage.
@@ -476,6 +488,7 @@ class ArachniteRuntime:
         # Nothing from the previous run reaches this run's first tick.
         self._supervisor_signal_buffer.clear()
         self._state_update_buffer.clear()
+        self._remote_signal_buffer.clear()
         self._reflex_outcomes.clear()
         self._action_master.drain_completed()
         self._last_results = []
@@ -966,12 +979,37 @@ class ArachniteRuntime:
         via the returned signals list, so buffering them too would re-apply a
         stale copy at the start of the next tick, on top of (and after) that
         tick's fresh sense reading. That echo is filtered out here by object
-        identity, which leaves every other route — instinct/action publishes,
-        signals arriving from a transport — buffered exactly as before.
+        identity, which leaves every other route — instinct/action publishes —
+        buffered exactly as before.
+
+        A StateUpdateSignal from another AgentNode is not applied: ctx.state
+        is per agent, so a peer's write must not land in this agent's state
+        (subscribe to 'state_update' on the bus to observe peers' writes).
         """
-        if self._sense_master.returned_this_tick(signal):
+        if self._sense_master.returned_this_tick(signal) or self._bus.is_remote(signal):
             return
         self._buffer_signal(self._state_update_buffer, signal)
+
+    def inject_remote_signal(self, signal: Signal) -> None:
+        """
+        Queue a signal that arrived from another AgentNode for the next tick.
+
+        Drained into ``ctx.signals`` at the start of the next tick, after the
+        local sense output, so instincts on this agent see remote sensors.
+        ``AgentNode`` wires this to ``SignalBus.add_remote_listener``, which
+        only reports transport-delivered signals — local ones, already in the
+        sense output, are never doubled. supervisor/node_fault signals are
+        skipped (the runtime buffers those from the bus already) and so are
+        state_update ones (agent-local). Bounded: when more than 1024 arrive
+        between two ticks the oldest are dropped, with a warning at the tick.
+        Event-lane reflexes see remote signals through their bus subscription.
+        """
+        if signal.kind in _SELF_BUFFERED_KINDS:
+            return
+        buffer = self._remote_signal_buffer
+        if len(buffer) == buffer.maxlen:
+            self._remote_signals_dropped += 1
+        buffer.append(signal)
 
     def _buffer_signal(self, buffer: deque[Signal], signal: Signal) -> None:
         """Keep ``signal`` for the next tick (oldest dropped when the buffer is full)."""
@@ -1393,6 +1431,19 @@ class ArachniteRuntime:
             )
             self._signals_dropped = 0
 
+        # Signals from other AgentNodes received since the last tick (same
+        # snapshot-before-read_all rule).
+        buffered_remote: list[Signal] | None = None
+        if self._remote_signal_buffer:
+            buffered_remote = list(self._remote_signal_buffer)
+            self._remote_signal_buffer.clear()
+        if self._remote_signals_dropped:
+            self._logger.warning(
+                "Buffered remote signals dropped before a tick",
+                dropped=self._remote_signals_dropped,
+            )
+            self._remote_signals_dropped = 0
+
         # Results of actions that finished since the previous tick's context
         # (actions run as tasks across ticks — ADR 0005). Completion order.
         completed = self._action_master.drain_completed()
@@ -1403,6 +1454,10 @@ class ArachniteRuntime:
 
         # 1. Sense
         signals = await self._sense_master.read_all()
+
+        # Remote signals after the local sense output.
+        if buffered_remote:
+            signals.extend(buffered_remote)
 
         # Append faults observed since the last tick (sense signals first, then
         # the buffered FAULTED/DEAD/RESTARTING + node_fault signals).

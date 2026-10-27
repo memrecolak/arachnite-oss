@@ -9,14 +9,15 @@
 # In the single-process simulation (simulate.py) both agents use
 # LocalTransport and run in the same process.
 # In production replace transport: local → mqtt or nats and set
-# the broker address in mesh.transport_options.
+# the broker address in mesh.mqtt_broker / mesh.nats_server (or per agent
+# in transport_config).
 #
 # Co-location constraint (enforced by DeploymentManifest.validate()):
 #   CollisionReflex and its target EmergencyRetractAction are BOTH on
 #   control-node, so the reflex path has zero network hops.
-#   The reflex's input (ProximitySenseNode) is placed there too: a reflex
-#   only sees signals produced on its own AgentNode, so a remote proximity
-#   sensor would leave the reflex blind.
+#   The reflex's input (ProximitySenseNode) is placed there too: a signal
+#   from another AgentNode reaches the reflex only at the next tick and
+#   after the network hop, which would defeat the reflex arc.
 
 mesh:
   name: robot-arm-cell

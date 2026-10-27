@@ -8,12 +8,14 @@ Spec reference: Section 11.4.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 
 from arachnite.distributed.agent_node import AgentNode
 from arachnite.distributed.manifest import DeploymentManifest
 from arachnite.logging import BaseLogSink
 from arachnite.models import NodeState
 from arachnite.transport.base import BaseTransport
+from arachnite.transport.local import LocalTransport
 
 
 class MeshRuntime:
@@ -24,6 +26,11 @@ class MeshRuntime:
     Local agents run as asyncio tasks in the current process.
     Remote agents are expected to start independently and connect
     via the configured transport.
+
+    Agents whose manifest transport is ``local`` (and that have no override
+    in ``transports``) share one in-process LocalTransport, so they exchange
+    signals like agents on a broker do; a private LocalTransport per agent
+    would leave each one isolated.
 
     Spec reference: Section 11.4.
     """
@@ -51,26 +58,46 @@ class MeshRuntime:
         """
         Build and start all AgentNodes defined in the manifest.
 
-        Builds each AgentNode from the manifest, then starts them
-        all concurrently. Each AgentNode connects its transport and
-        starts its runtime loop.
+        Validates the manifest (ManifestValidationError), builds each
+        AgentNode from it, then starts them all concurrently. Each AgentNode
+        connects its transport and starts its runtime loop. If any agent
+        fails to start, every agent of this attempt is stopped again and the
+        first error is raised, so a retry starts from a clean slate.
         """
         if self._started:
             return
+        self._manifest.validate()
 
         # Build agents
+        shared_local: LocalTransport | None = None
+        agents: dict[str, AgentNode] = {}
         for agent_id in self._manifest.agent_ids():
             transport = self._transports.get(agent_id)
-            agent     = AgentNode.from_manifest(
+            if transport is None and self._manifest.agent_config(agent_id).transport in (
+                "local", "",
+            ):
+                if shared_local is None:
+                    shared_local = LocalTransport(agent_node_id="mesh")
+                transport = shared_local
+            agents[agent_id] = AgentNode.from_manifest(
                 manifest   = self._manifest,
                 agent_id   = agent_id,
                 transport  = transport,
                 log_sinks  = self._log_sinks,
             )
-            self._agents[agent_id] = agent
+        self._agents = agents
 
         # Start all concurrently
-        await asyncio.gather(*(a.start() for a in self._agents.values()))
+        outcomes = await asyncio.gather(
+            *(a.start() for a in agents.values()), return_exceptions=True,
+        )
+        errors = [o for o in outcomes if isinstance(o, BaseException)]
+        if errors:
+            for agent in agents.values():
+                with contextlib.suppress(Exception):
+                    await agent.stop()
+            self._agents = {}
+            raise errors[0]
         self._started = True
 
     async def stop(self) -> None:

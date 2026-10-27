@@ -73,7 +73,10 @@ class MsgpackCodec(SignalCodec):
             raise ImportError(
                 "MsgpackCodec requires 'msgpack'. Install with: pip install msgpack"
             )
-        return msgpack.unpackb(data, raw=False)
+        # strict_map_key=False: packb() encodes dicts with int/float keys, so
+        # the decoder must accept them too (msgpack's default only takes
+        # str/bytes keys, silently breaking the round trip for e.g. {0: 1.2}).
+        return msgpack.unpackb(data, raw=False, strict_map_key=False)
 
 
 class JSONCodec(SignalCodec):
@@ -112,14 +115,29 @@ class PickleCodec(SignalCodec):
 class NumpyCodec(SignalCodec):
     """
     Codec for numpy ndarrays. Encodes shape, dtype, and raw bytes.
+
+    Only numeric ndarrays (and numpy scalars) take the array encoding; any
+    other value — a MediaStore path string, raw ``bytes``, a dict, a list —
+    falls back to msgpack behind a one-byte marker and round-trips unchanged,
+    so registering this codec for a kind does not corrupt the non-array
+    values published under it. Decoded arrays are writeable copies.
     Requires: numpy
     """
+
+    #: First byte of a non-array payload. An array payload starts with its
+    #: ndim, which numpy caps far below 255.
+    _FALLBACK_MARKER = 0xFF
 
     def encode(self, value: Any) -> bytes:
         if not _NUMPY_AVAILABLE:
             raise ImportError(
                 "NumpyCodec requires 'numpy'. Install with: pip install numpy"
             )
+        if not (
+            isinstance(value, (np.ndarray, np.generic))
+            and not np.asarray(value).dtype.hasobject
+        ):
+            return bytes([self._FALLBACK_MARKER]) + MsgpackCodec().encode(value)
         arr = np.asarray(value)
         # Header: shape length (1 byte), shape ints (8 bytes each), dtype string
         shape_bytes = len(arr.shape).to_bytes(1, "little")
@@ -133,6 +151,8 @@ class NumpyCodec(SignalCodec):
             raise ImportError(
                 "NumpyCodec requires 'numpy'. Install with: pip install numpy"
             )
+        if data[:1] == bytes([self._FALLBACK_MARKER]):
+            return MsgpackCodec().decode(data[1:])
         ndim      = data[0]
         offset    = 1
         shape     = tuple(
@@ -142,7 +162,13 @@ class NumpyCodec(SignalCodec):
         offset   += ndim * 8
         dtype_str = data[offset : offset + 16].rstrip(b"\x00").decode("ascii")
         offset   += 16
-        return np.frombuffer(data[offset:], dtype=np.dtype(dtype_str)).reshape(shape)
+        # .copy(): np.frombuffer over immutable bytes is read-only; a consumer
+        # that edits the received frame in place would fail.
+        return (
+            np.frombuffer(data[offset:], dtype=np.dtype(dtype_str))
+            .reshape(shape)
+            .copy()
+        )
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -167,6 +193,11 @@ class CodecRegistry:
 
     def __init__(self) -> None:
         self._codecs: dict[str, SignalCodec] = {}
+        # Name of the network transport this registry was checked for, once
+        # one has connected with it. From then on register() refuses unsafe
+        # codecs too, so the connect-time check cannot be bypassed by
+        # registering e.g. a PickleCodec afterwards (spec §14.2.1).
+        self._network_transport: str | None = None
         # Install a default msgpack fallback if available, else JSON
         if _MSGPACK_AVAILABLE:
             self._codecs["*"] = MsgpackCodec()
@@ -178,7 +209,13 @@ class CodecRegistry:
         Register a codec for a signal kind.
 
         Use kind='*' to set the fallback for all unregistered kinds.
+
+        Raises UnsafeCodecError for a codec with ``network_safe=False`` once a
+        network transport has connected with this registry — the same check
+        ``connect()`` applies.
         """
+        if self._network_transport is not None and not codec.network_safe:
+            raise UnsafeCodecError(_unsafe_message(codec, self._network_transport))
         self._codecs[kind] = codec
 
     def check_network_safety(self, transport_name: str) -> None:
@@ -189,16 +226,27 @@ class CodecRegistry:
         registered. Call this before establishing a network transport
         connection to prevent remote code execution via unsafe codecs
         such as PickleCodec.
+
+        On success the registry stays bound to the network: every later
+        ``register()`` is checked the same way.
         """
         for _kind, codec in self._codecs.items():
             if not codec.network_safe:
-                raise UnsafeCodecError(
-                    f"{type(codec).__name__} is not safe for network transport "
-                    f"'{transport_name}'. PickleCodec can execute arbitrary code "
-                    f"when deserialising untrusted data. Use MsgpackCodec or "
-                    f"JSONCodec instead, or set PickleCodec.network_safe = True "
-                    f"if you accept the risk."
-                )
+                raise UnsafeCodecError(_unsafe_message(codec, transport_name))
+        self._network_transport = transport_name
+
+    def decode_network(self, kind: str, data: bytes) -> Any:
+        """
+        Decode bytes that arrived over a network transport.
+
+        Like ``decode()``, but refuses a codec with ``network_safe=False``
+        whatever route put it in the registry — defence in depth behind the
+        connect-time and register-time checks.
+        """
+        codec = self._get_codec(kind)
+        if not codec.network_safe:
+            raise UnsafeCodecError(_unsafe_message(codec, "network"))
+        return codec.decode(data)
 
     def _get_codec(self, kind: str) -> SignalCodec:
         if kind in self._codecs:
@@ -220,6 +268,16 @@ class CodecRegistry:
     def __repr__(self) -> str:
         kinds = list(self._codecs)
         return f"CodecRegistry(kinds={kinds})"
+
+
+def _unsafe_message(codec: SignalCodec, transport_name: str) -> str:
+    return (
+        f"{type(codec).__name__} is not safe for network transport "
+        f"'{transport_name}'. PickleCodec can execute arbitrary code "
+        f"when deserialising untrusted data. Use MsgpackCodec or "
+        f"JSONCodec instead, or set PickleCodec.network_safe = True "
+        f"if you accept the risk."
+    )
 
 
 # ── Convenience singleton ─────────────────────────────────────────────────────

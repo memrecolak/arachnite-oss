@@ -30,6 +30,7 @@ import asyncio
 import contextlib
 from collections import defaultdict
 from collections.abc import Awaitable, Callable
+from typing import Any
 
 from arachnite.codec import CodecRegistry
 from arachnite.exceptions import TransportConnectionError
@@ -52,6 +53,16 @@ class RedisTransport(BaseTransport):
     Channel convention:
         {channel_prefix}:{signal.kind}
     e.g.  arachnite:thermal, arachnite:visual
+
+    The wildcard kind ``'*'`` is a pattern subscription (``PSUBSCRIBE
+    {channel_prefix}:*``); a plain SUBSCRIBE would only match a channel
+    literally named ``…:*``.
+
+    ``connect()`` verifies the server answers (``PING``) and retries up to
+    ``max_reconnect_attempts`` times, ``reconnect_interval_s`` apart, before
+    raising ``TransportConnectionError`` — ``from_url()`` alone is lazy and
+    would report success against a server that is down. A connection lost
+    later is re-established in the background; ``disconnect()`` cancels it.
 
     Good when Redis is already part of the deployment stack.
     Uses Redis Pub/Sub for delivery and optionally Redis Streams
@@ -86,11 +97,27 @@ class RedisTransport(BaseTransport):
 
         self._pub_client:  aioredis.Redis | None = None
         self._sub_client:  aioredis.Redis | None = None
-        self._pubsub:      object | None = None
+        self._pubsub:      Any | None = None
         self._connected:   bool = False
         self._stopped:     bool = True
         self._subscribers: dict[str, list[Callback]] = defaultdict(list)
         self._listen_task: asyncio.Task[None] | None = None
+        self._reconnect_task: asyncio.Task[None] | None = None
+
+    def _channel(self, kind: str) -> str:
+        return f"{self._channel_prefix}:{kind}"
+
+    async def _pubsub_subscribe(self, pubsub: Any, kind: str) -> None:
+        if kind == "*":
+            await pubsub.psubscribe(self._channel("*"))
+        else:
+            await pubsub.subscribe(self._channel(kind))
+
+    async def _pubsub_unsubscribe(self, pubsub: Any, kind: str) -> None:
+        if kind == "*":
+            await pubsub.punsubscribe(self._channel("*"))
+        else:
+            await pubsub.unsubscribe(self._channel(kind))
 
     # ── Connection ────────────────────────────────────────────────────────────
 
@@ -98,101 +125,152 @@ class RedisTransport(BaseTransport):
         """Connect publish and subscribe Redis clients."""
         self._codec.check_network_safety(type(self).__name__)
         self._stopped = False
+        await self._connect_loop()
+
+    async def _connect_loop(self) -> None:
+        """Open the connection, retrying; stops early once disconnect() was called."""
+        attempts = 0
+        while not self._stopped:
+            try:
+                await self._open()
+                return
+            except Exception as exc:
+                attempts += 1
+                if attempts >= self._max_reconnect:
+                    raise TransportConnectionError(
+                        "RedisTransport",
+                        f"Failed after {attempts} attempts: {exc}",
+                    ) from exc
+                await asyncio.sleep(self._reconnect_s)
+
+    async def _open(self) -> None:
+        """One connection attempt: connect, PING, subscribe known kinds, listen."""
+        pub = sub = None
         try:
-            self._pub_client = await aioredis.from_url(  # type: ignore[no-untyped-call,unused-ignore]
+            pub = await aioredis.from_url(  # type: ignore[no-untyped-call,unused-ignore]
                 self._url, db=self._db, password=self._password,
                 decode_responses=False,
             )
-            self._sub_client = await aioredis.from_url(  # type: ignore[no-untyped-call,unused-ignore]
+            sub = await aioredis.from_url(  # type: ignore[no-untyped-call,unused-ignore]
                 self._url, db=self._db, password=self._password,
                 decode_responses=False,
             )
-            self._pubsub     = self._sub_client.pubsub()
-            self._connected  = True
-            self._logger.info("Transport connected", transport=type(self).__name__)
-            # Subscribe to any channels registered before connect() was called
-            for kind, callbacks in self._subscribers.items():
+            # from_url() is lazy: without a round trip a server that is down
+            # would only show up as silently dropped subscriptions.
+            await pub.ping()
+            pubsub = sub.pubsub()
+            for kind, callbacks in list(self._subscribers.items()):
                 if callbacks:
-                    channel = f"{self._channel_prefix}:{kind}"
-                    with contextlib.suppress(Exception):
-                        await self._pubsub.subscribe(channel)  # type: ignore[union-attr,unused-ignore]
-            self._listen_task = asyncio.create_task(self._listen_loop())
-        except Exception as exc:
-            raise TransportConnectionError("RedisTransport", str(exc)) from exc
+                    await self._pubsub_subscribe(pubsub, kind)
+        except BaseException:
+            await self._close_clients(pub, sub)
+            raise
+        if self._stopped:
+            # disconnect() ran while this attempt was connecting.
+            await self._close_clients(pub, sub)
+            return
+        self._pub_client, self._sub_client, self._pubsub = pub, sub, pubsub
+        self._connected  = True
+        self._logger.info("Transport connected", transport=type(self).__name__)
+        self._listen_task = asyncio.create_task(self._listen_loop(pubsub))
 
     async def disconnect(self) -> None:
-        """Close both Redis connections cleanly."""
+        """Close both Redis connections cleanly and cancel any pending reconnect."""
         self._logger.info("Transport disconnected", transport=type(self).__name__)
         self._stopped = True
         self._connected = False
-        if self._listen_task:
-            self._listen_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await self._listen_task
-        for client in (self._pub_client, self._sub_client):
-            if client:
-                with contextlib.suppress(Exception):
-                    await client.aclose()  # type: ignore[no-untyped-call,unused-ignore]
+        current = asyncio.current_task()
+        for task in (self._reconnect_task, self._listen_task):
+            if task is not None and task is not current and not task.done():
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
+        self._reconnect_task = None
+        self._listen_task = None
+        await self._close_clients(self._pub_client, self._sub_client)
         self._pub_client = self._sub_client = self._pubsub = None
+
+    @staticmethod
+    async def _close_clients(*clients: Any) -> None:
+        for client in clients:
+            if client is not None:
+                with contextlib.suppress(Exception):
+                    await client.aclose()
 
     # ── Pub/Sub ───────────────────────────────────────────────────────────────
 
     async def publish(self, signal: Signal) -> None:
         if not self._connected or self._pub_client is None:
             raise TransportConnectionError("RedisTransport", "Not connected")
-        channel = f"{self._channel_prefix}:{signal.kind}"
+        channel = self._channel(signal.kind)
         payload = self._encode_signal(signal)
         await self._pub_client.publish(channel, payload)
 
     async def subscribe(self, kind: str, callback: Callback) -> None:
         already = bool(self._subscribers[kind])
-        self._subscribers[kind].append(callback)
+        if callback not in self._subscribers[kind]:
+            self._subscribers[kind].append(callback)
         if not already and self._pubsub and self._connected:
-            channel = f"{self._channel_prefix}:{kind}"
-            await self._pubsub.subscribe(channel)  # type: ignore[attr-defined]
+            await self._pubsub_subscribe(self._pubsub, kind)
             # redis.asyncio PubSub.listen() exits when no channels are subscribed.
             # _listen_loop may have already exited before this first subscription
             # completed (the task runs during the above await). Restart it.
             if self._listen_task is None or self._listen_task.done():
-                self._listen_task = asyncio.create_task(self._listen_loop())
+                self._listen_task = asyncio.create_task(self._listen_loop(self._pubsub))
 
     async def unsubscribe(self, kind: str, callback: Callback) -> None:
         with contextlib.suppress(ValueError):
             self._subscribers[kind].remove(callback)
         if not self._subscribers[kind] and self._pubsub and self._connected:
-            channel = f"{self._channel_prefix}:{kind}"
             with contextlib.suppress(Exception):
-                await self._pubsub.unsubscribe(channel)  # type: ignore[attr-defined]
+                await self._pubsub_unsubscribe(self._pubsub, kind)
 
     # ── Listener loop ─────────────────────────────────────────────────────────
 
-    async def _listen_loop(self) -> None:
+    async def _listen_loop(self, pubsub: Any = None) -> None:
         """Receive messages from Redis and dispatch to local subscribers."""
-        if self._pubsub is None:
+        pubsub = pubsub if pubsub is not None else self._pubsub
+        if pubsub is None:
             return
         try:
-            async for message in self._pubsub.listen():  # type: ignore[attr-defined]
-                if message["type"] != "message":
-                    continue
-                await self._dispatch(message["data"])
+            async for message in pubsub.listen():
+                if message["type"] == "message":
+                    await self._dispatch(message["data"])
+                elif message["type"] == "pmessage":
+                    await self._dispatch(message["data"], via_pattern=True)
         except asyncio.CancelledError:
             return
         except Exception:
             self._connected = False
-            asyncio.create_task(self._reconnect())
+            if not self._stopped:
+                self._reconnect_task = asyncio.create_task(self._reconnect())
 
-    async def _dispatch(self, data: bytes) -> None:
+    async def _dispatch(self, data: bytes, via_pattern: bool = False) -> None:
+        """
+        Decode one Redis message and call the matching subscribers.
+
+        Redis delivers a publish once per matching subscription: once as a
+        'message' for ``SUBSCRIBE <prefix>:<kind>`` and once as a 'pmessage'
+        for ``PSUBSCRIBE <prefix>:*``. Each copy serves a disjoint set of
+        callbacks, so a callback under both the kind and '*' is called once.
+        """
         try:
             signal = self._decode_signal(data)
-        except Exception:
+        except Exception as exc:
+            self._logger.warning(
+                "Dropped undecodable Redis message",
+                error=f"{type(exc).__name__}: {exc}",
+            )
             return
-        callbacks = (
-            list(self._subscribers.get(signal.kind, []))
-            + list(self._subscribers.get("*", []))
-        )
-        for cb in callbacks:
-            with contextlib.suppress(Exception):
-                await cb(signal)
+        kind_callbacks = list(self._subscribers.get(signal.kind, []))
+        star_callbacks = list(self._subscribers.get("*", []))
+        if via_pattern:
+            callbacks = [cb for cb in star_callbacks if cb not in kind_callbacks]
+        elif self._subscribers.get("*") and self._connected:
+            callbacks = kind_callbacks          # the 'pmessage' copy serves '*'
+        else:
+            callbacks = kind_callbacks + star_callbacks
+        await self._deliver(signal, callbacks)
 
     async def _reconnect(self) -> None:
         if self._stopped:
@@ -201,16 +279,16 @@ class RedisTransport(BaseTransport):
         if self._stopped:
             return
         # Close stale clients before creating new ones to avoid resource leaks.
-        # The listen task has already exited (it raised and called us via create_task).
-        for client in (self._pub_client, self._sub_client):
-            if client:
-                with contextlib.suppress(Exception):
-                    await client.aclose()  # type: ignore[no-untyped-call,unused-ignore]
+        # The listen task has already exited (it raised and scheduled us).
+        await self._close_clients(self._pub_client, self._sub_client)
         self._pub_client = self._sub_client = self._pubsub = None
         self._listen_task = None
-        # connect() re-subscribes all active channels and starts a fresh listen task
-        with contextlib.suppress(Exception):
-            await self.connect()
+        # _connect_loop() re-subscribes all active channels and starts a fresh
+        # listen task; it stops early if disconnect() is called meanwhile.
+        try:
+            await self._connect_loop()
+        except TransportConnectionError as exc:
+            self._logger.error("Redis reconnect gave up", error=str(exc))
 
     @property
     def connected(self) -> bool:

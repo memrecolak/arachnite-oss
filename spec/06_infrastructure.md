@@ -423,7 +423,11 @@ class PickleCodec\(SignalCodec\): \.\.\.      \# arbitrary Python objects \(netw
 
 class NumpyCodec\(SignalCodec\): \.\.\.       \# numpy arrays \(requires numpy\)
 
-class PILCodec\(SignalCodec\): \.\.\.         \# PIL/Pillow images
+\# There is no built\-in PIL/Pillow codec: register your own SignalCodec for
+
+\# image objects, or publish arrays \(NumpyCodec\) or MediaStore paths\.
+
+``NumpyCodec`` \(``default\_registry\(\)`` registers it for kind ``'visual'`` when numpy is installed\) encodes numeric ndarrays and numpy scalars as shape \+ dtype \+ raw bytes and decodes them to **writeable** arrays\. Any other value — a MediaStore path string, ``bytes``, a dict, a list, ``None`` — is msgpack\-encoded behind a one\-byte marker \(``0xFF``, never a valid ndim\) and round\-trips unchanged, so a non\-array value published under ``'visual'`` is not corrupted\. ``MsgpackCodec`` decodes dicts with int/float keys \(``strict\_map\_key=False``\), matching what it encodes\.
 
 ## __14\.2\.1 Codec Network Safety__
 
@@ -435,9 +439,11 @@ class PILCodec\(SignalCodec\): \.\.\.         \# PIL/Pillow images
 
 **Transport enforcement** — Every non\-local transport \(`MQTTTransport`, `NATSTransport`, `RedisTransport`\) MUST call `CodecRegistry.check_network_safety()` at the start of its `connect()` method, before establishing any network connection\. `LocalTransport` is exempt because signals never leave the process\.
 
+**After connect** — A successful `check_network_safety()` binds the registry to the network: from then on `register()` applies the same check and raises `UnsafeCodecError` for a codec with `network_safe = False`, so a `PickleCodec` cannot be added after `connect()` \(e\.g\. by a node's `setup()`\)\. As defence in depth, the transports decode received values with `CodecRegistry.decode_network()`, which refuses an unsafe codec however it entered the registry\.
+
 ### Rules
 
-- `PickleCodec` MUST NOT be used with any network transport\. Attempting to do so raises `UnsafeCodecError` at connect time\.
+- `PickleCodec` MUST NOT be used with any network transport\. Attempting to do so raises `UnsafeCodecError` at connect time, or at `register()` time once a network transport has connected with the registry\.
 - Custom codecs that perform unsafe deserialisation SHOULD set `network_safe = False`\.
 - Developers MAY override `PickleCodec.network_safe = True` if they accept the risk in a fully trusted mesh\. This is NOT RECOMMENDED for production deployments\.
 - `UnsafeCodecError` is a subclass of `ArachniteError` and is part of the public API \(exported from `arachnite`\)\.
@@ -509,7 +515,9 @@ class MediaStore:
 
         """Write data to disk\. Returns absolute path\.
 
-        Files organised as base\_dir / kind / source\_tickN\_timestamp\.ext\."""
+        Files organised as base\_dir / kind / source\_tickN\_timestamp\.ext;
+
+        a name already taken gets a \_1, \_2, \.\.\. suffix \(never overwritten\)\."""
 
     def load\(self, path: str | Path\) \-> bytes:
 
@@ -605,7 +613,7 @@ Example \(vision instinct with evidence\)::
 
 ### __Security: path component validation__
 
-The `kind` and `source` parameters to `store()` are used to construct filesystem paths\. To prevent path traversal attacks \(e\.g\. `kind="../../etc"`\), both parameters MUST match the pattern `[a-zA-Z0-9_][a-zA-Z0-9_.\-]*`\. If either parameter fails validation, `store()` MUST raise `PathTraversalError`\. As defense\-in\-depth, the resolved output path MUST be verified to reside under `base_dir` before any write occurs\.
+The `kind` and `source` parameters to `store()` are used to construct filesystem paths\. To prevent path traversal attacks \(e\.g\. `kind="../../etc"`\), both parameters MUST match the pattern `[a-zA-Z0-9_][a-zA-Z0-9_.\-]*`\. If either parameter fails validation, `store()` MUST raise `PathTraversalError`\. The `extension` \(per call or from the extensions map\) MUST be one or more `.name` segments of `[a-zA-Z0-9_-]` — no separators, no `..` — or `store()` raises `PathTraversalError`\. As defense\-in\-depth, the resolved output path MUST be verified to reside under `base_dir` before any write occurs; the check is a path containment test \(`Path.is_relative_to`\), not a string\-prefix test \(which would accept a sibling such as `<base_dir>_evil`\)\. Files are created exclusively \(`open(..., 'xb')`\), so two stores whose timestamps fall in the same 100 µs bucket get distinct names instead of the second overwriting the first\.
 
 `PathTraversalError` is a subclass of `ArachniteError` and is part of the public API \(exported from `arachnite`\)\.
 

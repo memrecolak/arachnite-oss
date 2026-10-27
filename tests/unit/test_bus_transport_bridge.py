@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from typing import Any
 
 import pytest
 
@@ -27,6 +28,7 @@ from arachnite.bus import ORIGIN_AGENT_KEY, SignalBus
 from arachnite.exceptions import SignalBusError
 from arachnite.models import Signal
 from arachnite.transport.local import LocalTransport
+from tests.conftest import settle
 
 
 def _sig(kind: str = "k", value: object = 1) -> Signal:
@@ -219,3 +221,158 @@ class TestWireKindsAllowlist:
         await bus_a.publish(_sig(value=99))
         assert len(b_cb.seen) == 1        # inbound delivery still works
         assert b_cb.seen[0].value == 99
+
+
+# ── Review 6 (distributed): transport interest, echo ids, retries, remote tap ─
+
+async def _r6_nats_pair(server: Any, a_id: str | None = "A", b_id: str | None = "B",
+                        ) -> tuple[SignalBus, SignalBus, Any, Any]:
+    from arachnite.transport.nats import NATSTransport
+    ta = NATSTransport(agent_node_id="A")
+    tb = NATSTransport(agent_node_id="B")
+    await ta.connect()
+    await tb.connect()
+    return (SignalBus(transport=ta, agent_node_id=a_id),
+            SignalBus(transport=tb, agent_node_id=b_id), ta, tb)
+
+
+class TestR6BusTransportInterest:
+    """R6-F12-01: one transport subscription per bus, so each remote signal arrives once."""
+
+    async def test_kind_and_wildcard_subscribers_get_one_copy_local(self) -> None:
+        """R6-F12-01: shared LocalTransport, B has a 'k' and a '*' subscriber"""
+        transport = LocalTransport(agent_node_id="shared")
+        await transport.connect()
+        bus_a = SignalBus(transport=transport, agent_node_id="A")
+        bus_b = SignalBus(transport=transport, agent_node_id="B")
+        kind_cb, star_cb = _Collector(), _Collector()
+        bus_b.subscribe("node_fault", kind_cb)
+        bus_b.subscribe("*", star_cb)
+        await bus_a.start_transport()
+        await bus_b.start_transport()
+        await bus_a.publish(_sig("node_fault", "faulted"))
+        assert (len(kind_cb.seen), len(star_cb.seen)) == (1, 1)
+
+    async def test_kind_and_wildcard_subscribers_get_one_copy_nats(
+        self, fake_nats_server: Any,
+    ) -> None:
+        """R6-F12-01: over NATS (real encode/decode) each subscriber gets 1, not 4"""
+        bus_a, bus_b, _ta, tb = await _r6_nats_pair(fake_nats_server)
+        kind_cb, star_cb = _Collector(), _Collector()
+        bus_b.subscribe("node_fault", kind_cb)
+        bus_b.subscribe("*", star_cb)
+        await bus_a.start_transport()
+        await bus_b.start_transport()
+        await bus_a.publish(_sig("node_fault", "faulted"))
+        assert (len(kind_cb.seen), len(star_cb.seen)) == (1, 1)
+        assert fake_nats_server.live_subjects(tb._nc) == ["arachnite.>"]
+
+    async def test_unsubscribe_withdraws_transport_interest(self, fake_nats_server: Any) -> None:
+        """R6-F12-01: dropping the last '*' subscriber falls back to kind subscriptions"""
+        bus_a, bus_b, _ta, tb = await _r6_nats_pair(fake_nats_server)
+        kind_cb, star_cb = _Collector(), _Collector()
+        bus_b.subscribe("node_fault", kind_cb)
+        bus_b.subscribe("*", star_cb)
+        await bus_a.start_transport()
+        await bus_b.start_transport()
+        bus_b.unsubscribe("*", star_cb)
+        await settle()
+        assert fake_nats_server.live_subjects(tb._nc) == ["arachnite.node_fault"]
+        await bus_a.publish(_sig("node_fault", "faulted"))
+        await bus_a.publish(_sig("other", 1))
+        assert [s.kind for s in kind_cb.seen] == ["node_fault"]
+        assert star_cb.seen == []
+        bus_b.unsubscribe("node_fault", kind_cb)
+        await settle()
+        assert fake_nats_server.live_subjects(tb._nc) == []
+
+
+class TestR6BusEchoId:
+    """R6-F12-12: the bus's echo key defaults to the transport's agent id."""
+
+    async def test_default_bus_ids_do_not_drop_peer_signals(self, fake_nats_server: Any) -> None:
+        """R6-F12-12: buses built without agent_node_id still exchange signals"""
+        from arachnite.transport.nats import NATSTransport
+        tp, tl = NATSTransport(agent_node_id="pi"), NATSTransport(agent_node_id="laptop")
+        await tp.connect()
+        await tl.connect()
+        bus_pi, bus_laptop = SignalBus(transport=tp), SignalBus(transport=tl)
+        got = _Collector()
+        bus_laptop.subscribe("temperature", got)
+        await bus_pi.start_transport()
+        await bus_laptop.start_transport()
+        await bus_pi.publish(_sig("temperature", 71.5))
+        assert [s.value for s in got.seen] == [71.5]
+        assert got.seen[0].metadata[ORIGIN_AGENT_KEY] == "pi"
+
+
+class TestR6BusSubscribeRetry:
+    """R6-F12-18: a transport subscription that fails is retried, not lost."""
+
+    async def test_failed_late_subscribe_is_retried_on_next_subscribe(
+        self, fake_nats_server: Any,
+    ) -> None:
+        """R6-F12-18: the next subscribe() of the kind retries the failed one"""
+        bus_a, bus_b, _ta, _tb = await _r6_nats_pair(fake_nats_server)
+        await bus_a.start_transport()
+        await bus_b.start_transport()
+        fake_nats_server.fail_next_subscribe = 1
+        got = _Collector()
+        bus_b.subscribe("proximity", got)            # transport subscribe fails once
+        await settle()
+        bus_b.subscribe("proximity", _Collector())   # a second subscriber of the kind
+        await settle()
+        await bus_a.publish(_sig("proximity", 0.1))
+        assert [s.value for s in got.seen] == [0.1]
+
+    async def test_failed_subscribe_is_retried_in_background(
+        self, fake_nats_server: Any, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """R6-F12-18: without further subscribe() calls the retry still happens"""
+        import arachnite.bus as bus_module
+        monkeypatch.setattr(bus_module, "_TRANSPORT_RETRY_S", 0.01, raising=False)
+        bus_a, bus_b, _ta, _tb = await _r6_nats_pair(fake_nats_server)
+        await bus_a.start_transport()
+        await bus_b.start_transport()
+        fake_nats_server.fail_next_subscribe = 1
+        got = _Collector()
+        bus_b.subscribe("proximity", got)
+        await asyncio.sleep(0.1)
+        await bus_a.publish(_sig("proximity", 0.2))
+        assert [s.value for s in got.seen] == [0.2]
+
+
+class TestR6BusRemoteListener:
+    """R6-F3: the bus reports transport-delivered signals to remote listeners."""
+
+    async def test_remote_listener_sees_remote_not_local_signals(self) -> None:
+        """R6-F3: a remote listener gets peers' signals of every kind, never local ones"""
+        transport = LocalTransport(agent_node_id="shared")
+        await transport.connect()
+        bus_a = SignalBus(transport=transport, agent_node_id="A")
+        bus_b = SignalBus(transport=transport, agent_node_id="B")
+        remote: list[Signal] = []
+        bus_b.add_remote_listener(remote.append)
+        await bus_a.start_transport()
+        await bus_b.start_transport()
+        await bus_a.publish(_sig("temperature", 1))   # nobody on B subscribes this kind
+        await bus_b.publish(_sig("temperature", 2))   # B's own publish
+        assert [(s.kind, s.value) for s in remote] == [("temperature", 1)]
+        assert bus_b.is_remote(remote[0])
+
+    async def test_stop_transport_withdraws_subscriptions(self) -> None:
+        """R6-F3: after stop_transport() a shared transport no longer feeds the bus"""
+        transport = LocalTransport(agent_node_id="shared")
+        await transport.connect()
+        bus_a = SignalBus(transport=transport, agent_node_id="A")
+        bus_b = SignalBus(transport=transport, agent_node_id="B")
+        got = _Collector()
+        bus_b.subscribe("k", got)
+        await bus_a.start_transport()
+        await bus_b.start_transport()
+        await bus_b.stop_transport()
+        await bus_a.publish(_sig("k", 1))
+        assert got.seen == []
+        await bus_b.start_transport()
+        await bus_a.publish(_sig("k", 2))
+        assert [s.value for s in got.seen] == [2]

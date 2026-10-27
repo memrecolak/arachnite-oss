@@ -44,12 +44,30 @@ class LocalTransport(BaseTransport):
         self._connected = False
 
     async def publish(self, signal: Signal) -> None:
-        """Deliver a signal to all matching local subscribers."""
-        for cb in chain(
-            self._subscribers.get(signal.kind, ()),
-            self._subscribers.get("*", ()),
-        ):
-            await cb(signal)
+        """
+        Deliver a signal to all matching local subscribers.
+
+        Iterates a snapshot (a subscriber that unsubscribes itself does not
+        make the next one be skipped), calls a callback registered under both
+        the kind and '*' once, and isolates subscriber errors like the network
+        transports do: a raising subscriber is logged and the others still run.
+        """
+        kind_cbs = self._subscribers.get(signal.kind)
+        star_cbs = self._subscribers.get("*")
+        if kind_cbs and star_cbs:
+            callbacks = self._unique(chain(kind_cbs, star_cbs))
+        else:
+            callbacks = list(kind_cbs or star_cbs or ())   # snapshot
+        # Inlined (not self._deliver) to keep the in-process hop as cheap as before.
+        for cb in callbacks:
+            try:
+                await cb(signal)
+            except Exception as exc:  # noqa: BLE001
+                self._logger.warning(
+                    "Transport subscriber raised; continuing delivery",
+                    kind=signal.kind,
+                    error=f"{type(exc).__name__}: {exc}",
+                )
 
     async def subscribe(self, kind: str, callback: Callback) -> None:
         if callback not in self._subscribers[kind]:

@@ -592,6 +592,8 @@ await bus.publish(StateUpdateSignal(
 # and stays current — the copy read_all() publishes for bus subscribers is
 # recognised by the runtime and not buffered back into the next tick.
 # ctx.state is a shallow copy — mutations do not affect ContextNode's internal state
+# ctx.state is per AgentNode: a StateUpdateSignal from ANOTHER agent (over the
+# transport) reaches bus subscribers but never writes this agent's state.
 ```
 
 ---
@@ -666,6 +668,12 @@ class VisionInstinct(BaseInstinctNode):
 
 # Cleanup old files periodically
 media.cleanup(max_age_s=300)   # remove files older than 5 minutes
+
+# store() never overwrites: a name already taken (same source/tick/100 us bucket)
+# gets a _1, _2, ... suffix. `extension` must be '.name' segments of
+# [a-zA-Z0-9_-] (else PathTraversalError); containment is a real path check.
+# A path string on kind 'visual' crosses network transports unchanged (NumpyCodec
+# only array-encodes ndarrays; other values fall back to msgpack).
 media.clear()                   # remove everything
 ```
 
@@ -1067,6 +1075,56 @@ auditable.
 
 ---
 
+## Distributed bridge — remote signals, manifests, transports (spec §10–§11)
+
+**Remote signals reach the tick.** `AgentNode` attaches a remote listener to its bus
+(`SignalBus.add_remote_listener`); the bus then subscribes `'*'` on the transport, and every
+signal another AgentNode publishes is queued with `ArachniteRuntime.inject_remote_signal()`
+into this agent's **next** tick's `ctx.signals`, after the local sense output. Local signals are
+never doubled (only transport-delivered signals reach the listener). Bounded at 1024 between
+ticks (oldest dropped, warning). `supervisor`/`node_fault` are not injected twice (the runtime
+buffers them itself); a remote `state_update` is never applied (ctx.state is per agent).
+Remote SupervisorSignals also feed `agent.health.remote_states()` / `mesh_healthy()`.
+Hand-built bus + runtime: `bus.add_remote_listener(runtime.inject_remote_signal)`.
+Proposals do NOT cross the bus: an instinct's proposal goes to its own agent's actions.
+
+```python
+bus = SignalBus(transport=NATSTransport(agent_node_id="pi"))  # bus id defaults to "pi"
+bus.is_remote(signal)          # True for a signal published by another agent's bus
+await bus.stop_transport()     # withdraw subscriptions (AgentNode.stop() does this)
+```
+
+- Agent ids must be unique across the mesh (they are the echo-suppression key).
+- `'*'` works on every transport (MQTT `prefix#`, NATS `prefix.>`, Redis PSUBSCRIBE); a callback
+  under both a kind and `'*'` is called once; a raising subscriber never stops delivery.
+- Bus transport interest follows local subscribers (withdrawn on the last unsubscribe); a
+  failed transport subscribe is retried with backoff.
+- The wire keeps `SupervisorSignal` / `NodeFaultSignal` / `StateUpdateSignal` fields and dicts
+  with int keys.
+
+**Manifests are validated on load.** `DeploymentManifest.from_dict()/from_yaml()` raise
+`ManifestValidationError`, and `AgentNode.from_manifest()` / `MeshRuntime.start()` re-validate.
+Checks use each class's `node_id` (not its class name): reflex co-location, duplicates. Also:
+sections must be sense/instinct/decision/action with matching base classes, permission
+whitelists, known transport kinds, `transport_config` keys per transport (mqtt: broker_host,
+broker_port, topic_prefix, qos, username, password, tls, reconnect_interval_s,
+max_reconnect_attempts; nats: servers, subject_prefix, reconnect_*; redis: url,
+channel_prefix, db, password, reconnect_*). Mesh-level defaults: `mqtt_broker: host:port`,
+`nats_server`, `redis_url`. `on_transport_fault` is rejected (no TransportFaultReflex exists).
+
+**MeshRuntime**: agents with `transport: local` share one in-process LocalTransport; a failed
+start stops every agent of that attempt before raising.
+
+**Codecs**: once a network transport connected with a `CodecRegistry`, `register()` of an unsafe
+codec (PickleCodec) raises `UnsafeCodecError`; received values are decoded with
+`decode_network()`, which refuses unsafe codecs.
+
+**Reconnect**: MQTT/Redis `connect()` retry `max_reconnect_attempts` times then raise
+`TransportConnectionError` (Redis PINGs — `from_url` is lazy); `disconnect()` cancels a pending
+reconnect; NATS re-subscribes after a disconnect()/connect() cycle.
+
+---
+
 ## Signal merge policies
 
 When multiple SenseNodes emit the same signal kind in one tick (redundant sensors),
@@ -1440,7 +1498,7 @@ Concurrency obligations (ADR 0005):
 arachnite/
   __init__.py       public API — import everything from here
   models.py         all dataclasses and enums (Signal.confidence rejects NaN/Inf)
-  bus.py            SignalBus
+  bus.py            SignalBus (transport bridge: start/stop_transport, add_remote_listener, is_remote)
   context.py        ContextNode (state persistence, StateUpdateSignal, max_state_keys eviction)
   runtime.py        ArachniteRuntime (tick loop, event-driven reflex lane, wait_idle, live reg/unreg, shutdown)
   builder.py        RuntimeBuilder (fluent construction API)
@@ -1448,9 +1506,10 @@ arachnite/
   health.py         HealthMonitor
   shutdown.py       ShutdownCoordinator
   logging.py        StructuredLogger, sinks
-  codec.py          SignalCodec (network_safe attr), CodecRegistry (check_network_safety)
+  codec.py          SignalCodec (network_safe attr), CodecRegistry (check_network_safety binds;
+                    register() then refuses unsafe codecs; decode_network)
   config.py         NodeConfig
-  media.py          MediaStore (on-disk storage for large signal payloads; kind/source validated against [a-zA-Z0-9_][a-zA-Z0-9_.\-]*, raises PathTraversalError)
+  media.py          MediaStore (on-disk storage for large signal payloads; kind/source validated against [a-zA-Z0-9_][a-zA-Z0-9_.\-]*, extension against '.name' segments, raises PathTraversalError; exclusive create, no overwrite)
   framework_config.py  FrameworkConfig (runtime, transport, logging settings)
   llm_provider.py   LLMProvider, Anthropic/Ollama/Local, ThreadSafeProvider, SharedModelRegistry
   web.py            SignalDashboard, FileLogSink
@@ -1473,9 +1532,9 @@ arachnite/
     nats.py         NATSTransport (calls check_network_safety on connect)
     redis.py        RedisTransport (calls check_network_safety on connect)
   distributed/
-    agent_node.py   AgentNode
-    manifest.py     DeploymentManifest
-    mesh.py         MeshRuntime
+    agent_node.py   AgentNode (remote signals -> runtime.inject_remote_signal + mesh health)
+    manifest.py     DeploymentManifest (validated on load; NodeAssignment.node_id = class node_id)
+    mesh.py         MeshRuntime (shared LocalTransport for local agents; clean partial start)
     colocation.py   reflex co-location validator
     permissions.py  permission validation helpers
 examples/
