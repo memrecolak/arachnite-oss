@@ -367,8 +367,12 @@ def test_command(tests: tuple[str, ...]) -> str:
     return f'"{sys.executable}" -B -m pytest -x -q ' + " ".join(tests)
 
 
-# Environment for every test run the harness starts: no bytecode written.
-_NO_BYTECODE_ENV = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1"}
+# Environment for every test run the harness starts: no bytecode written, and
+# UTF-8 stdout/stderr. cosmic-ray decodes the test command's output as UTF-8;
+# on a Windows console code page a non-ASCII character in a failure message
+# made it raise instead of recording the kill, so the mutant was counted as
+# incompetent (23 such cases in one run).
+_NO_BYTECODE_ENV = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1", "PYTHONUTF8": "1"}
 
 
 def _purge_pycache() -> int:
