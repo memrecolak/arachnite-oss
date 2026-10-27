@@ -193,7 +193,7 @@ The framework automatically emits the following LogEvents without any developer 
 | Event              | Level   | Message                              | Trigger / data                                                                                  |
 |--------------------|---------|--------------------------------------|--------------------------------------------------------------------------------------------------|
 | `tick.overrun`     | WARNING | `"Tick overrun"`                     | Tick took longer than `interval × (1 + overrun_warn_pct)` for `overrun_warn_consecutive` consecutive ticks \(default 3\)\. Data: `tick`, `overrun_ms`, `elapsed_ms`, `interval_ms`, `consecutive`\. |
-| `reflex.fired`     | INFO    | `"Reflex fired"`                     | Each `ReflexInstinctNode` activation, before `launch_reflex()`\. Data: `instinct_id`, `action_id`, `priority`, `urgency`\. |
+| `reflex.fired`     | INFO    | `"Reflex fired"`                     | Each `ReflexInstinctNode` activation, before `launch_reflex()`\. Data: `instinct_id`, `reflex_node_id`, `action_id`, `priority`, `urgency`\. |
 | `reflex.armed`     | INFO    | `"Reflex armed; taking resources from running action(s)"` | `launch_reflex()` returned `ARMED`\. Data: `action_id`, `owners`, `preemption`\. |
 | `reflex.not_found` | WARNING | `"Reflex dispatch skipped: action not found"` | A reflex proposal names no registered action\. Data: `action_id`, `instinct_id`\. |
 | `reflex.conflict`  | ERROR   | `"Reflex priority conflict; dispatching all in priority order"` | `reflex_conflict='raise'` and equal top priorities; the reflexes are still launched\. Data: `priority`, `instinct_ids`\. |
@@ -206,7 +206,10 @@ The framework automatically emits the following LogEvents without any developer 
 | `action.cancelled` | INFO    | `"Action cancelled; safe-stop complete"` | An action was cancelled by `emergency_stop()`, shutdown or `cancel()`, after its safe\-stop\. Data: `action_id`, `stopped_at`\. |
 | `action.completed` | INFO    | `"Action complete"`                  | An action's task finished with a `Result`\. Data: `action_id`, `success`, `preempted`, `duration_ms`\. |
 | `action.interrupted`| INFO   | `"Action interrupted"`               | An `InterruptRequest` was honoured\. Data: `stopped_at`, `policy`\.                              |
-| `interrupt.blocked`| WARNING | `"Interrupt blocked by mandatory step"` | A deliberative interrupt targeted an action inside a mandatory block \(`MandatoryBlockViolation`\)\. Data: `action_id`, `detail`\. |
+| `interrupt.held`   | DEBUG   | `"Interrupt held until the mandatory block ends"` | A deliberative interrupt targeted an action inside a mandatory block; it is latched and honoured at the first stop point after the block \(ADR 0009\)\. Data: `action_id`, `step`\. |
+| `action.timed_out` | WARNING | `"Action timed out; running its safe-stop"` | `timeout_s` expired: `execute()` was cancelled; `on_preempted()`, the abort rules of the cut step and `on_timeout()` follow \(ADR 0009\)\. Data: `action_id`, `timeout_s`\. |
+| `instinct.bad_result` | ERROR | `"Instinct returned a non-Proposal; treated as None"` | `evaluate()` returned something other than a Proposal or None; reported to the node's supervisor as a fault\. Data: `node_id`, `returned_type`\. |
+| `decision.bad_choice` | ERROR | `"Strategy decide() returned a proposal it was not offered; selection stopped"` | A strategy error in the default `decide_many()`\. Data: `strategy`, `action_id`, `selected`\. |
 | `step.completed`   | DEBUG   | `"Step complete"`                    | `MultiStepActionNode` finished one `ActionStep`\. Data: `step`, `duration_ms`\.                   |
 | `transport.connected` | INFO | `"Transport connected"`              | `BaseTransport.connect()` succeeded\. Data: `transport` \(class name\)\.                          |
 | `transport.disconnected` | INFO | `"Transport disconnected"`        | `BaseTransport.disconnect()` called\. Data: `transport` \(class name\)\.                          |

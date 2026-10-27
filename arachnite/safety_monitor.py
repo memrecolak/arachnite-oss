@@ -135,11 +135,14 @@ class MonitorState:
     #: tick, also when a reflex fired (ADR 0005). Use
     #: ``reflex_routed_through_decision``.
     decision_entered: bool = False
-    #: A running action was inside a mandatory block at the end of the tick.
+    #: A running action was inside a mandatory block at the end of the tick
+    #: (informational; MandatoryBlockMonitor does not need it).
     mandatory_block_active: bool = False
     #: A *deliberative* interrupt was honoured strictly inside a mandatory
-    #: block. Reflex preemption (PREEMPT) and emergency_stop() are declared
-    #: exceptions and never set this.
+    #: block, by an action whose Result reached this tick. Cancellations
+    #: (reflex PREEMPT, cancel(), shutdown, emergency_stop(), the action
+    #: timeout: ``Result.cancelled``) and reflex hand-offs are the declared
+    #: ways into a block and never set this.
     interrupt_accepted_during_block: bool = False
     #: Declared resources that had more than one running owner.
     resources_with_multiple_owners: int = 0
@@ -186,14 +189,20 @@ class MandatoryBlockMonitor(BaseSafetyMonitor):
 
     A reflex declaring ReflexPreemption.PREEMPT and emergency_stop() are the
     declared exceptions (ADR 0005) and are not violations; they surface as
-    ``Result.preempted`` / a shutdown, not as an accepted interrupt.
+    ``Result.preempted`` / ``Result.cancelled``, not as an accepted
+    interrupt.
+
+    The violating action has, by definition, already stopped, so the check
+    rests on ``interrupt_accepted_during_block`` alone — whether some other
+    action is inside a block at that moment (``mandatory_block_active``) is
+    irrelevant.
     """
 
     monitor_id = "MandatoryBlockMonitor"
 
     async def check(self, tick: int, state: MonitorState) -> SafetyViolationSignal | None:
         self._last_check_ok = True
-        if state.mandatory_block_active and state.interrupt_accepted_during_block:
+        if state.interrupt_accepted_during_block:
             return await self.emit_violation(
                 property_name="mandatory_block_atomicity",
                 severity=SafetySeverity.CRITICAL,

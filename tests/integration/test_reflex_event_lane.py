@@ -10,8 +10,17 @@ import pytest
 import arachnite.runtime as runtime_module
 from arachnite import SignalBus
 from arachnite.context import ContextNode
-from arachnite.models import Context, Proposal, Result, Signal
-from arachnite.nodes.action import ActionMasterNode, BaseActionNode
+from arachnite.models import (
+    ActionStep,
+    Context,
+    InterruptPolicy,
+    Proposal,
+    ReflexPreemption,
+    Result,
+    Signal,
+    StepResult,
+)
+from arachnite.nodes.action import ActionMasterNode, BaseActionNode, MultiStepActionNode
 from arachnite.nodes.decision import DecisionMasterNode, GreedyDecisionNode
 from arachnite.nodes.instinct import BaseInstinctNode, BaseReflexInstinctNode, InstinctMasterNode
 from arachnite.nodes.sense import BaseSenseNode, SenseMasterNode
@@ -402,3 +411,131 @@ class TestEventLaneEdges:
         await bus.publish(_signal("EventProximity", "proximity", 0.01))   # must not raise
         await rt.stop()
         assert retract.entered == []
+
+
+# ── Sixth review: lane re-entrancy and the producing node's preemption ───────
+
+
+class _FaultReflex(BaseReflexInstinctNode):
+    """The node_fault reflex pattern (spec §6.6) with a bug: evaluate() raises."""
+
+    node_id = "FaultReflex"
+    priority = 250
+    trigger_on_signals = ["node_fault", "hazard"]
+
+    def __init__(self, bus: SignalBus) -> None:
+        super().__init__(bus)
+        self.calls = 0
+
+    async def evaluate(self, ctx: Context) -> Proposal | None:
+        self.calls += 1
+        raise KeyError("bug in reflex")
+
+
+class _GuardReflex(BaseReflexInstinctNode):
+    """WAIT_FOR_BLOCK reflex whose Proposal.instinct_id differs from its node_id."""
+
+    node_id = "Guard"
+    priority = 250
+    preemption = ReflexPreemption.WAIT_FOR_BLOCK
+    trigger_on_signals = ["proximity"]
+
+    async def evaluate(self, ctx: Context) -> Proposal | None:
+        if any(s.kind == "proximity" and s.value < 0.05 for s in ctx.signals):
+            return Proposal(instinct_id="guard-reflex", action_id="Retract",
+                            priority=self.priority, urgency=1.0)
+        return None
+
+
+class _Lift(MultiStepActionNode):
+    """grip + raise form a mandatory block; each step waits for the test."""
+
+    node_id = "Lift"
+    resources = frozenset({"arm"})
+    interrupt_policy = InterruptPolicy.ALWAYS
+    timeout_s = 10.0
+
+    def __init__(self, bus: SignalBus) -> None:
+        super().__init__(bus)
+        self.go = {name: asyncio.Event() for name in ("grip", "raise", "swing")}
+        self.log: list[str] = []
+
+    def steps(self) -> list[ActionStep]:
+        return [
+            ActionStep("grip", interruptible=False),
+            ActionStep("raise", interruptible=False),
+            ActionStep("swing", interruptible=True),
+        ]
+
+    async def execute_step(
+        self, step: ActionStep, proposal: Proposal, completed: list[StepResult],
+    ) -> StepResult:
+        self.log.append(step.name)
+        await self.go[step.name].wait()
+        return StepResult(step_name=step.name, success=True)
+
+
+class TestSixthReviewRegressions:
+    @pytest.mark.asyncio
+    async def test_fault_reflex_is_not_re_evaluated_inside_its_own_evaluation(self) -> None:
+        """R6-F9: a raising node_fault reflex is not re-entered by its own node_fault"""
+        bus = SignalBus()
+        sense = EventProximity(bus)
+        fault = _FaultReflex(bus)
+        rt, _, _ = _build(sense, extra_reflexes=(fault,), bus=bus)
+        rt._supervisors[1]._restart_delay = 10.0   # keep the restart out of the picture
+        await rt.start()
+        try:
+            started = time.perf_counter()
+            await sense.push(_signal("EventProximity", "hazard", 1.0))
+            elapsed = time.perf_counter() - started
+            assert fault.calls == 1
+            assert elapsed < 0.5
+            # The node_fault published during the evaluation is kept as the
+            # lane's latest signal of its kind, for the next evaluation.
+            assert any(kind == "node_fault" for _, kind in rt._lane_latest)
+            # The guard is released afterwards: a later trigger is evaluated.
+            fault.enabled = True
+            await sense.push(_signal("EventProximity", "hazard", 1.0))
+            assert fault.calls == 2
+        finally:
+            await rt.stop()
+
+    @pytest.mark.asyncio
+    async def test_lane_reflex_keeps_its_preemption_whatever_its_instinct_id(self) -> None:
+        """R6-F7: a lane WAIT_FOR_BLOCK reflex keeps its mode if Proposal.instinct_id != node_id"""
+        bus = SignalBus()
+        sense = EventProximity(bus)
+        sm = SenseMasterNode(bus=bus)
+        sm.register(sense)
+        im = InstinctMasterNode(bus=bus)
+        im.register(_GuardReflex(bus))
+        am = ActionMasterNode(bus=bus)
+        lift = _Lift(bus)
+        am.register(lift)
+        am.register(Retract(bus))
+        rt = ArachniteRuntime(
+            sense_master=sm, context=ContextNode(), instinct_master=im,
+            decision_master=DecisionMasterNode(bus=bus, strategy=GreedyDecisionNode(bus=bus)),
+            action_master=am, bus=bus, tick_rate_hz=SLOW_TICK_HZ, reflex_mode="event",
+        )
+        await rt.start()
+        try:
+            am.launch(Proposal(instinct_id="op", action_id="Lift", priority=50, urgency=0.5))
+            for _ in range(100):
+                if lift.log == ["grip"]:
+                    break
+                await asyncio.sleep(0.005)
+            await sense.push(_signal("EventProximity", "proximity", 0.01))
+            await asyncio.sleep(0.02)
+            assert am.running_action_ids() == {"Lift"}     # not cut into the block
+            lift.go["grip"].set()
+            lift.go["raise"].set()
+            assert await rt.wait_idle(2.0)
+            results = {r.action_id: r for r in am.drain_completed()}
+            assert results["Lift"].preempted is True
+            assert results["Lift"].stopped_at_step == "swing"
+            assert [s.step_name for s in results["Lift"].step_results] == ["grip", "raise"]
+            assert "Retract" in results
+        finally:
+            await rt.stop()

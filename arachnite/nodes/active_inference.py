@@ -38,6 +38,7 @@ When beta is high, the agent prefers actions in uncertain contexts
 from __future__ import annotations
 
 import math
+import random
 import sys
 
 if sys.version_info >= (3, 12):
@@ -70,6 +71,9 @@ class ActiveInferenceDecisionNode(BaseDecisionNode):
               0.0 = deterministic (argmin EFE).
               >0.0 = probabilistic (softmax over -EFE).
         prior_confidence: Default confidence when proposal has no evidence.
+        seed: Seed for the softmax sampling (temperature > 0), giving a
+              reproducible sequence of choices; None uses the module-level
+              ``random`` generator.
     """
 
     node_id = "ActiveInferenceDecisionNode"
@@ -79,12 +83,14 @@ class ActiveInferenceDecisionNode(BaseDecisionNode):
         beta: float = 1.0,
         temperature: float = 0.0,
         prior_confidence: float = 0.5,
+        seed: int | None = None,
         **kwargs: object,
     ) -> None:
         super().__init__(**kwargs)  # type: ignore[arg-type]
         self.beta = beta
         self.temperature = temperature
         self.prior_confidence = prior_confidence
+        self._rng: random.Random | None = random.Random(seed) if seed is not None else None
 
     def _pragmatic_value(self, p: Proposal) -> float:
         """Goal-directed value: how well does this proposal serve objectives."""
@@ -136,9 +142,7 @@ class ActiveInferenceDecisionNode(BaseDecisionNode):
         total = sum(exp_vals)
         probs = [e / total for e in exp_vals]
 
-        import random
-        return random.choices(
-            [p for p, _ in efes],
-            weights=probs,
-            k=1,
-        )[0]
+        rng = self._rng
+        if rng is None:
+            return random.choices([p for p, _ in efes], weights=probs, k=1)[0]
+        return rng.choices([p for p, _ in efes], weights=probs, k=1)[0]

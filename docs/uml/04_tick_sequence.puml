@@ -92,9 +92,9 @@ deactivate IM
 RT -> DM : on_new_proposals_many(\n   proposals, running_proposals,\n   running_interruptible,\n   evaluated_instinct_ids,\n   conflicts=conflicting_owners)
 activate DM
 DM -> DM : merge with pending (persist=True)\nand parked hand-off proposals
-DM -> DS : decide_many(pool)
+DM -> DS : decide_many(pool)\n(calls decide() until None)
 DS --> DM : list<Proposal> selected
-DM -> DM : per proposal, conflicting owners?\nnone: dispatch\nall interruptible, non-reflex, lower priority:\n InterruptRequest per owner + dispatch\notherwise: hold
+DM -> DM : per proposal, conflicting owners?\nnone: dispatch\nall non-reflex, lower priority:\n InterruptRequest per owner + dispatch\notherwise: hold
 DM --> RT : (to_dispatch, interrupt_requests)
 deactivate DM
 RT -> IM : notify_rejected(rejected)
@@ -102,7 +102,7 @@ RT -> IM : notify_rejected(rejected)
 alt interrupt_requests not empty
   loop for each InterruptRequest
     RT -> AM : request_interrupt(req, target_action_id)
-    AM ->> AT : set interrupt flag\n(honoured at next allowed boundary;\nMandatoryBlockViolation inside a block)
+    AM ->> AT : set interrupt flag\n(honoured at next allowed boundary;\nlatched through a mandatory block)
   end
 end
 RT -> RT : notify decision_observers(\n   DecisionEvent)

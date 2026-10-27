@@ -15,13 +15,13 @@ executes.  The model is derived from the v0.13 source:
   rollback via ``on_interrupted`` (reverse order, mandatory steps with a
   rollback callable only).  A WAIT_FOR_BLOCK reflex waiting on the action
   is handed over at the first stop point, whatever the policy.
-* ``ActionMasterNode.request_interrupt`` -- the gate: raises
-  ``MandatoryBlockViolation`` while the current step is mandatory (``reqR``),
-  forwards otherwise (``reqA``), no-op when the action is not running
-  (``reqD``).
-* ``ActionMasterNode.interrupt_all`` (graceful ``stop()``) -- bypasses the
-  gate and sets the pending flag even inside a mandatory block (``sreq``);
-  the flag is then honoured at the next stop point.
+* ``ActionMasterNode.request_interrupt`` -- the gate: while the current
+  step is mandatory the request is latched (``reqR``, ADR 0009) and honoured
+  at the first stop point after the block; forwarded otherwise (``reqA``);
+  no-op when the action is not running (``reqD``).
+* ``ActionMasterNode.interrupt_all`` (graceful ``stop()``) -- sets the
+  pending flag, also inside a mandatory block (``sreq``); the flag is then
+  honoured at the next stop point.
 * ``ArachniteRuntime.emergency_stop`` -- cancels the action at its current
   await, runs its safe-stop, never rolls back, then halts (``estop``,
   ``safe_stop``, ``halt``).
@@ -46,11 +46,12 @@ checkable property.
 Checks on the action alone (1-9; 1-8 for EVERY step layout with N <= MAX_N):
   1. deadlock freedom (the only terminal state is after ``halt``)
   2. estop is enabled in every state before shutdown        (never refused)
-  3. gate soundness: reqR exactly while the current step is mandatory
+  3. gate soundness: reqR exactly while the current step is mandatory,
+     and reqR latches the request (it is pending afterwards)
   4. mandatory-step atomicity: no ack/roll/bail inside a mandatory step
   5. deliberative stops only at stop points: an ack/roll walk starts only
      at a boundary that is not strictly inside a block
-  6. no spurious interrupt: ack/roll/bail only after a reqA or sreq
+  6. no spurious interrupt: ack/roll/bail only after a reqA, reqR or sreq
   7. rollback order: strictly reverse completion order over mandatory
      rollback-bearing steps, then ack
   8. honour at the first eligible stop point; NEVER never acks
@@ -164,7 +165,8 @@ def owner_succ(state, lay: Layout, policy: str, rb: bool = False):
         elif lay.interruptible(cur):
             yield ("reqA", ("exec", idx, in_step, True, rpend, done))
         else:
-            yield ("reqR", state)  # MandatoryBlockViolation, caught by caller
+            # latched, honoured at the first stop point after the block
+            yield ("reqR", ("exec", idx, in_step, True, rpend, done))
         if cur is not None:
             # graceful stop(): interrupt_all() bypasses the gate
             yield ("sreq", ("exec", idx, in_step, True, rpend, done))
@@ -313,9 +315,11 @@ def check_layout(lay: Layout, policy: str, quiet: bool = True) -> bool:
     def gate_ok() -> bool:
         for s, outs in trans.items():
             cur = s[1] if s[0] == "exec" and s[1] <= lay.n else None
-            for e, _ in outs:
+            for e, t in outs:
                 if e == "reqR" and (cur is None or lay.interruptible(cur)):
                     return False
+                if e == "reqR" and not (t[0] == "exec" and t[3]):
+                    return False  # an in-block request must be latched
                 if e == "reqA" and (cur is None or not lay.interruptible(cur)):
                     return False
         return True
@@ -346,10 +350,10 @@ def check_layout(lay: Layout, policy: str, quiet: bool = True) -> bool:
         return True
     ok &= report(stops_ok(), f"5 stop-points-only {tag}", quiet)
 
-    # 6. no spurious interrupt: ack/roll/bail need a prior reqA (or the
-    #    shutdown request) in this run
+    # 6. no spurious interrupt: ack/roll/bail need a prior reqA or reqR
+    #    (or the shutdown request) in this run
     def spurious(sp, e):
-        if e in ("reqA", "sreq"):
+        if e in ("reqA", "reqR", "sreq"):
             return "armed"
         if e == "dispatch":
             return "running"

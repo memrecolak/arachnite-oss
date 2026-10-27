@@ -208,6 +208,7 @@ class ReflexConflictError(ArachniteError):
         priority: int,
         node_ids: list[str],
         proposals: list[Any] | None = None,
+        fired: list[tuple[Any, Any]] | None = None,
     ) -> None:
         super().__init__(
             f"Priority conflict: reflex nodes {node_ids} all fired at priority={priority}. "
@@ -218,6 +219,9 @@ class ReflexConflictError(ArachniteError):
         #: Every reflex proposal of the evaluation that raised, priority
         #: descending — lets the runtime still dispatch them (fail-safe).
         self.proposals: list[Any] = list(proposals) if proposals else []
+        #: The same proposals as ``(reflex node, proposal)`` pairs, so each
+        #: is launched with its own node's preemption mode.
+        self.fired: list[tuple[Any, Any]] = list(fired) if fired else []
 
 
 # ── Codec ────────────────────────────────────────────────────────────────────

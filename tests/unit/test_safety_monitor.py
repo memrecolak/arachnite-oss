@@ -81,13 +81,15 @@ class TestReflexBypassMonitor:
 
 class TestMandatoryBlockMonitor:
     @pytest.mark.asyncio
-    async def test_no_violation_when_block_not_active(self, bus: SignalBus) -> None:
+    async def test_violation_when_no_block_is_active_any_more(self, bus: SignalBus) -> None:
+        """R6-F10: the violating action has stopped, so no block need be active now"""
         m = MandatoryBlockMonitor(bus)
         result = await m.check(
             1,
             _state(mandatory_block_active=False, interrupt_accepted_during_block=True),
         )
-        assert result is None
+        assert result is not None
+        assert result.property_name == "mandatory_block_atomicity"
 
     @pytest.mark.asyncio
     async def test_no_violation_when_block_active_no_interrupt(self, bus: SignalBus) -> None:

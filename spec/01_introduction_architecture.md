@@ -344,6 +344,16 @@ class Result:
 
                                         \# implies interrupted; never retried
 
+    cancelled: bool = False             \# True if execute\(\) was cancelled at
+
+                                        \# an await and the safe\-stop ran:
+
+                                        \# PREEMPT, cancel\(\)/cancel\_all\(\),
+
+                                        \# emergency stop, action timeout
+
+                                        \# \(ADR 0009\); not a boundary stop
+
 # __4\. SignalBus__
 
 The SignalBus is the central nervous system of the framework\. Nodes communicate exclusively through it — they never hold direct references to each other\. This keeps every node independently testable and allows new nodes to be added without touching existing ones\.

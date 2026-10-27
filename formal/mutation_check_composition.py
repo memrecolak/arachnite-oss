@@ -73,6 +73,16 @@ def m_gate_accept_mandatory():
     _wrap_owner(t)
 
 
+def m_gate_drops_mandatory():
+    def t(state, lay, policy, rb, orig):
+        for e, s2 in orig(state, lay, policy, rb):
+            if e == "reqR":  # in-block request refused, not latched (pre-ADR 0009)
+                yield (e, state)
+            else:
+                yield (e, s2)
+    _wrap_owner(t)
+
+
 def m_bail_in_mandatory():
     def t(state, lay, policy, rb, orig):
         yield from orig(state, lay, policy, rb)
@@ -230,6 +240,7 @@ def m_dispatch_while_armed():
 
 MUTANTS = (
     ("gate forwards during mandatory step", m_gate_accept_mandatory, "3"),
+    ("gate drops a request inside a mandatory step", m_gate_drops_mandatory, "3"),
     ("cooperative bail inside mandatory step", m_bail_in_mandatory, "4"),
     ("deliberative ack at an interior block boundary", m_ack_inside_block, "5"),
     ("rollback in forward order", m_forward_rollback, "7"),

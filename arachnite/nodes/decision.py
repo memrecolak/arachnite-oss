@@ -10,6 +10,7 @@ from __future__ import annotations
 import random
 from abc import abstractmethod
 from collections.abc import Callable
+from typing import Any
 
 from arachnite.bus import SignalBus
 from arachnite.config import NodeConfig
@@ -20,13 +21,17 @@ from arachnite.nodes.base import BaseNode
 
 class BaseDecisionNode(BaseNode):
     """
-    Receives the full list of Proposals from InstinctMasterNode and
-    selects exactly one to execute (or None to idle this tick).
+    Receives the Proposals of a tick and selects the ones to execute, one
+    at a time through decide() (or none, to idle this tick).
 
     Developer contract:
     - Extend this class and implement decide().
     - The proposals list is always pre-sorted by priority descending.
-    - Returning None is valid — it means the agent idles this tick.
+    - Returning None is valid — it means the agent starts nothing more this
+      tick (None on the first call idles the agent).
+    - The runtime selects through decide_many(), whose default calls decide()
+      repeatedly (see decide_many()); override decide_many() only for custom
+      multi-select logic.
     - The strategy can be swapped at runtime via DecisionMasterNode.set_strategy().
 
     Spec reference: Section 5.6.
@@ -35,10 +40,11 @@ class BaseDecisionNode(BaseNode):
     @abstractmethod
     async def decide(self, proposals: list[Proposal]) -> Proposal | None:
         """
-        Select one Proposal from the list, or return None if no action
-        should be taken this tick.
+        Select one Proposal from the list, or return None if no (further)
+        action should be taken this tick.
 
-        Receives proposals sorted by priority descending. May be empty.
+        Receives proposals sorted by priority descending. Must return one of
+        the list's own objects (or None).
         """
 
     async def decide_many(
@@ -47,26 +53,74 @@ class BaseDecisionNode(BaseNode):
         running_action_ids: set[str] | None = None,
     ) -> list[Proposal]:
         """
-        Select multiple proposals for concurrent execution.
+        Select the proposals to start this tick by delegating to decide().
 
-        Default implementation: pick the best proposal per unique
-        ``action_id`` (by priority descending), skipping any
-        ``action_id`` already in ``running_action_ids``.
+        Default implementation: drop the candidates whose ``action_id`` is in
+        ``running_action_ids``; then call ``decide()`` on the remaining
+        candidates (sorted by priority, then urgency, descending), take its
+        choice, drop every candidate with the same ``action_id``, and repeat
+        until ``decide()`` returns None or no candidate is left. Returns the
+        choices in selection order. A choice that is not one of the offered
+        candidates is a strategy error: it is logged and selection stops.
+
+        For GreedyDecisionNode this is the best proposal per ``action_id``,
+        highest priority (then urgency) first.
 
         Subclasses may override for custom multi-select logic.
         """
-        if not proposals:
-            return []
         running = running_action_ids or set()
-        # Sort by priority desc, urgency desc for stable tie-breaking
-        sorted_proposals = sorted(
-            proposals, key=lambda p: (p.priority, p.urgency), reverse=True,
+        # Stable sort: ties keep the caller's order.
+        candidates = sorted(
+            (p for p in proposals if p.action_id not in running),
+            key=lambda p: (p.priority, p.urgency),
+            reverse=True,
         )
-        selected: dict[str, Proposal] = {}
-        for p in sorted_proposals:
-            if p.action_id not in selected and p.action_id not in running:
-                selected[p.action_id] = p
-        return list(selected.values())
+        selected: list[Proposal] = []
+        while candidates:
+            chosen = await self.decide(list(candidates))
+            if chosen is None:
+                break
+            if not any(c is chosen for c in candidates):
+                self.logger.error(
+                    "Strategy decide() returned a proposal it was not offered; "
+                    "selection stopped",
+                    strategy=type(self).__name__,
+                    action_id=getattr(chosen, "action_id", None),
+                    selected=len(selected),
+                )
+                break
+            selected.append(chosen)
+            candidates = [c for c in candidates if c.action_id != chosen.action_id]
+        return selected
+
+
+def _best_per_action(
+    proposals: list[Proposal],
+    running_action_ids: set[str] | None,
+    score: Callable[[Proposal], float] | None = None,
+) -> list[Proposal]:
+    """
+    The default decide_many() selection for a strategy whose decide() returns
+    the first candidate with the highest ``score`` (Greedy: priority, then
+    urgency; Weighted: priority x urgency), in O(n log n) rather than one
+    decide() call per choice: rank the candidates as decide_many() offers
+    them, stable-sort by ``score``, keep the first per action_id.
+    """
+    running = running_action_ids or set()
+    ranked = sorted(
+        (p for p in proposals if p.action_id not in running),
+        key=lambda p: (p.priority, p.urgency),
+        reverse=True,
+    )
+    if score is not None:
+        ranked.sort(key=score, reverse=True)  # stable: ties keep the offer order
+    seen: set[str] = set()
+    selected: list[Proposal] = []
+    for p in ranked:
+        if p.action_id not in seen:
+            seen.add(p.action_id)
+            selected.append(p)
+    return selected
 
 
 class GreedyDecisionNode(BaseDecisionNode):
@@ -83,6 +137,16 @@ class GreedyDecisionNode(BaseDecisionNode):
             return None
         # proposals is already sorted by priority desc; break ties by urgency
         return max(proposals, key=lambda p: (p.priority, p.urgency))
+
+    async def decide_many(
+        self,
+        proposals: list[Proposal],
+        running_action_ids: set[str] | None = None,
+    ) -> list[Proposal]:
+        """The default delegation's result, computed directly (decide() not overridden)"""
+        if type(self).decide is not GreedyDecisionNode.decide:
+            return await super().decide_many(proposals, running_action_ids)
+        return _best_per_action(proposals, running_action_ids)
 
 
 class WeightedDecisionNode(BaseDecisionNode):
@@ -102,26 +166,48 @@ class WeightedDecisionNode(BaseDecisionNode):
             return None
         return max(proposals, key=lambda p: p.priority * p.urgency)
 
+    async def decide_many(
+        self,
+        proposals: list[Proposal],
+        running_action_ids: set[str] | None = None,
+    ) -> list[Proposal]:
+        """The default delegation's result, computed directly (decide() not overridden)"""
+        if type(self).decide is not WeightedDecisionNode.decide:
+            return await super().decide_many(proposals, running_action_ids)
+        return _best_per_action(
+            proposals, running_action_ids, score=lambda p: p.priority * p.urgency,
+        )
+
 
 class RandomDecisionNode(BaseDecisionNode):
     """
     Samples probabilistically from proposals weighted by urgency.
 
     Useful for exploratory or creative agents where deterministic
-    behaviour is undesirable.
+    behaviour is undesirable. Pass ``seed`` for a reproducible sequence of
+    choices (its own ``random.Random``); without it the module-level
+    ``random`` generator is used.
     Spec reference: Section 5.6.
     """
 
     node_id = "RandomDecisionNode"
+
+    def __init__(self, *args: Any, seed: int | None = None, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._rng: random.Random | None = random.Random(seed) if seed is not None else None
 
     async def decide(self, proposals: list[Proposal]) -> Proposal | None:
         if not proposals:
             return None
         weights = [p.urgency for p in proposals]
         total   = sum(weights)
+        if self._rng is None:
+            if total == 0:
+                return random.choice(proposals)
+            return random.choices(proposals, weights=weights, k=1)[0]
         if total == 0:
-            return random.choice(proposals)
-        return random.choices(proposals, weights=weights, k=1)[0]
+            return self._rng.choice(proposals)
+        return self._rng.choices(proposals, weights=weights, k=1)[0]
 
 
 class DecisionMasterNode(BaseNode):
@@ -294,11 +380,14 @@ class DecisionMasterNode(BaseNode):
         same ``action_id``; the runtime passes
         ``ActionMasterNode.conflicting_owners`` so shared resources count
         too (ADR 0005). With no conflict it is dispatched. When every
-        conflicting owner is running, interruptible and of lower priority,
-        an ``InterruptRequest`` is issued to each owner
-        (``target_action_id``) and the proposal is returned for dispatch;
-        if it cannot start yet the runtime ``park()``s it for hand-off.
-        Otherwise — an owner inside a mandatory block, a reflex-owned action
+        conflicting owner is running, interruptible (per
+        ``running_interruptible``) and of lower priority, an
+        ``InterruptRequest`` is issued to each owner (``target_action_id``)
+        and the proposal is returned for dispatch; if it cannot start yet
+        the runtime ``park()``s it for hand-off. The runtime reports every
+        deliberative owner as interruptible, also one inside a mandatory
+        block: the request is latched on it and honoured at its first stop
+        point after the block (ADR 0009). Otherwise — a reflex-owned action
         (reported non-interruptible), or an owner of equal/higher priority —
         it is held: not dispatched, kept only under the ``persist`` rules.
 
@@ -322,7 +411,8 @@ class DecisionMasterNode(BaseNode):
         Args:
             proposals: All proposals from this tick's instinct evaluation.
             running_proposals: Currently running proposals keyed by action_id.
-            running_interruptible: Whether each running action is interruptible.
+            running_interruptible: Whether deliberation may interrupt each
+                running action (False for a reflex-owned action).
             evaluated_instinct_ids: Instinct IDs that were actually evaluated
                 this tick (passed signal gate and throttle).  ``None`` disables
                 pending-clear logic (backward compat).
@@ -394,7 +484,8 @@ class DecisionMasterNode(BaseNode):
                 to_dispatch.append(prop)
                 continue
             # Interrupt only if every owner is a running, interruptible,
-            # lower-priority action; anything else holds the proposal.
+            # lower-priority action; anything else holds the proposal. Inside
+            # a mandatory block the request is latched (ADR 0009).
             owner_props = [running_proposals.get(o) for o in sorted(owners)]
             can_interrupt = all(
                 running is not None

@@ -156,8 +156,9 @@ class InstinctMasterNode(FaultReportingMixin, BaseNode):
         """
         Register a normal or reflex instinct node.
         Reflex nodes (node.reflex == True) go to the reflex registry.
-        Raises NodeRegistrationError on duplicate node_id, or if a reflex
-        node has priority < 200 (the documented reflex band).
+        Raises NodeRegistrationError on a node_id already registered in
+        either registry (normal and reflex ids share one namespace), or if a
+        reflex node has priority < 200 (the documented reflex band).
         """
         if node.reflex and node.priority < 200:
             raise NodeRegistrationError(
@@ -170,7 +171,7 @@ class InstinctMasterNode(FaultReportingMixin, BaseNode):
                 ),
             )
         registry = self._reflex_nodes if node.reflex else self._normal_nodes
-        if node.node_id in registry:
+        if node.node_id in self._normal_nodes or node.node_id in self._reflex_nodes:
             raise NodeRegistrationError(node.node_id, self.node_id)
         registry[node.node_id] = node  # type: ignore[assignment]
         kind = "reflex" if node.reflex else "normal"
@@ -245,6 +246,28 @@ class InstinctMasterNode(FaultReportingMixin, BaseNode):
                 with contextlib.suppress(Exception):
                     await node.on_proposal_rejected(p)
 
+    async def _checked_proposal(
+        self, node: BaseInstinctNode, result: object,
+    ) -> Proposal | None:
+        """
+        Enforce the evaluate() contract (a Proposal or None). Anything else
+        is that node's fault: logged, reported to its supervisor, and treated
+        as None, so it cannot abort the stage for its siblings.
+        """
+        if result is None or isinstance(result, Proposal):
+            return result
+        error = TypeError(
+            f"evaluate() of '{node.node_id}' returned "
+            f"{type(result).__name__}, not a Proposal or None",
+        )
+        self.logger.error(
+            "Instinct returned a non-Proposal; treated as None",
+            node_id=node.node_id,
+            returned_type=type(result).__name__,
+        )
+        await self._report_fault(node.node_id, error)
+        return None
+
     async def evaluate_reflexes(
         self,
         ctx: Context,
@@ -256,7 +279,23 @@ class InstinctMasterNode(FaultReportingMixin, BaseNode):
         subset triggered by an arriving signal).
 
         Returns non-None proposals sorted by priority descending.
-        Called by the runtime before evaluate_all().
+        See ``evaluate_reflex_pairs()`` for the proposals with their nodes.
+        """
+        return [p for _, p in await self.evaluate_reflex_pairs(ctx, nodes)]
+
+    async def evaluate_reflex_pairs(
+        self,
+        ctx: Context,
+        nodes: Sequence[BaseReflexInstinctNode] | None = None,
+    ) -> list[tuple[BaseReflexInstinctNode, Proposal]]:
+        """
+        Evaluate reflexes as ``evaluate_reflexes()``, but return each
+        proposal with the reflex node that produced it, priority descending.
+        The runtime takes the reflex's ``preemption`` from that node, never
+        by looking up ``Proposal.instinct_id``. Called by the runtime before
+        evaluate_all(). With ``reflex_conflict="raise"`` a tie at the top
+        priority raises ``ReflexConflictError``, whose ``fired`` holds the
+        same pairs.
         """
         candidates = self._reflex_nodes.values() if nodes is None else nodes
         enabled = [n for n in candidates if n.enabled]
@@ -265,7 +304,7 @@ class InstinctMasterNode(FaultReportingMixin, BaseNode):
 
         async def _eval(node: BaseReflexInstinctNode) -> Proposal | None:
             try:
-                return await node.evaluate(ctx)
+                result = await node.evaluate(ctx)
             except Exception as exc:  # noqa: BLE001
                 self.logger.error(
                     "Reflex instinct raised",
@@ -274,31 +313,33 @@ class InstinctMasterNode(FaultReportingMixin, BaseNode):
                 )
                 await self._report_fault(node.node_id, exc)
                 return None
+            return await self._checked_proposal(node, result)
 
         # An evaluate() that ends in its own CancelledError is that reflex's
         # fault: its siblings' proposals still count.
         results = await self._gather_nodes(
             "evaluate()", [(n.node_id, _eval(n)) for n in enabled],
         )
-        proposals = [p for p in results if p is not None]
-        proposals.sort(key=lambda p: p.priority, reverse=True)
+        fired = [(n, p) for n, p in zip(enabled, results, strict=True) if p is not None]
+        fired.sort(key=lambda pair: pair[1].priority, reverse=True)
 
         # Check for priority conflicts if policy is 'raise'
-        if self.reflex_conflict == "raise" and len(proposals) > 1:
-            top_priority = proposals[0].priority
-            conflicts = [p for p in proposals if p.priority == top_priority]
+        if self.reflex_conflict == "raise" and len(fired) > 1:
+            top_priority = fired[0][1].priority
+            conflicts = [p for _, p in fired if p.priority == top_priority]
             if len(conflicts) > 1:
                 raise ReflexConflictError(
                     top_priority,
                     [p.instinct_id for p in conflicts],
-                    proposals=proposals,
+                    proposals=[p for _, p in fired],
+                    fired=fired,
                 )
 
         self.logger.debug(
             "evaluate_reflexes complete",
-            proposals=len(proposals),
+            proposals=len(fired),
         )
-        return proposals
+        return fired
 
     @property
     def last_evaluated_ids(self) -> set[str]:
@@ -417,8 +458,9 @@ class InstinctMasterNode(FaultReportingMixin, BaseNode):
                 if not allowed:
                     return None
             evaluated_ids.add(node.node_id)
+            result: Proposal | None
             try:
-                result = await node.evaluate(ctx)
+                result = await self._checked_proposal(node, await node.evaluate(ctx))
             except Exception as exc:  # noqa: BLE001
                 self.logger.error(
                     "Instinct node raised",

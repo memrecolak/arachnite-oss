@@ -259,8 +259,8 @@ share any resource. What happens next depends on who is asking:
 
 | Who wants the resource | Running owner is... | What happens |
 |---|---|---|
-| A normal proposal | at an interruptible step, lower priority | The owner gets an interrupt request and stops at its next safe boundary (the start of an interruptible step), under its `interrupt_policy` (ROLLBACK unwinds; a plain `BaseActionNode` simply runs to its end). The new proposal is **parked** and starts as soon as the owner releases: a **hand-off**. |
-| A normal proposal | inside a mandatory block, a reflex's action, or equal/higher priority | The proposal is held, not started. If its instinct keeps proposing it (or it has `persist=True`), it gets another chance on later ticks, for example once the block is over. |
+| A normal proposal | a normal action of lower priority | The owner gets an interrupt request and stops at its next safe boundary (the start of an interruptible step), under its `interrupt_policy` (ROLLBACK unwinds; a plain `BaseActionNode` simply runs to its end). Inside a mandatory block the request is held until the block ends, then honoured at the first safe boundary. The new proposal is **parked** and starts as soon as the owner releases: a **hand-off**. |
+| A normal proposal | a reflex's action, or equal/higher priority | The proposal is held, not started. If its instinct keeps proposing it (or it has `persist=True`), it gets another chance on later ticks. |
 | A reflex | anything except another reflex's action | **Preemption**, see the next section. |
 | A reflex | a reflex's action | The reflex waits until that action finishes. |
 

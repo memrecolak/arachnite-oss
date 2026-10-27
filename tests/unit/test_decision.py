@@ -2,16 +2,26 @@
 
 from __future__ import annotations
 
+import random
+
 import pytest
 
 from arachnite.bus import SignalBus
-from arachnite.models import InterruptRequest, Proposal
+from arachnite.context import ContextNode
+from arachnite.logging import NullLogSink
+from arachnite.models import Context, InterruptRequest, Proposal, Result
+from arachnite.nodes.action import ActionMasterNode, BaseActionNode
+from arachnite.nodes.active_inference import ActiveInferenceDecisionNode
 from arachnite.nodes.decision import (
+    BaseDecisionNode,
     DecisionMasterNode,
     GreedyDecisionNode,
     RandomDecisionNode,
     WeightedDecisionNode,
 )
+from arachnite.nodes.instinct import BaseInstinctNode, InstinctMasterNode
+from arachnite.nodes.sense import SenseMasterNode
+from arachnite.runtime import ArachniteRuntime
 
 
 def _proposal(
@@ -750,3 +760,229 @@ class TestLastConsidered:
         assert len(dm.last_considered) == 2
         ids = {p.instinct_id for p in dm.last_considered}
         assert ids == {"InstY", "InstZ"}
+
+
+# ── Sixth review: the strategy's decide() drives selection (R6-F1) ────────────
+
+
+def _old_decide_many(
+    proposals: list[Proposal], running_action_ids: set[str] | None = None,
+) -> list[Proposal]:
+    """The pre-R6 BaseDecisionNode.decide_many(), kept verbatim as the Greedy reference"""
+    if not proposals:
+        return []
+    running = running_action_ids or set()
+    sorted_proposals = sorted(
+        proposals, key=lambda p: (p.priority, p.urgency), reverse=True,
+    )
+    selected: dict[str, Proposal] = {}
+    for p in sorted_proposals:
+        if p.action_id not in selected and p.action_id not in running:
+            selected[p.action_id] = p
+    return list(selected.values())
+
+
+class _OneShot(BaseInstinctNode):
+    """Proposes ``action_id`` with a fixed priority and urgency every tick."""
+
+    def __init__(
+        self, bus: SignalBus, node_id: str, action_id: str, priority: int, urgency: float,
+    ) -> None:
+        super().__init__(bus=bus)
+        self.node_id = node_id
+        self.priority = priority
+        self._action_id = action_id
+        self._urgency = urgency
+
+    async def evaluate(self, ctx: Context) -> Proposal | None:
+        return Proposal(
+            instinct_id=self.node_id, action_id=self._action_id,
+            priority=self.priority, urgency=self._urgency,
+            parameters={"who": self.node_id},
+        )
+
+
+class _Recorder(BaseActionNode):
+    def __init__(self, bus: SignalBus, node_id: str, log: list[str]) -> None:
+        super().__init__(bus=bus)
+        self.node_id = node_id
+        self._log = log
+
+    async def execute(self, proposal: Proposal) -> Result:
+        self._log.append(f"{self.node_id}:{proposal.parameters['who']}")
+        return Result(action_id=self.node_id, success=True)
+
+
+class _IdleStrategy(BaseDecisionNode):
+    node_id = "IdleStrategy"
+
+    def __init__(self, bus: SignalBus) -> None:
+        super().__init__(bus=bus)
+        self.calls = 0
+
+    async def decide(self, proposals: list[Proposal]) -> Proposal | None:
+        self.calls += 1
+        return None
+
+
+class _ForeignStrategy(BaseDecisionNode):
+    """Returns a proposal it was never offered (a strategy bug)."""
+
+    node_id = "ForeignStrategy"
+
+    async def decide(self, proposals: list[Proposal]) -> Proposal | None:
+        return _proposal("Elsewhere", priority=999)
+
+
+async def _run_one_tick(
+    strategy: BaseDecisionNode, instincts: list[tuple[str, str, int, float]],
+) -> list[str]:
+    log: list[str] = []
+    bus = strategy.bus
+    im = InstinctMasterNode(bus=bus)
+    am = ActionMasterNode(bus=bus)
+    for node_id, action_id, priority, urgency in instincts:
+        im.register(_OneShot(bus, node_id, action_id, priority, urgency))
+    for action_id in sorted({a for _, a, _, _ in instincts}):
+        am.register(_Recorder(bus, action_id, log))
+    rt = ArachniteRuntime(
+        sense_master=SenseMasterNode(bus=bus), context=ContextNode(),
+        instinct_master=im,
+        decision_master=DecisionMasterNode(bus=bus, strategy=strategy),
+        action_master=am, bus=bus, log_sinks=[NullLogSink()],
+    )
+    await rt.tick()
+    assert await rt.wait_idle(2.0)
+    return sorted(log)
+
+
+class TestSixthReviewRegressions:
+    @pytest.mark.asyncio
+    async def test_weighted_strategy_selects_at_runtime(self) -> None:
+        """R6-F1: the runtime runs what WeightedDecisionNode.decide() picks, not the top priority"""
+        ran = await _run_one_tick(
+            WeightedDecisionNode(bus=_bus()),
+            [("A", "Act", 60, 0.1), ("B", "Act", 50, 1.0)],   # scores 6 vs 50
+        )
+        assert ran == ["Act:B"]
+
+    @pytest.mark.asyncio
+    async def test_strategy_returning_none_idles_the_agent(self) -> None:
+        """R6-F1: a strategy whose decide() returns None starts nothing"""
+        strategy = _IdleStrategy(_bus())
+        ran = await _run_one_tick(strategy, [("A", "Act", 60, 0.5), ("C", "Other", 40, 0.5)])
+        assert ran == []
+        assert strategy.calls == 1
+
+    @pytest.mark.asyncio
+    async def test_decide_many_calls_decide_on_the_remaining_candidates(self) -> None:
+        """R6-F1: decide() is called repeatedly; each choice removes its action_id"""
+        offered: list[list[str]] = []
+
+        class _Spy(WeightedDecisionNode):
+            async def decide(self, proposals: list[Proposal]) -> Proposal | None:
+                offered.append([f"{p.action_id}/{p.priority}" for p in proposals])
+                return await super().decide(proposals)
+
+        a_hi = _proposal("A", priority=90, urgency=0.1)    # score 9
+        a_lo = _proposal("A", priority=20, urgency=1.0)    # score 20
+        b    = _proposal("B", priority=50, urgency=0.5)    # score 25
+        run  = _proposal("R", priority=99, urgency=1.0)    # running: never offered
+        chosen = await _Spy(bus=_bus()).decide_many([a_lo, b, a_hi, run], {"R"})
+        assert chosen == [b, a_lo]
+        assert offered == [["A/90", "B/50", "A/20"], ["A/90", "A/20"]]
+
+    @pytest.mark.asyncio
+    async def test_choice_that_was_not_offered_stops_selection(self) -> None:
+        """R6-F1: decide() returning a foreign proposal is a strategy error; nothing is selected"""
+        chosen = await _ForeignStrategy(bus=_bus()).decide_many(
+            [_proposal("A", priority=60), _proposal("B", priority=50)],
+        )
+        assert chosen == []
+
+    @pytest.mark.asyncio
+    async def test_decision_master_uses_the_strategy(self) -> None:
+        """R6-F1: on_new_proposals_many() dispatches the strategy's choice"""
+        dm = DecisionMasterNode(bus=_bus(), strategy=WeightedDecisionNode(bus=_bus()))
+        hi = _proposal("Act", priority=60, urgency=0.1, instinct_id="A")
+        lo = _proposal("Act", priority=50, urgency=1.0, instinct_id="B")
+        dispatched, _ = await dm.on_new_proposals_many(
+            [hi, lo], running_proposals={}, running_interruptible={},
+        )
+        assert dispatched == [lo]
+
+    @pytest.mark.asyncio
+    async def test_random_strategy_is_reproducible_with_a_seed(self) -> None:
+        """R6-F1: RandomDecisionNode(seed=...) repeats its sequence of choices"""
+        props = [_proposal(f"A{i}", priority=50, urgency=0.1 * (i + 1)) for i in range(6)]
+
+        async def picks(seed: int) -> list[str]:
+            node = RandomDecisionNode(bus=_bus(), seed=seed)
+            out = []
+            for _ in range(20):
+                chosen = await node.decide(props)
+                assert chosen is not None
+                out.append(chosen.action_id)
+            return out
+
+        assert await picks(7) == await picks(7)
+
+    @pytest.mark.asyncio
+    async def test_active_inference_softmax_is_reproducible_with_a_seed(self) -> None:
+        """R6-F1: ActiveInferenceDecisionNode(seed=...) repeats its softmax choices"""
+        props = [_proposal(f"A{i}", priority=10 * (i + 1), urgency=0.5) for i in range(5)]
+
+        async def picks(seed: int) -> list[str]:
+            node = ActiveInferenceDecisionNode(bus=_bus(), temperature=20.0, seed=seed)
+            out = []
+            for _ in range(20):
+                chosen = await node.decide(props)
+                assert chosen is not None
+                out.append(chosen.action_id)
+            return out
+
+        assert await picks(3) == await picks(3)
+
+
+class TestGreedySelectionUnchanged:
+    @pytest.mark.asyncio
+    async def test_greedy_decide_many_matches_the_pre_r6_selection(self) -> None:
+        """R6-F1 pin: GreedyDecisionNode selects exactly what the old default did, in order"""
+        rng = random.Random(20261027)
+        greedy = GreedyDecisionNode(bus=_bus())
+        for _ in range(2000):
+            n = rng.randint(0, 12)
+            props = [
+                _proposal(
+                    f"A{rng.randint(0, 5)}",
+                    priority=rng.choice([10, 50, 50, 80, 150, 200]),
+                    urgency=rng.choice([0.0, 0.3, 0.3, 0.9, 1.0]),
+                    instinct_id=f"I{i}",
+                )
+                for i in range(n)
+            ]
+            running = {f"A{rng.randint(0, 5)}"} if rng.random() < 0.3 else None
+            got = await greedy.decide_many(list(props), running)
+            want = _old_decide_many(list(props), running)
+            assert [id(p) for p in got] == [id(p) for p in want]
+
+    @pytest.mark.asyncio
+    async def test_greedy_and_weighted_shortcuts_match_the_delegation(self) -> None:
+        """R6-F1 pin: Greedy/Weighted decide_many() equals the decide()-delegating default"""
+        rng = random.Random(1027)
+        strategies = [GreedyDecisionNode(bus=_bus()), WeightedDecisionNode(bus=_bus())]
+        for _ in range(2000):
+            props = [
+                _proposal(
+                    f"A{rng.randint(0, 5)}",
+                    priority=rng.choice([10, 20, 50, 80, 100, 200]),
+                    urgency=rng.choice([0.0, 0.1, 0.25, 0.5, 0.8, 1.0]),
+                    instinct_id=f"I{i}",
+                )
+                for i in range(rng.randint(0, 12))
+            ]
+            running = {f"A{rng.randint(0, 5)}"} if rng.random() < 0.3 else None
+            for strategy in strategies:
+                fast = await strategy.decide_many(list(props), running)
+                general = await BaseDecisionNode.decide_many(strategy, list(props), running)
+                assert [id(p) for p in fast] == [id(p) for p in general]

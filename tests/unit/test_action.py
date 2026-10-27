@@ -12,7 +12,6 @@ from arachnite.exceptions import (
     ActionNotFoundError,
     ActionTimeoutError,
     ActionVetoed,
-    MandatoryBlockViolation,
     NodeRegistrationError,
     RollbackError,
     StepAbortError,
@@ -416,15 +415,16 @@ class TestActionMasterNodeRequestInterrupt:
         await am.request_interrupt(_interrupt())  # must not raise
 
     @pytest.mark.asyncio
-    async def test_request_interrupt_mandatory_block_raises(self) -> None:
+    async def test_request_interrupt_mandatory_block_is_latched(self) -> None:
+        """R6-F6: inside a mandatory block the request is held on the node, not refused"""
         bus  = _bus()
         am   = ActionMasterNode(bus=bus)
         node = NeverPolicyAction(bus=bus)
         node._current_step = ActionStep("mandatory", interruptible=False)
         am._running_nodes[node.node_id] = node
         am._running_proposals[node.node_id] = _proposal(node.node_id)
-        with pytest.raises(MandatoryBlockViolation):
-            await am.request_interrupt(_interrupt())
+        await am.request_interrupt(_interrupt())  # must not raise
+        assert node._interrupt_requested
 
     @pytest.mark.asyncio
     async def test_request_interrupt_multistep_interruptible(self) -> None:

@@ -827,3 +827,119 @@ class TestReflexConflictPolicyEdges:
         im = InstinctMasterNode(bus=_bus(), reflex_conflict="raise")
         im.register(_SilentReflex(bus=_bus()))
         assert await im.evaluate_reflexes(_ctx()) == []
+
+
+# ── Sixth review ──────────────────────────────────────────────────────────────
+
+
+class _SameIdNormal(BaseInstinctNode):
+    node_id = "Guard"
+    priority = 10
+
+    async def evaluate(self, ctx: Context) -> Proposal | None:
+        return None
+
+
+class _SameIdReflex(BaseReflexInstinctNode):
+    node_id = "Guard"
+    priority = 250
+
+    async def evaluate(self, ctx: Context) -> Proposal | None:
+        return None
+
+
+class _ReturnsTrueReflex(BaseReflexInstinctNode):
+    node_id = "ReturnsTrue"
+    priority = 260
+
+    async def evaluate(self, ctx: Context) -> Proposal | None:
+        return True  # type: ignore[return-value]  # contract violation under test
+
+
+class _ReturnsDictInstinct(BaseInstinctNode):
+    node_id = "ReturnsDict"
+    priority = 90
+
+    async def evaluate(self, ctx: Context) -> Proposal | None:
+        return {"action_id": "Act"}  # type: ignore[return-value]  # contract violation
+
+
+class _ProposingReflex(BaseReflexInstinctNode):
+    priority = 250
+
+    def __init__(self, bus: SignalBus, node_id: str, instinct_id: str) -> None:
+        self.node_id = node_id  # type: ignore[misc]
+        super().__init__(bus)
+        self._instinct_id = instinct_id
+
+    async def evaluate(self, ctx: Context) -> Proposal | None:
+        return Proposal(instinct_id=self._instinct_id, action_id="Brake",
+                        priority=self.priority, urgency=1.0)
+
+
+class TestSixthReviewRegressions:
+    @pytest.mark.parametrize("first,second", [
+        (_SameIdNormal, _SameIdReflex),
+        (_SameIdReflex, _SameIdNormal),
+    ])
+    def test_duplicate_id_across_registries_is_rejected(
+        self, first: type[BaseInstinctNode], second: type[BaseInstinctNode],
+    ) -> None:
+        """R6-F7: normal and reflex node_ids share one namespace"""
+        im = InstinctMasterNode(bus=_bus())
+        im.register(first(bus=_bus()))
+        with pytest.raises(NodeRegistrationError):
+            im.register(second(bus=_bus()))
+
+    @pytest.mark.asyncio
+    async def test_reflex_proposals_come_with_their_node(self) -> None:
+        """R6-F7: evaluate_reflex_pairs() pairs each proposal with the reflex that made it"""
+        im = InstinctMasterNode(bus=_bus())
+        reflex = _ProposingReflex(_bus(), "Guard", instinct_id="someone-else")
+        im.register(reflex)
+        pairs = await im.evaluate_reflex_pairs(_ctx())
+        assert [(node, p.instinct_id) for node, p in pairs] == [(reflex, "someone-else")]
+
+    @pytest.mark.asyncio
+    async def test_conflict_error_carries_the_pairs(self) -> None:
+        """R6-F7: ReflexConflictError.fired keeps each proposal's node"""
+        im = InstinctMasterNode(bus=_bus(), reflex_conflict="raise")
+        a = _ProposingReflex(_bus(), "A", instinct_id="x")
+        b = _ProposingReflex(_bus(), "B", instinct_id="x")
+        im.register(a)
+        im.register(b)
+        with pytest.raises(ReflexConflictError) as info:
+            await im.evaluate_reflex_pairs(_ctx())
+        assert [node for node, _ in info.value.fired] == [a, b]
+
+    @pytest.mark.asyncio
+    async def test_non_proposal_reflex_result_is_a_fault_and_none(self) -> None:
+        """R6-F8: a reflex returning a non-Proposal is reported; its siblings still fire"""
+        im = InstinctMasterNode(bus=_bus())
+        faults: list[tuple[str, BaseException]] = []
+
+        async def handler(node_id: str, error: BaseException) -> None:
+            faults.append((node_id, error))
+
+        im.set_fault_handler(handler)
+        im.register(_ReturnsTrueReflex(bus=_bus()))
+        im.register(_ProposingReflex(_bus(), "Collision", instinct_id="Collision"))
+        proposals = await im.evaluate_reflexes(_ctx())
+        assert [p.instinct_id for p in proposals] == ["Collision"]
+        assert [(n, type(e)) for n, e in faults] == [("ReturnsTrue", TypeError)]
+
+    @pytest.mark.asyncio
+    async def test_non_proposal_instinct_result_is_a_fault_and_none(self) -> None:
+        """R6-F8: a normal instinct returning a non-Proposal is reported; siblings still count"""
+        im = InstinctMasterNode(bus=_bus())
+        faults: list[str] = []
+
+        async def handler(node_id: str, error: BaseException) -> None:
+            faults.append(node_id)
+
+        im.set_fault_handler(handler)
+        im.register(_ReturnsDictInstinct(bus=_bus()))
+        im.register(AlwaysProposesInstinct(bus=_bus()))
+        proposals = await im.evaluate_all(_ctx())
+        assert [p.instinct_id for p in proposals] == ["AlwaysProposesInstinct"]
+        assert faults == ["ReturnsDict"]

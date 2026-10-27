@@ -90,7 +90,14 @@ SITES: tuple[Site, ...] = (
         key="reflex_responsiveness",
         prop="Reflex responsiveness",
         targets=(
-            ("arachnite/nodes/instinct.py", ("InstinctMasterNode.evaluate_reflexes",)),
+            (
+                "arachnite/nodes/instinct.py",
+                (
+                    "InstinctMasterNode.evaluate_reflexes",
+                    "InstinctMasterNode.evaluate_reflex_pairs",
+                    "InstinctMasterNode._checked_proposal",
+                ),
+            ),
             (
                 "arachnite/runtime.py",
                 ("ArachniteRuntime._launch_reflexes", "ArachniteRuntime._on_reflex_signal"),
@@ -150,11 +157,13 @@ SITES: tuple[Site, ...] = (
                     "ActionMasterNode._execute_with_retry",
                     "ActionMasterNode._retry_blocked",
                     "ActionMasterNode._timed_out",
+                    "ActionMasterNode._on_timeout_result",
                     "ActionMasterNode.dispatch",
                     "ActionMasterNode.dispatch_many",
                     "ActionMasterNode._dispatch_one",
                     "_master_cancel_overflow",
                     "MultiStepActionNode.walk_cut_short",
+                    "MultiStepActionNode._abort_timed_out",
                 ),
             ),
         ),

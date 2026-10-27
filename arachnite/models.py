@@ -150,6 +150,10 @@ class Result:
     # True when a reflex took the action's resources away mid-execution
     # (ADR 0005). Implies interrupted=True; never retried.
     preempted:        bool = False
+    # True when execute() was cancelled at an await and the run's safe-stop
+    # ran: reflex PREEMPT, cancel()/cancel_all() (shutdown, emergency stop)
+    # or the action timeout (ADR 0009) — not a stop at a step boundary.
+    cancelled:        bool = False
 
 
 # ══════════════════════════════════════════════════════════════════════════════
