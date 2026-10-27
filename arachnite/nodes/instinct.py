@@ -7,7 +7,6 @@ Spec reference: Sections 5.4, 5.5.
 
 from __future__ import annotations
 
-import asyncio
 import contextlib
 import inspect
 import math
@@ -21,7 +20,7 @@ from arachnite.config import NodeConfig
 from arachnite.exceptions import NodeRegistrationError, ReflexConflictError
 from arachnite.logging import BaseLogSink
 from arachnite.models import Context, Proposal, ReflexPreemption
-from arachnite.nodes.base import BaseNode, FaultReportingMixin, gather_settled
+from arachnite.nodes.base import BaseNode, FaultReportingMixin, gather_settled, setup_nodes
 
 
 class BaseInstinctNode(BaseNode):
@@ -206,7 +205,7 @@ class InstinctMasterNode(FaultReportingMixin, BaseNode):
 
     async def setup(self) -> None:
         all_nodes = [*self._normal_nodes.values(), *self._reflex_nodes.values()]
-        await asyncio.gather(*(n.setup() for n in all_nodes))
+        await setup_nodes(all_nodes)
 
     async def teardown(self) -> None:
         all_nodes = [*self._normal_nodes.values(), *self._reflex_nodes.values()]

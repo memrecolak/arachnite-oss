@@ -200,3 +200,49 @@ async def test_non_confidence_evidence_ignored(bus: SignalBus) -> None:
     # No _confidence keys -> uses prior
     epistemic = node._epistemic_value(p)
     assert epistemic == pytest.approx(0.5)
+
+
+# ── Review 6 ─────────────────────────────────────────────────────────────────
+
+
+class TestReview6EvidenceValidation:
+    """R6-F19: malformed evidence confidences cannot steer or break selection."""
+
+    @pytest.mark.asyncio
+    async def test_nan_confidence_never_wins_by_position(self, bus: SignalBus) -> None:
+        """R6-F19: a NaN confidence is ignored instead of winning argmin by list order"""
+        node = ActiveInferenceDecisionNode(bus=bus, beta=1.0)
+        good = _proposal(100, 1.0, {"sig_confidence": 0.9}, action_id="Good")
+        nan = _proposal(10, 0.1, {"sig_confidence": float("nan")}, action_id="NaN")
+        assert (await node.decide([nan, good])).action_id == "Good"  # type: ignore[union-attr]
+        assert (await node.decide([good, nan])).action_id == "Good"  # type: ignore[union-attr]
+
+    @pytest.mark.asyncio
+    async def test_out_of_range_confidence_is_clamped(self, bus: SignalBus) -> None:
+        """R6-F19: a confidence above 1 is clamped, never turned into a bonus"""
+        node = ActiveInferenceDecisionNode(bus=bus, beta=1.0)
+        over = _proposal(50, 1.0, {"sig_confidence": 9.0}, action_id="Over")
+        honest = _proposal(55, 1.0, {"sig_confidence": 1.0}, action_id="Honest")
+        assert (await node.decide([honest, over])).action_id == "Honest"  # type: ignore[union-attr]
+        assert node._epistemic_value(over) == 0.0
+        below = _proposal(evidence={"sig_confidence": -3.0})
+        assert node._epistemic_value(below) == 1.0
+
+    @pytest.mark.asyncio
+    async def test_softmax_with_nan_evidence_selects(self, bus: SignalBus) -> None:
+        """R6-F19: temperature > 0 with NaN evidence still selects instead of raising"""
+        node = ActiveInferenceDecisionNode(bus=bus, beta=1.0, temperature=0.5)
+        good = _proposal(100, 1.0, {"sig_confidence": 0.9}, action_id="Good")
+        nan = _proposal(10, 0.1, {"sig_confidence": float("nan")}, action_id="NaN")
+        for _ in range(20):
+            assert await node.decide([good, nan]) is not None
+
+    @pytest.mark.parametrize("kwargs", [
+        {"beta": float("nan")}, {"beta": -1.0},
+        {"temperature": float("inf")}, {"temperature": -0.1},
+        {"prior_confidence": 1.5}, {"prior_confidence": float("nan")},
+    ])
+    def test_invalid_parameters_rejected(self, bus: SignalBus, kwargs: dict[str, float]) -> None:
+        """R6-F19: non-finite or out-of-range parameters raise ValueError"""
+        with pytest.raises(ValueError):
+            ActiveInferenceDecisionNode(bus=bus, **kwargs)  # type: ignore[arg-type]

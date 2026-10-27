@@ -11,6 +11,7 @@ import asyncio
 import contextlib
 from abc import ABC
 from collections.abc import Awaitable, Callable, Coroutine, Sequence
+from collections.abc import Set as AbstractSet
 from pathlib import Path
 from typing import Any, TypeVar
 
@@ -53,6 +54,33 @@ def settled_error(outcomes: Sequence[object]) -> BaseException | None:
             return outcome
     return None
 
+async def setup_nodes(nodes: Sequence[BaseNode]) -> None:
+    """
+    Run every node's ``setup()`` concurrently and wait for all of them.
+
+    If any fails, nothing set up here is left running: the background tasks
+    of every node (the failing one's too) are cancelled, the nodes whose
+    ``setup()`` succeeded are torn down, and the first error is raised. A
+    master's ``setup()`` uses this so a failed ``start()`` leaks no
+    listener of a sibling (or of a sibling still inside a slow ``setup()``).
+    """
+    outcomes = await asyncio.gather(*(n.setup() for n in nodes), return_exceptions=True)
+    error = settled_error(outcomes)
+    if error is None:
+        return
+    await asyncio.gather(
+        *(n.cancel_background_tasks() for n in nodes), return_exceptions=True,
+    )
+    await asyncio.gather(
+        *(
+            n.teardown() for n, outcome in zip(nodes, outcomes, strict=True)
+            if not isinstance(outcome, BaseException)
+        ),
+        return_exceptions=True,
+    )
+    raise error
+
+
 #: Signature of the runtime-supplied fault sink: ``(node_id, error) -> None``.
 #: Wired to a :class:`~arachnite.supervisor.NodeSupervisor`'s ``on_fault``.
 FaultHandler = Callable[[str, BaseException], Awaitable[None]]
@@ -82,9 +110,21 @@ class FaultReportingMixin:
 
     _fault_handler: FaultHandler | None = None
 
+    #: Ids of leaf nodes the supervisor declared DEAD (a live set it owns).
+    _dead_nodes: AbstractSet[str] = frozenset()
+
     def set_fault_handler(self, handler: FaultHandler | None) -> None:
         """Install (or clear) the fault sink. Called by the runtime at wiring time."""
         self._fault_handler = handler
+
+    def set_dead_nodes(self, dead: AbstractSet[str]) -> None:
+        """
+        Install the supervisor's live set of DEAD node ids (see
+        ``NodeSupervisor.dead_node_ids``). Every per-node fan-out
+        (``_gather_nodes``) skips those nodes: a DEAD node is not run again.
+        Called by the runtime at wiring time.
+        """
+        self._dead_nodes = dead
 
     async def _report_fault(self, node_id: str, error: BaseException) -> None:
         """
@@ -115,7 +155,19 @@ class FaultReportingMixin:
         ends in the node's own CancelledError — is logged and reported as
         that node's fault and yields None; its siblings are unaffected. A
         cancel of the caller still propagates (``gather`` raises it).
+
+        A node the supervisor declared DEAD is skipped: its call is never
+        started (the unstarted coroutine is closed) and yields nothing.
         """
+        dead = self._dead_nodes
+        if dead:
+            live: list[tuple[str, Awaitable[_T]]] = []
+            for node_id, aw in calls:
+                if node_id in dead and asyncio.iscoroutine(aw):
+                    aw.close()
+                else:
+                    live.append((node_id, aw))
+            calls = live
         outcomes = await asyncio.gather(*(aw for _, aw in calls), return_exceptions=True)
         results: list[_T | None] = []
         for (node_id, _), outcome in zip(calls, outcomes, strict=True):

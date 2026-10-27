@@ -24,6 +24,18 @@ from arachnite.models import (
     StateUpdateSignal,
 )
 
+_MISSING = object()
+
+
+def _differs(old: Any, new: Any) -> bool:
+    """True unless ``old`` and ``new`` compare equal (an uncomparable pair differs)."""
+    if old is new:
+        return False
+    try:
+        return not bool(old == new)
+    except Exception:  # noqa: BLE001 — e.g. numpy arrays: ambiguous truth value
+        return True
+
 
 class ContextNode:
     """
@@ -60,6 +72,9 @@ class ContextNode:
         self._last_results: list[Result]       = []
         self._action_states: list[ActionExecutionState] = []
         self._initialized: bool                = False
+        # The signals list of the latest update(), exactly as handed out in
+        # that tick's ctx.signals (history eviction never touches it).
+        self._last_signals: list[Signal]       = []
 
         # Load persisted state from disk if available
         if self._state_path and self._state_path.exists():
@@ -98,10 +113,18 @@ class ContextNode:
         concurrent action execution.  The singular ``result`` and
         ``action_state`` remain for backward compatibility; when plural
         parameters are given, the singular fields are populated from the
-        first (highest-priority) element.
+        first element (the runtime passes results in completion order, so
+        ``last_result`` is the first-completed result, spec §7.2.1).
 
         StateUpdateSignals are intercepted here and applied to _state before
         the snapshot is built, so instincts see the updated state immediately.
+        With ``flush_on_write`` a StateUpdateSignal that changed the state is
+        persisted here, as ``set()`` / ``delete()`` would.
+
+        ``ctx.signals`` is ``signals`` itself, never modified: HistoryConfig
+        eviction applies to history only and copies a tick's list before
+        replacing an entry in it, so neither the caller's list nor a Context
+        handed out earlier is rewritten by a later tick.
         """
         self._tick        += 1
         self._last_result  = result
@@ -116,16 +139,27 @@ class ContextNode:
             self._action_state = self._action_states[0]
 
         # Apply any state-update signals before building the snapshot
+        state_changed = False
         for sig in signals:
             if isinstance(sig, StateUpdateSignal):
                 if sig.delete:
-                    self._state.pop(sig.key, None)
+                    if sig.key in self._state:
+                        del self._state[sig.key]
+                        state_changed = True
                 else:
+                    if self._flush_on_write and not state_changed:
+                        state_changed = _differs(
+                            self._state.get(sig.key, _MISSING), sig.state_value,
+                        )
                     self._state[sig.key] = sig.state_value
                     self._enforce_state_limit()
+        if state_changed and self._flush_on_write:
+            self.flush_state()
 
-        # Append current tick signals to history
+        # Append current tick signals to history. The list is shared with
+        # ctx.signals; eviction copies it before writing (copy on evict).
         self._history.append(signals)
+        self._last_signals = signals
         self._apply_history_config()
         self._initialized = True
 
@@ -138,9 +172,7 @@ class ContextNode:
         """
         if not self._initialized:
             raise ContextError()
-        return self._build_context(
-            self._history[-1] if self._history else []
-        )
+        return self._build_context(self._last_signals)
 
     def reflex_view(self, signals: list[Signal]) -> Context:
         """
@@ -187,6 +219,9 @@ class ContextNode:
         if not self._history:
             return
         now = time.monotonic()
+        # Indices of history entries already copied during this call: each
+        # tick's list is copied at most once, on its first eviction.
+        copied: set[int] = set()
         for kind, cfg in self._history_config.items():
             if (
                 cfg.value_ttl_s is None
@@ -194,29 +229,43 @@ class ContextNode:
                 and cfg.max_bytes is None
             ):
                 continue
-            self._apply_kind_config(kind, cfg, now)
+            self._apply_kind_config(kind, cfg, now, copied)
+
+    def _evict(self, t_idx: int, s_idx: int, replacement: Signal, copied: set[int]) -> None:
+        """
+        Replace one history entry, copying that tick's list first (copy on
+        evict). The list stored by update() is the one handed out as that
+        tick's ctx.signals (and the caller's own list), so it is never
+        written to in place.
+        """
+        if t_idx not in copied:
+            self._history[t_idx] = list(self._history[t_idx])
+            copied.add(t_idx)
+        self._history[t_idx][s_idx] = replacement
 
     def _apply_kind_config(
-        self, kind: str, cfg: HistoryConfig, now: float
+        self, kind: str, cfg: HistoryConfig, now: float, copied: set[int],
     ) -> None:
-        # Pass 1: TTL — walk once, mutate in place.
+        # Pass 1: TTL — walk once, evict expired entries (copy on evict).
         # ``cfg.value_ttl_s`` truthiness guard preserves the legacy behavior that
         # ``value_ttl_s=0`` is treated as disabled (not "evict everything").
         if cfg.value_ttl_s:
             ttl = cfg.value_ttl_s
-            for tick_signals in self._history:
+            for t_idx, tick_signals in enumerate(list(self._history)):
                 for i, sig in enumerate(tick_signals):
                     if sig.kind != kind:
                         continue
+                    if sig.value is None and (sig.metadata or {}).get("evicted"):
+                        continue  # already evicted: keep it (and its reason) as is
                     if (now - sig.timestamp) > ttl:
-                        tick_signals[i] = Signal(
+                        self._evict(t_idx, i, Signal(
                             source=sig.source,
                             kind=sig.kind,
                             value=None,
                             confidence=0.0,
                             timestamp=sig.timestamp,
                             metadata={"evicted": True},
-                        )
+                        ), copied)
 
         # Passes 2 and 3 share an index of *live* (non-evicted) entries for this kind.
         if cfg.max_ticks is None and cfg.max_bytes is None:
@@ -234,14 +283,14 @@ class ContextNode:
             excess = len(index) - cfg.max_ticks
             if excess > 0:
                 for t_idx, s_idx, old in index[:excess]:
-                    self._history[t_idx][s_idx] = Signal(
+                    self._evict(t_idx, s_idx, Signal(
                         source=old.source,
                         kind=old.kind,
                         value=None,
                         confidence=0.0,
                         timestamp=old.timestamp,
                         metadata={"evicted": True, "reason": "max_ticks"},
-                    )
+                    ), copied)
                 index = index[excess:]
 
         # Pass 3: max_bytes
@@ -251,14 +300,14 @@ class ContextNode:
             while total > cfg.max_bytes and evicted < len(index):
                 t_idx, s_idx, sig = index[evicted]
                 total -= sys.getsizeof(sig.value)
-                self._history[t_idx][s_idx] = Signal(
+                self._evict(t_idx, s_idx, Signal(
                     source=sig.source,
                     kind=sig.kind,
                     value=None,
                     confidence=0.0,
                     timestamp=sig.timestamp,
                     metadata={"evicted": True, "reason": "max_bytes"},
-                )
+                ), copied)
                 evicted += 1
 
     # ── State access ──────────────────────────────────────────────────────────

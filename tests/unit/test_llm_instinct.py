@@ -3,16 +3,22 @@
 from __future__ import annotations
 
 import asyncio
+import math
+import subprocess
 import sys
+import threading
 import time
 from collections import deque
+from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
 
+import arachnite
 from arachnite import SignalBus
+from arachnite.llm_provider import LLMProvider
 from arachnite.models import Context, Proposal, Signal
 from arachnite.nodes.llm import LLMInstinctNode
 
@@ -52,6 +58,14 @@ async def _settle(node: LLMInstinctNode) -> None:
     """
     if node._pending is not None:
         await node._pending
+
+
+def _stale_proposal(node: LLMInstinctNode) -> Proposal:
+    """A proposal standing in for an earlier, now outdated LLM decision."""
+    return Proposal(
+        instinct_id=node.node_id, action_id="ShutdownAction",
+        priority=node.priority, urgency=0.9, rationale="stale",
+    )
 
 
 def _tool_use_block(name: str, inp: dict[str, Any]) -> SimpleNamespace:
@@ -108,7 +122,7 @@ class TestLLMInstinctNodeProposal:
         )
         with patch.dict(sys.modules, {"anthropic": _make_mock_anthropic(fake_response)}):
             await node.evaluate(_ctx())
-            await asyncio.sleep(0.05)
+            await _settle(node)  # no fixed sleep: slow hosts take longer
             result = await node.evaluate(_ctx())
             await _settle(node)
 
@@ -122,20 +136,25 @@ class TestLLMInstinctNodeProposal:
     @pytest.mark.asyncio
     async def test_no_action_tool_returns_none(self) -> None:
         node = ThermalLLMInstinct(bus=_bus())
+        node._cached_proposal = _stale_proposal(node)  # must be replaced, not kept
         fake_response = _mock_anthropic_response(
             _tool_use_block("no_action", {"reason": "Temperature is normal"})
         )
         with patch.dict(sys.modules, {"anthropic": _make_mock_anthropic(fake_response)}):
             await node.evaluate(_ctx())
-            await asyncio.sleep(0.05)
+            await _settle(node)
             result = await node.evaluate(_ctx())
             await _settle(node)
+            # The parse path itself answers None (it does not raise).
+            direct = node._call_llm_sync(_ctx())
 
         assert result is None
+        assert direct is None
 
     @pytest.mark.asyncio
     async def test_unknown_action_id_ignored(self) -> None:
         node = ThermalLLMInstinct(bus=_bus())
+        node._cached_proposal = _stale_proposal(node)  # must be replaced, not kept
         fake_response = _mock_anthropic_response(
             _tool_use_block("propose_action", {
                 "action_id": "NonExistentAction",
@@ -145,25 +164,31 @@ class TestLLMInstinctNodeProposal:
         )
         with patch.dict(sys.modules, {"anthropic": _make_mock_anthropic(fake_response)}):
             await node.evaluate(_ctx())
-            await asyncio.sleep(0.05)
+            await _settle(node)
             result = await node.evaluate(_ctx())
             await _settle(node)
+            # The parse path itself rejects the action (it does not raise).
+            direct = node._call_llm_sync(_ctx())
 
         assert result is None
+        assert direct is None
 
     @pytest.mark.asyncio
     async def test_text_only_response_returns_none(self) -> None:
         node = ThermalLLMInstinct(bus=_bus())
+        node._cached_proposal = _stale_proposal(node)  # must be replaced, not kept
         fake_response = _mock_anthropic_response(
             _text_block("I think no action is needed.")
         )
         with patch.dict(sys.modules, {"anthropic": _make_mock_anthropic(fake_response)}):
             await node.evaluate(_ctx())
-            await asyncio.sleep(0.05)
+            await _settle(node)
             result = await node.evaluate(_ctx())
             await _settle(node)
+            direct = node._call_llm_sync(_ctx())
 
         assert result is None
+        assert direct is None
 
     @pytest.mark.asyncio
     async def test_llm_exception_does_not_propagate(self) -> None:
@@ -172,11 +197,15 @@ class TestLLMInstinctNodeProposal:
         broken.messages.create.side_effect = RuntimeError("API error")
         mock_mod = ModuleType("anthropic")
         mock_mod.Anthropic = MagicMock(return_value=broken)  # type: ignore[attr-defined]
+        node._cached_proposal = _stale_proposal(node)
         with patch.dict(sys.modules, {"anthropic": mock_mod}):
+            first = await node.evaluate(_ctx())
+            await _settle(node)  # the failing call must not raise out of the task
             result = await node.evaluate(_ctx())
             await _settle(node)
 
-        assert result is None   # no exception raised, cached stays None
+        assert first is not None  # the cache is served until the call completes
+        assert result is None     # a failed call clears it (never re-proposed)
 
 
 class TestLLMInstinctNodeCooldown:
@@ -337,10 +366,13 @@ class TestLLMInstinctNodeLock:
 
             # Release the background call
             release_call.set()
-            await asyncio.sleep(0.05)  # let the background task complete
+            await _settle(node)  # let the background task complete
 
-        # After background task completes, the new proposal is visible
-        final_result = await node.evaluate(_ctx())
+            # After background task completes, the new proposal is visible.
+            # Still patched: this evaluate() starts another call, which must
+            # not reach the real provider (its thread would outlive the test).
+            final_result = await node.evaluate(_ctx())
+            await _settle(node)
         assert final_result is not None
         assert final_result.action_id == "CoolDownAction"
         assert final_result.urgency == 0.9
@@ -375,3 +407,132 @@ class TestLLMInstinctNodeLock:
 
         assert lock_was_held, "_call_llm must acquire the lock when writing _cached_proposal"
         assert node._cached_proposal is new_proposal
+
+
+class _ScriptedProvider(LLMProvider):
+    """Answers each call with the next scripted step (the last one repeats)."""
+
+    def __init__(self, script: list[Any]) -> None:
+        self.script = script
+        self.calls = 0
+
+    def complete(self, system: str, user: str, tools: Any) -> Any:
+        self.calls += 1
+        step = self.script[min(self.calls - 1, len(self.script) - 1)]
+        if isinstance(step, BaseException):
+            raise step
+        return step
+
+
+class _BlockingProvider(LLMProvider):
+    """A hung HTTP call: blocks until released (or 10 s)."""
+
+    def __init__(self) -> None:
+        self.release = threading.Event()
+        self.calls = 0
+
+    def complete(self, system: str, user: str, tools: Any) -> Any:
+        self.calls += 1
+        self.release.wait(10.0)
+        return None
+
+
+_HUNG_EXIT_SCRIPT = """
+import asyncio, time
+from collections import deque
+import arachnite
+from arachnite import SignalBus
+from arachnite.llm_provider import LLMProvider
+from arachnite.models import Context
+from arachnite.nodes.llm import LLMInstinctNode
+
+class Hung(LLMProvider):
+    def complete(self, system, user, tools):
+        time.sleep(30.0)
+        return None
+
+class Brain(LLMInstinctNode):
+    node_id = "Brain"
+    min_interval_s = 0.0
+    def available_actions(self):
+        return {"Noop": "do nothing"}
+
+async def main():
+    node = Brain(bus=SignalBus(), provider=Hung())
+    ctx = Context(tick=1, signals=[], history=deque(), state={},
+                  last_result=None, timestamp=0.0)
+    await node.evaluate(ctx)
+    await asyncio.sleep(0.2)
+    await node.cancel_background_tasks()  # what master teardown does
+
+asyncio.run(main())
+print(arachnite.__file__)
+"""
+
+
+_GOOD_CALL = (
+    "propose_action",
+    {"action_id": "CoolDownAction", "urgency": 0.9, "rationale": "hot"},
+)
+
+
+class TestReview6LLMInstinct:
+    """R6-F16: failed, invalid or hung LLM calls never leave a stale proposal."""
+
+    @pytest.mark.parametrize("failure", [
+        ConnectionError("network down"),
+        ("propose_action", {"action_id": "CoolDownAction", "urgency": 1.5, "rationale": "x"}),
+        ("propose_action", {"action_id": "CoolDownAction", "urgency": "high", "rationale": "x"}),
+        ("propose_action", {"action_id": "CoolDownAction", "urgency": math.nan}),
+        ("propose_action", ["CoolDownAction"]),
+        ("propose_action", {"action_id": "CoolDownAction", "urgency": 0.5, "parameters": [1]}),
+    ], ids=["raises", "urgency>1", "urgency-str", "urgency-nan", "args-list", "params-list"])
+    @pytest.mark.asyncio
+    async def test_failed_call_clears_cached_proposal(self, failure: Any) -> None:
+        """R6-F16: after a failing/invalid call the last proposal is not re-proposed"""
+        provider = _ScriptedProvider([_GOOD_CALL, failure])
+        node = ThermalLLMInstinct(bus=_bus(), provider=provider)
+        seen = []
+        for _ in range(4):
+            proposal = await node.evaluate(_ctx())
+            seen.append(None if proposal is None else proposal.action_id)
+            await _settle(node)
+        assert provider.calls == 4
+        assert seen == [None, "CoolDownAction", None, None]
+
+    @pytest.mark.asyncio
+    async def test_hung_call_times_out_and_clears_cache(self) -> None:
+        """R6-F16: a call exceeding call_timeout_s is abandoned and clears the cache"""
+
+        class Timed(ThermalLLMInstinct):
+            call_timeout_s = 0.05
+
+        provider = _BlockingProvider()
+        node = Timed(bus=_bus(), provider=provider)
+        node._cached_proposal = _stale_proposal(node)
+        try:
+            await node.evaluate(_ctx())
+            await asyncio.wait_for(_settle(node), 5.0)
+            assert await node.evaluate(_ctx()) is None
+            # The abandoned call still runs: no second call meanwhile, and its
+            # thread is a daemon, so it never holds up interpreter exit.
+            assert provider.calls == 1
+            assert node._call_thread is not None and node._call_thread.daemon
+        finally:
+            provider.release.set()
+
+    def test_hung_call_does_not_delay_process_exit(self) -> None:
+        """R6-F16: asyncio.run() returns promptly after a node with a hung call shuts down"""
+        script = _HUNG_EXIT_SCRIPT
+        root = Path(arachnite.__file__).resolve().parents[1]  # the package under test
+        started = time.monotonic()
+        proc = subprocess.run(
+            [sys.executable, "-c", script], cwd=root, capture_output=True,
+            text=True, timeout=120,
+        )
+        elapsed = time.monotonic() - started
+        assert proc.returncode == 0, proc.stderr
+        assert proc.stdout.strip() == str(root / "arachnite" / "__init__.py")
+        # The provider hangs for 30 s; interpreter start-up is a few seconds
+        # even on a Raspberry Pi.
+        assert elapsed < 20.0

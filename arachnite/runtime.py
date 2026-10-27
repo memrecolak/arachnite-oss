@@ -257,6 +257,13 @@ class ArachniteRuntime:
         self._sense_master.set_fault_handler(self._supervisors[0].on_fault)
         self._instinct_master.set_fault_handler(self._supervisors[1].on_fault)
         self._action_master.set_fault_handler(self._supervisors[3].on_fault)
+        # A node its supervisor declared DEAD is no longer run by its master.
+        self._sense_master.set_dead_nodes(self._supervisors[0].dead_node_ids)
+        self._instinct_master.set_dead_nodes(self._supervisors[1].dead_node_ids)
+        self._action_master.set_dead_nodes(self._supervisors[3].dead_node_ids)
+        # The runtime's log sinks reach every master and leaf logger that has
+        # no sinks of its own (spec §13.2).
+        self._share_log_sinks()
 
         self._stop_event = asyncio.Event()
 
@@ -326,6 +333,21 @@ class ArachniteRuntime:
         # recorded by the last tick.
         self._reflex_outcomes: deque[LaunchStatus] = deque(maxlen=_MAX_PENDING_OUTCOMES)
         self._monitor_report: dict[str, object] = {}
+
+    def _share_log_sinks(self) -> None:
+        """Give the runtime's log sinks to every master and leaf logger without sinks."""
+        sinks = self._log_sinks
+        nodes: list[BaseNode] = [
+            self._sense_master, self._instinct_master,
+            self._decision_master, self._decision_master.strategy,
+            self._action_master,
+            *self._sense_master.nodes,
+            *self._instinct_master.normal_nodes,
+            *self._instinct_master.reflex_nodes,
+            *self._action_master.nodes,
+        ]
+        for node in nodes:
+            node.logger.adopt_sinks(sinks)
 
     # ── Public properties ─────────────────────────────────────────────────────
 
@@ -465,6 +487,9 @@ class ArachniteRuntime:
 
         # Dependency validation (startup-only)
         self._validate_dependencies(all_nodes)
+
+        # Nodes registered on a master after construction log to the runtime's sinks too.
+        self._share_log_sinks()
 
         # Nothing from the previous run reaches this run's first tick.
         self._supervisor_signal_buffer.clear()
@@ -751,6 +776,7 @@ class ArachniteRuntime:
         This is the primary hook for Phase 1 self-assembly: DynamicLoaderAction
         generates a new SenseNode and registers it without restarting the agent.
         """
+        node.logger.adopt_sinks(self._log_sinks)
         if not self._running:
             self._sense_master.register(node)
             self._supervisors[0].track(node)
@@ -771,6 +797,7 @@ class ArachniteRuntime:
         Calls setup() on the node immediately (if the runtime is running) and
         begins tracking it with the instinct supervisor.
         """
+        node.logger.adopt_sinks(self._log_sinks)
         if not self._running:
             self._instinct_master.register(node)
             self._supervisors[1].track(node)
@@ -793,6 +820,7 @@ class ArachniteRuntime:
         Calls setup() on the node immediately (if the runtime is running) and
         begins tracking it with the action supervisor.
         """
+        node.logger.adopt_sinks(self._log_sinks)
         if not self._running:
             self._action_master.register(node)
             self._supervisors[3].track(node)

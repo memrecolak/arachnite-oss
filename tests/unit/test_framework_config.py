@@ -360,3 +360,66 @@ class TestBuildSupervisorKwargs:
         kwargs = cfg.build_supervisor_kwargs()
         assert kwargs["max_restarts"] == 10
         assert kwargs["restart_delay_s"] == 0.5
+
+
+# ── Review 6 ──────────────────────────────────────────────────────────────────
+
+class TestReview6ConfigTypes:
+    """R6-F19: TOML values are checked/converted to each setting's type; file sink opened."""
+
+    @staticmethod
+    def _load(tmp_path: Path, content: str) -> FrameworkConfig:
+        path = tmp_path / "arachnite.toml"
+        path.write_text(content, encoding="utf-8")
+        return FrameworkConfig.from_toml(path)
+
+    def test_interpolated_strings_are_converted(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """R6-F19: "${X:-false}" is False and "${HZ:-20}" is 20.0, not truthy strings"""
+        monkeypatch.delenv("FLUSH", raising=False)
+        monkeypatch.delenv("HZ", raising=False)
+        monkeypatch.setenv("RESTARTS", "5")
+        cfg = self._load(tmp_path, (
+            '[runtime]\ntick_rate_hz = "${HZ:-20}"\n'
+            '[supervisor]\nmax_restarts = "${RESTARTS}"\n'
+            '[context]\nflush_on_write = "${FLUSH:-false}"\n'
+        ))
+        assert cfg.context.flush_on_write is False
+        assert cfg.runtime.tick_rate_hz == 20.0
+        assert isinstance(cfg.runtime.tick_rate_hz, float)
+        assert cfg.supervisor.max_restarts == 5
+
+    @pytest.mark.parametrize(("section", "key", "value"), [
+        ("context", "flush_on_write", '"maybe"'),
+        ("runtime", "tick_rate_hz", '"fast"'),
+        ("runtime", "tick_rate_hz", "true"),
+        ("supervisor", "max_restarts", "2.5"),
+        ("logging", "level", "3"),
+    ])
+    def test_unconvertible_value_raises(
+        self, tmp_path: Path, section: str, key: str, value: str,
+    ) -> None:
+        """R6-F19: a value that does not fit the setting's type raises ValueError naming it"""
+        with pytest.raises(ValueError, match=key):
+            self._load(tmp_path, f"[{section}]\n{key} = {value}\n")
+
+    def test_file_log_sink_is_opened(self, tmp_path: Path) -> None:
+        """R6-F19: the [logging] file sink is opened, so the file receives events"""
+        log = tmp_path / "agent.log"
+        cfg = FrameworkConfig(logging=LoggingSettings(level="DEBUG", file=str(log)))
+        sinks = cfg.build_log_sinks()
+        try:
+            assert log.exists()
+            assert any(getattr(s, "_fh", None) is not None for s in sinks)
+        finally:
+            for sink in sinks:
+                close = getattr(sink, "close", None)
+                if close is not None:
+                    close()
+
+    def test_teardown_timeout_has_a_consumer(self) -> None:
+        """R6-F19: runtime.teardown_timeout_s reaches the ShutdownCoordinator"""
+        cfg = FrameworkConfig(runtime=RuntimeSettings(teardown_timeout_s=12.5))
+        coordinator = cfg.build_shutdown_coordinator()
+        assert coordinator._teardown_timeout_s == 12.5

@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import json
 import time
+from pathlib import Path
 
 import pytest
 
@@ -743,3 +745,77 @@ class TestContextNodeMaxTicks:
             if s.kind == "image" and s.value is not None
         ]
         assert live == []
+
+
+# ── Review 6 ──────────────────────────────────────────────────────────────────
+
+def _r6_sig(kind: str, value: object, source: str = "test", age_s: float = 0.0) -> Signal:
+    return Signal(
+        source=source, kind=kind, value=value,
+        confidence=1.0, timestamp=time.monotonic() - age_s,
+    )
+
+
+def _r6_state(key: str, value: object) -> StateUpdateSignal:
+    return StateUpdateSignal(
+        source="test", kind="state_update", value=None, confidence=1.0,
+        timestamp=time.monotonic(), key=key, state_value=value,
+    )
+
+
+class TestReview6Context:
+    """R6-F18 / R6-F19: snapshots immutable under eviction; flush_on_write for bus writes."""
+
+    def test_earlier_snapshot_signals_not_rewritten(self) -> None:
+        """R6-F18: eviction on later ticks does not rewrite a Context handed out earlier"""
+        cn = ContextNode(history_length=10, history_config={"temp": HistoryConfig(max_ticks=2)})
+        ctx1 = cn.update([_r6_sig("temp", 41.0)])
+        cn.update([_r6_sig("temp", 42.0)])
+        ctx3 = cn.update([_r6_sig("temp", 43.0)])
+        assert ctx1.signals[0].value == 41.0
+        assert ctx1.history[-1][0].value == 41.0
+        # The rolling history itself is still evicted.
+        assert ctx3.history[0][0].value is None
+        assert ctx3.history[0][0].metadata["reason"] == "max_ticks"
+
+    def test_current_tick_signals_never_evicted(self) -> None:
+        """R6-F18: the current tick's ctx.signals keeps every reading (max_ticks and TTL)"""
+        cn = ContextNode(history_config={"temp": HistoryConfig(max_ticks=2)})
+        readings = [_r6_sig("temp", v, source=f"T{i}") for i, v in enumerate((40.0, 41.0, 42.0))]
+        ctx = cn.update(readings)
+        assert [s.value for s in ctx.signals] == [40.0, 41.0, 42.0]
+        assert [s.value for s in cn.snapshot().signals] == [40.0, 41.0, 42.0]
+        assert ctx.history[-1][0].value is None  # history keeps only max_ticks live
+
+        cn = ContextNode(history_config={"cam": HistoryConfig(value_ttl_s=1.0)})
+        ctx = cn.update([_r6_sig("cam", "frame-123", age_s=2.0)])
+        assert [s.value for s in ctx.signals] == ["frame-123"]
+
+    def test_caller_list_not_mutated(self) -> None:
+        """R6-F18: update() never writes into the caller's signals list"""
+        cn = ContextNode(history_config={"temp": HistoryConfig(max_ticks=0)})
+        mine = [_r6_sig("temp", 1.0)]
+        original = list(mine)
+        cn.update(mine)
+        cn.update([_r6_sig("temp", 2.0)])
+        assert mine == original
+
+    def test_state_update_signal_flushed_with_flush_on_write(self, tmp_path: Path) -> None:
+        """R6-F19: a StateUpdateSignal write is persisted when flush_on_write is set"""
+        path = tmp_path / "state.json"
+        cn = ContextNode(state_path=path, flush_on_write=True)
+        cn.update([_r6_state("pose", [1.0, 2.0])])
+        assert json.loads(path.read_text(encoding="utf-8")) == {"pose": [1.0, 2.0]}
+        reloaded = ContextNode(state_path=path)
+        assert reloaded.get("pose") == [1.0, 2.0]
+
+    def test_unchanged_state_update_is_not_rewritten(self, tmp_path: Path) -> None:
+        """R6-F19: an unchanged StateUpdateSignal value does not rewrite the state file"""
+        path = tmp_path / "state.json"
+        cn = ContextNode(state_path=path, flush_on_write=True)
+        cn.update([_r6_state("pose", [1.0, 2.0])])
+        path.write_text("{}", encoding="utf-8")  # sentinel: a rewrite would replace it
+        cn.update([_r6_state("pose", [1.0, 2.0])])
+        assert path.read_text(encoding="utf-8") == "{}"
+        cn.update([_r6_state("pose", [3.0, 4.0])])
+        assert json.loads(path.read_text(encoding="utf-8")) == {"pose": [3.0, 4.0]}

@@ -44,7 +44,7 @@ from arachnite.models import (
     Result,
     StepResult,
 )
-from arachnite.nodes.base import BaseNode, FaultReportingMixin, gather_settled
+from arachnite.nodes.base import BaseNode, FaultReportingMixin, gather_settled, setup_nodes
 
 # Proposals at or above this priority are reflex/safety actions. They bypass
 # ActionGuards to preserve the framework's "reflexes always fire" guarantee
@@ -1232,7 +1232,7 @@ class ActionMasterNode(FaultReportingMixin, BaseNode):
 
     async def setup(self) -> None:
         self._closed = False
-        await asyncio.gather(*(n.setup() for n in self._nodes.values()))
+        await setup_nodes(list(self._nodes.values()))
 
     def close(self) -> None:
         """
