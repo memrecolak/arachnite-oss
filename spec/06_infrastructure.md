@@ -106,6 +106,7 @@ String values beginning with $\{ are treated as environment variable references 
 - Use environment variable interpolation: $\{VAR\_NAME\} or $\{VAR\_NAME:\-fallback\}\.
 - For production deployments, use a secrets manager and inject via environment variables at runtime\.
 - The manifest validator warns \(but does not error\) if a string value looks like a plain secret \(matches common patterns like Bearer\_, sk\-\_, password=\)\.
+- `FrameworkConfig\.from\_toml\(\)` \(`arachnite\.toml`\) converts every value, after interpolation, to its setting's type \(`"$\{X:\-false\}"` → `False`; an unconvertible value raises `ValueError` naming the key\), and reports keys and sections it does not know — a misspelt `tick_rate` — with a `UserWarning` instead of ignoring them silently\.
 
 
 # __13\. Logging and Observability__
@@ -187,6 +188,8 @@ class SignalBusLogSink\(BaseLogSink\): \.\.\.   \# publishes LogEvents as Signal
 runtime = ArachniteRuntime\(\.\.\., log\_sinks=\[StdoutLogSink\(level=LogLevel\.INFO\)\]\)
 
 **Propagation and precedence\.** The sinks given to `ArachniteRuntime` \(or `RuntimeBuilder.log_sinks\(\)`\) — by default a `StdoutLogSink\(level=WARNING\)` — are the sinks of the runtime logger and of every master, decision\-strategy and leaf logger **that has no sinks of its own** \(at construction, at `start\(\)` and on `register_*_live\(\)`\)\. A node constructed with a non\-empty `log_sinks` keeps exactly those and does not also log to the runtime's; pass `\[NullLogSink\(\)\]` to silence one node\. A logger without any sink returns before building a `LogEvent`\.
+
+**Delivery\.** Inside a running event loop each accepting sink's `emit\(\)` is started at once \(an eager task on Python 3\.12\+\): a sink that writes synchronously — stdout, JSON, file — has finished before the log call returns; one that awaits I/O continues as a task that is kept until it ends\. `flush_log_sinks\(timeout=1\.0\)` waits for those; the runtime calls it at the end of every shutdown, and a program that logs through an awaiting sink outside a runtime should await it before its loop closes\. An event logged with no running loop \(construction, synchronous helpers\) is delivered synchronously\. In `JSONLogSink` records the framing keys \(`ts`, `level`, `node_id`, `agent_node_id`, `tick`, `msg`\) always describe the emitting logger; a data field with one of those names is written as `data_<key>`\.
 
 ## __13\.3 Framework\-Emitted Events__
 

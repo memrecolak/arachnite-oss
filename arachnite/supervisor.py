@@ -110,6 +110,11 @@ class NodeSupervisor:
             raise KeyError(f"Node '{node_id}' is not tracked by this supervisor.")
         return self._states[node_id]
 
+    @property
+    def supervisor_id(self) -> str:
+        """The id this supervisor publishes its signals under (e.g. ``supervisor_0``)."""
+        return self._supervisor_id
+
     def all_states(self) -> dict[str, NodeState]:
         """Return a snapshot of {node_id: NodeState} for all tracked nodes."""
         return dict(self._states)

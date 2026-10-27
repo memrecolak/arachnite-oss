@@ -8,6 +8,7 @@ Spec reference: Section 13.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import sys
 import time
@@ -109,13 +110,64 @@ class JSONLogSink(BaseLogSink):
             "agent_node_id": event.agent_node_id,
             "tick":          event.tick,
             "msg":           event.message,
-            **event.data,
         }
+        # A data field never overwrites a framing field (e.g. a master logging
+        # ``node_id=<leaf>`` keeps its own node_id); it is written as data_<key>.
+        for key, value in event.data.items():
+            record[f"data_{key}" if key in _JSON_FRAMING_KEYS else key] = value
         print(json.dumps(record, default=str), file=self._stream, flush=True)
 
 
+_JSON_FRAMING_KEYS = frozenset({"ts", "level", "node_id", "agent_node_id", "tick", "msg"})
+
 #: The level-only filter of BaseLogSink; sinks that keep it can be pre-filtered.
 _DEFAULT_ACCEPTS = BaseLogSink.accepts
+
+# Sink emissions still running (a sink that awaits I/O): held so they are not
+# garbage-collected mid-flight; ``flush_log_sinks()`` waits for them.
+_PENDING_EMITS: set[asyncio.Task[None]] = set()
+
+
+def _emit_done(task: asyncio.Task[None]) -> None:
+    _PENDING_EMITS.discard(task)
+    if not task.cancelled():
+        task.exception()  # a failing sink must not surface as "never retrieved"
+
+
+def _start_emit(loop: asyncio.AbstractEventLoop, sink: BaseLogSink, event: LogEvent) -> None:
+    """
+    Run ``sink.emit(event)`` now, as far as it can go without waiting (an
+    eager task on Python 3.12+): a sink that writes synchronously — stdout,
+    JSON, file — has finished before the log call returns, so nothing is lost
+    when the event loop shuts down right after. A sink that awaits I/O
+    continues as a task, kept until it ends.
+    """
+    if sys.version_info >= (3, 12):
+        task = asyncio.Task(sink.emit(event), loop=loop, eager_start=True)
+    else:  # pragma: no cover - exercised by the Python 3.10/3.11 CI legs
+        task = loop.create_task(sink.emit(event))
+    if task.done():
+        _emit_done(task)
+        return
+    _PENDING_EMITS.add(task)
+    task.add_done_callback(_emit_done)
+
+
+def _emit_without_loop(sink: BaseLogSink, event: LogEvent) -> None:
+    """Deliver an event logged outside any running event loop, synchronously."""
+    with contextlib.suppress(Exception):
+        asyncio.run(sink.emit(event))
+
+
+async def flush_log_sinks(timeout: float | None = 1.0) -> None:
+    """
+    Wait (up to ``timeout``) for sink emissions still in flight. The runtime
+    calls it at the end of a shutdown; a program that logs through a sink
+    which awaits I/O should await it before its event loop closes.
+    """
+    pending = set(_PENDING_EMITS)
+    if pending:
+        await asyncio.wait(pending, timeout=timeout)
 
 
 class NullLogSink(BaseLogSink):
@@ -190,16 +242,18 @@ class StructuredLogger:
             data          = data,
             timestamp     = time.monotonic(),
         )
-        # Fire-and-forget: schedule on running loop if available,
-        # otherwise emit synchronously (useful during setup/teardown).
         try:
             loop = asyncio.get_running_loop()
-            for sink in sinks:
-                if sink.accepts(event):
-                    loop.create_task(sink.emit(event))
         except RuntimeError:
-            # No running event loop — emit synchronously via a new loop.
-            pass  # drop silently outside async context during tests
+            loop = None
+        for sink in sinks:
+            if not sink.accepts(event):
+                continue
+            if loop is None:
+                # No running event loop (construction, sync helpers): deliver now.
+                _emit_without_loop(sink, event)
+            else:
+                _start_emit(loop, sink, event)
 
     def debug(self, msg: str, **data: Any) -> None:
         self._emit(LogLevel.DEBUG, msg, data)

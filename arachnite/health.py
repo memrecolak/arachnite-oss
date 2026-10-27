@@ -37,10 +37,13 @@ class HealthMonitor:
         Returns a nested dict: {supervisor_id: {node_id: NodeState}}
         for all local supervisors.
         """
-        return {
-            str(i): s.all_states()
-            for i, s in enumerate(self._supervisors)
-        }
+        report: dict[str, dict[str, NodeState]] = {}
+        for i, sup in enumerate(self._supervisors):
+            key = sup.supervisor_id
+            if key in report:  # two supervisors under one id: keep both
+                key = f"{key}#{i}"
+            report[key] = sup.all_states()
+        return report
 
     def nodes_in_state(self, state: NodeState) -> list[str]:
         """

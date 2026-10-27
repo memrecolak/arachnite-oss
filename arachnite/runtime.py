@@ -19,7 +19,13 @@ from arachnite.bus import SignalBus
 from arachnite.context import ContextNode
 from arachnite.exceptions import ReflexConflictError
 from arachnite.health import HealthMonitor
-from arachnite.logging import BaseLogSink, LogLevel, StdoutLogSink, StructuredLogger
+from arachnite.logging import (
+    BaseLogSink,
+    LogLevel,
+    StdoutLogSink,
+    StructuredLogger,
+    flush_log_sinks,
+)
 from arachnite.models import (
     ActionExecutionState,
     Context,
@@ -619,6 +625,7 @@ class ArachniteRuntime:
             await self._shutdown_coordinator.execute(self)
             self._shutdown_phase = self._shutdown_coordinator.phase
         finally:
+            await flush_log_sinks()
             self._leave_context(context)
 
     async def emergency_stop(self) -> None:
@@ -675,6 +682,7 @@ class ArachniteRuntime:
         try:
             await self._emergency_body(graceful)
         finally:
+            await flush_log_sinks()
             self._leave_context(context)
 
     async def _emergency_body(self, graceful: asyncio.Task[None] | None) -> None:

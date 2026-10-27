@@ -419,7 +419,10 @@ RuntimeBuilder defaults: GreedyDecisionNode strategy, 10 Hz tick rate, dispatch_
 Pass node **classes** to auto-instantiate with the builder's bus, or pre-built **instances** for custom args.
 Access the shared bus via `builder.bus`. `.log_sinks()` (like `ArachniteRuntime(log_sinks=...)`)
 reaches every master and leaf logger that has no sinks of its own — a node built with its own
-`log_sinks` keeps only those. Other chainable options: `.strategy()`, `.log_sinks()`,
+`log_sinks` keeps only those. Sink delivery: synchronous sinks (stdout/JSON/file) have written an
+event before the log call returns (Python 3.12+); stop()/emergency_stop() flush sinks that await I/O
+(`flush_log_sinks()` for standalone use); events logged outside a loop are delivered synchronously.
+`rt.health.report()` is keyed by supervisor id. Other chainable options: `.strategy()`, `.log_sinks()`,
 `.reflex_conflict()`, `.reflex_mode("tick" | "event")`, `.strict_resources()`, `.permissions()`,
 `.shutdown()`, `.overrun_warn()`, `.overrun_warn_consecutive()`.
 

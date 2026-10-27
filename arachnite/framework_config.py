@@ -38,6 +38,7 @@ from __future__ import annotations
 import dataclasses
 import os
 import re
+import warnings
 
 try:
     import tomllib
@@ -46,6 +47,9 @@ except ImportError:  # Python < 3.11
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+
+# Top-level TOML sections FrameworkConfig reads; anything else is ignored with a warning.
+_SECTIONS = frozenset({"runtime", "transport", "logging", "supervisor", "context"})
 
 # ── Sub-configs ────────────────────────────────────────────────────────────────
 
@@ -156,12 +160,31 @@ class FrameworkConfig:
 
     @classmethod
     def _from_dict(cls, d: dict[str, Any]) -> FrameworkConfig:
-        def _pick(src: dict[str, Any], dc: type) -> dict[str, Any]:
+        def _pick(
+            src: dict[str, Any], dc: type, section: str, subtables: tuple[str, ...] = (),
+        ) -> dict[str, Any]:
             types = {f.name: f.type for f in dataclasses.fields(dc)}
+            unknown = sorted(k for k in src if k not in types and k not in subtables)
+            if unknown:
+                # A misspelt key would otherwise leave its setting at the
+                # default without a trace.
+                warnings.warn(
+                    f"[{section}]: unknown key(s) ignored: {', '.join(unknown)}",
+                    UserWarning,
+                    stacklevel=4,
+                )
             return {
                 k: _coerce(dc.__name__, k, str(types[k]), v)
                 for k, v in src.items() if k in types
             }
+
+        unknown_sections = sorted(set(d) - _SECTIONS)
+        if unknown_sections:
+            warnings.warn(
+                f"unknown section(s) ignored: {', '.join(unknown_sections)}",
+                UserWarning,
+                stacklevel=3,
+            )
 
         rt_d   = d.get("runtime", {})
         tr_d   = d.get("transport", {})
@@ -170,20 +193,24 @@ class FrameworkConfig:
         ctx_d  = d.get("context", {})
 
         return cls(
-            runtime    = RuntimeSettings(**_pick(rt_d, RuntimeSettings)),
-            transport  = TransportSettings(**_pick(tr_d, TransportSettings)),
+            runtime    = RuntimeSettings(**_pick(rt_d, RuntimeSettings, "runtime")),
+            transport  = TransportSettings(
+                **_pick(tr_d, TransportSettings, "transport", ("mqtt", "nats", "redis")),
+            ),
             mqtt       = MQTTSettings(
-                **_pick(d.get("transport", {}).get("mqtt", {}), MQTTSettings),
+                **_pick(tr_d.get("mqtt", {}), MQTTSettings, "transport.mqtt"),
             ),
             nats       = NATSSettings(
-                **_pick(d.get("transport", {}).get("nats", {}), NATSSettings),
+                **_pick(tr_d.get("nats", {}), NATSSettings, "transport.nats"),
             ),
             redis      = RedisSettings(
-                **_pick(d.get("transport", {}).get("redis", {}), RedisSettings),
+                **_pick(tr_d.get("redis", {}), RedisSettings, "transport.redis"),
             ),
-            logging    = LoggingSettings(**_pick(log_d, LoggingSettings)),
-            supervisor = SupervisorSettings(**_pick(sup_d, SupervisorSettings)),
-            context    = ContextSettings(**_pick(ctx_d, ContextSettings)),
+            logging    = LoggingSettings(**_pick(log_d, LoggingSettings, "logging")),
+            supervisor = SupervisorSettings(
+                **_pick(sup_d, SupervisorSettings, "supervisor"),
+            ),
+            context    = ContextSettings(**_pick(ctx_d, ContextSettings, "context")),
         )
 
     # ── Builders ───────────────────────────────────────────────────────────────

@@ -146,8 +146,16 @@ class TestMeshHealthy:
         sv.track(node)
         hm = HealthMonitor([sv])
         report = hm.report()
-        assert "0" in report
-        assert "DummyNode" in report["0"]
+        assert sv.supervisor_id in report
+        assert "DummyNode" in report[sv.supervisor_id]
+
+    def test_report_is_keyed_by_supervisor_id(self, bus: SignalBus) -> None:
+        """R6-S12: report() is {supervisor_id: {node_id: state}} (spec 6.5), not list indices"""
+        a = NodeSupervisor(bus, supervisor_id="supervisor_0")
+        b = NodeSupervisor(bus, supervisor_id="supervisor_1")
+        c = NodeSupervisor(bus, supervisor_id="supervisor_1")
+        hm = HealthMonitor([a, b, c])
+        assert list(hm.report()) == ["supervisor_0", "supervisor_1", "supervisor_1#2"]
 
     def test_repr(self, bus: SignalBus) -> None:
         hm = HealthMonitor([make_supervisor(bus)])

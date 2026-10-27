@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import tempfile
+import warnings
 from pathlib import Path
 
 import pytest
@@ -250,8 +251,36 @@ flush_on_write = true
     def test_unknown_keys_ignored(self) -> None:
         p = self._write_toml('[runtime]\ntick_rate_hz = 5.0\nunknown_key = "ignored"\n')
         try:
-            cfg = FrameworkConfig.from_toml(p)
+            with pytest.warns(UserWarning, match=r"\[runtime\].*unknown_key"):
+                cfg = FrameworkConfig.from_toml(p)
             assert cfg.runtime.tick_rate_hz == 5.0
+        finally:
+            p.unlink()
+
+    def test_misspelt_key_and_unknown_section_warn(self) -> None:
+        """R6-F12: a typo (tick_rate) or an unknown section is reported, not silently dropped"""
+        p = self._write_toml(
+            '[runtime]\ntick_rate = 20.0\n[transport.mqtt]\nhosts = "x"\n[runtim]\nx = 1\n',
+        )
+        try:
+            with pytest.warns(UserWarning) as record:
+                cfg = FrameworkConfig.from_toml(p)
+            text = " | ".join(str(w.message) for w in record)
+            assert "tick_rate" in text
+            assert "[transport.mqtt]" in text and "hosts" in text
+            assert "runtim" in text
+            assert cfg.runtime.tick_rate_hz != 20.0  # the typo did not take effect
+        finally:
+            p.unlink()
+
+    def test_known_subtables_do_not_warn(self) -> None:
+        p = self._write_toml(
+            '[transport]\nbackend = "local"\n[transport.nats]\nurl = "nats://h:4222"\n',
+        )
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("error")
+                FrameworkConfig.from_toml(p)
         finally:
             p.unlink()
 

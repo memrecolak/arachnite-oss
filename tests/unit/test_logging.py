@@ -292,3 +292,102 @@ class TestObservabilityMixin:
         m.increment("x")
         text = m.metrics_text()
         assert "MyNode" in text
+
+
+# ── Review 6 (F09): delivery guarantees ───────────────────────────────────────
+
+class _Recording(BaseLogSink):
+    """Records synchronously, before any await (like stdout, JSON and file sinks)."""
+
+    def __init__(self) -> None:
+        super().__init__(LogLevel.DEBUG)
+        self.messages: list[str] = []
+
+    async def emit(self, event: LogEvent) -> None:
+        self.messages.append(event.message)
+
+
+class _Awaiting(BaseLogSink):
+    """Awaits I/O before recording (network / WebSocket sinks)."""
+
+    def __init__(self) -> None:
+        super().__init__(LogLevel.DEBUG)
+        self.messages: list[str] = []
+
+    async def emit(self, event: LogEvent) -> None:
+        await asyncio.sleep(0.01)
+        self.messages.append(event.message)
+
+
+async def _flush() -> None:
+    """flush_log_sinks() where it exists; a plain yield on code that predates it."""
+    from arachnite import logging as arachnite_logging
+
+    flush = getattr(arachnite_logging, "flush_log_sinks", None)
+    if flush is None:
+        await asyncio.sleep(0)
+    else:
+        await flush()
+
+
+class TestReview6Delivery:
+    def test_event_logged_outside_a_loop_is_delivered(self) -> None:
+        """R6-F09: an event logged with no running loop reaches its sinks"""
+        sink = _Recording()
+        StructuredLogger("Main", sinks=[sink]).error("outside any loop")
+        assert sink.messages == ["outside any loop"]
+
+    def test_runtime_stop_flushes_pending_log_events(self) -> None:
+        """R6-F09: stop() returns only once a sink that awaits I/O has written the last events"""
+        from arachnite import BaseSenseNode, RuntimeBuilder, Signal
+
+        sink = _Awaiting()
+
+        class Quiet(BaseSenseNode):
+            node_id = "Quiet"
+            signal_kind = "quiet"
+            poll_interval_s = 0.0
+
+            async def read(self) -> Signal | None:
+                return None
+
+            async def teardown(self) -> None:
+                self.logger.warning("tearing down")
+
+        async def main() -> None:
+            rt = (
+                RuntimeBuilder().sense(Quiet).tick_rate(50).log_sinks([sink]).build()
+            )
+            await rt.start()
+            await rt.stop()
+            assert "tearing down" in sink.messages  # no extra await after stop()
+
+        asyncio.run(main())
+
+    def test_flush_waits_for_an_awaiting_sink(self) -> None:
+        """R6-F09: flush_log_sinks() lets a sink that awaits I/O finish"""
+        sink = _Awaiting()
+        log = StructuredLogger("Main", sinks=[sink])
+
+        async def main() -> None:
+            log.warning("last words")
+            await _flush()
+
+        asyncio.run(main())
+        assert sink.messages == ["last words"]
+
+    def test_json_data_never_overwrites_the_emitter(self) -> None:
+        """R6-F09: a node_id= data field does not replace the emitting logger's node_id"""
+        buf = io.StringIO()
+        log = StructuredLogger("InstinctMasterNode", sinks=[JSONLogSink(stream=buf)])
+
+        async def main() -> None:
+            log.error("Instinct node raised", node_id="Flaky", error="boom")
+            await _flush()
+
+        asyncio.run(main())
+        record = json.loads(buf.getvalue().splitlines()[0])
+        assert record["node_id"] == "InstinctMasterNode"
+        assert record["data_node_id"] == "Flaky"
+        assert record["error"] == "boom"
+

@@ -1242,7 +1242,11 @@ class HealthMonitor:
 
     def report\(self\) \-> dict\[str, dict\[str, NodeState\]\]:
 
-        """Returns a nested dict: \{supervisor\_id: \{node\_id: NodeState\}\}\.
+        """Returns a nested dict: \{supervisor\_id: \{node\_id: NodeState\}\}, keyed by
+
+        each supervisor's ``supervisor\_id`` \(two supervisors sharing an id are
+
+        kept apart as ``id\#index``\)\.
 
         Useful for logging, dashboards, and test assertions\."""
 
