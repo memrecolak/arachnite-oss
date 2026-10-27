@@ -56,6 +56,7 @@ import ast
 import csv
 import datetime as _dt
 import json
+import os
 import platform
 import shutil
 import sqlite3
@@ -358,7 +359,28 @@ def git_describe() -> str:
 
 
 def test_command(tests: tuple[str, ...]) -> str:
-    return f'"{sys.executable}" -m pytest -x -q ' + " ".join(tests)
+    # -B: never write .pyc files, so a mutant can never be judged against
+    # bytecode compiled from a different (same-size, same-second) source.
+    return f'"{sys.executable}" -B -m pytest -x -q ' + " ".join(tests)
+
+
+# Environment for every test run the harness starts: no bytecode written.
+_NO_BYTECODE_ENV = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1"}
+
+
+def _purge_pycache() -> int:
+    """
+    Delete every ``__pycache__`` under the package and the tests. A .pyc is
+    validated by source size and whole-second mtime, so a one-character
+    mutant written within the same second as the original (or restored)
+    source would otherwise run on the other version's bytecode.
+    """
+    removed = 0
+    for root in (REPO_ROOT / "arachnite", REPO_ROOT / "tests"):
+        for cache in root.rglob("__pycache__"):
+            shutil.rmtree(cache, ignore_errors=True)
+            removed += 1
+    return removed
 
 
 # --------------------------------------------------------------------------
@@ -569,8 +591,12 @@ def run_mutation(sites: list[Site], max_mutants: int | None, timeout_factor: flo
             # time the unmutated suite once: green-baseline check + timeout basis
             cmd = test_command(site.tests)
             print(f"[mutation] {slug}: baseline run: {cmd}")
+            _purge_pycache()
             t0 = time.perf_counter()
-            base = subprocess.run(cmd, cwd=REPO_ROOT, shell=True, capture_output=True, text=True)
+            base = subprocess.run(
+                cmd, cwd=REPO_ROOT, shell=True, capture_output=True, text=True,
+                env=_NO_BYTECODE_ENV,
+            )
             baseline_s = time.perf_counter() - t0
             if base.returncode != 0:
                 raise SystemExit(
@@ -587,7 +613,11 @@ def run_mutation(sites: list[Site], max_mutants: int | None, timeout_factor: flo
                   f"({ann_excluded} annotation-equivalent excluded; "
                   f"baseline {baseline_s:.1f}s, per-mutant timeout {timeout_s:.0f}s)")
             if kept:
-                subprocess.run([cr, "exec", str(config), str(session)], cwd=REPO_ROOT, check=True)
+                _purge_pycache()
+                subprocess.run(
+                    [cr, "exec", str(config), str(session)],
+                    cwd=REPO_ROOT, check=True, env=_NO_BYTECODE_ENV,
+                )
 
             source_lines = (REPO_ROOT / module_rel).read_text(encoding="utf-8").splitlines()
             outcome = _read_outcomes(session, ranges, source_lines)

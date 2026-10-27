@@ -214,16 +214,9 @@ class TestDeadNodesAreSkipped:
         assert (live.calls, dead.calls) == (1, 0)
         assert faults == []
 
-    @pytest.mark.xfail(
-        strict=True,
-        raises=ValueError,
-        reason="D-1 (MUT-RR-005): _gather_nodes drops a DEAD node's entry, so "
-               "evaluate_reflex_pairs' strict zip raises ValueError while any "
-               "DEAD reflex is enabled; remove this marker once fixed",
-    )
     @pytest.mark.asyncio
     async def test_dead_reflex_is_skipped_and_its_sibling_still_fires(self) -> None:
-        """MUT-RR-005 (D-1): a DEAD reflex is skipped and the sibling's proposal stays its own"""
+        """MUT-RR-005 (D-1, fixed): a DEAD reflex is skipped; the sibling keeps its own proposal"""
         bus = SignalBus()
         im = InstinctMasterNode(bus=bus)
         live, dead = _LiveReflex(bus, proposal_priority=260), _DeadReflex(bus, 270)
