@@ -525,7 +525,7 @@ The LLM is called with two tools: propose\_action \(returns action\_id, urgency,
 - Extend BaseInstinctNode and implement evaluate\(\)\.
 - Keep evaluate\(\) fast\. Move heavy computation to setup\(\) or a background task\.
 - Set priority to reflect urgency class: 100\+ for safety/survival, 50\-99 for goal\-directed, 1\-49 for exploratory\.
-- Return None explicitly when the instinct does not apply\. Do not raise\.
+- Return None explicitly when the instinct does not apply\. Do not raise\. Return a Proposal or None only: any other value \(``True``, a dict\) is that node's fault — InstinctMasterNode logs it, reports it to the node's supervisor and treats it as None, so it never aborts the stage for the other instincts\.
 - For LLM\-backed instincts, extend LLMInstinctNode instead of BaseInstinctNode\. Set min\_interval\_s to control API call frequency\. Never use LLMInstinctNode as a reflex node — LLM latency is incompatible with the reflex arc requirement\.
 - Use trigger\_interval\_s to rate\-limit instincts that should not run every tick \(e\.g\. ReflectionInstinct, CuriosityInstinct\)\.
 - Use trigger\_on\_signals to gate instincts on specific signal kinds \(e\.g\. SocialInstinct fires only when "face", "speech", or "proximity" signals are present\)\. Both trigger\_on\_signals and trigger\_interval\_s can be combined — the signal gate is checked first, then the cooldown\.
@@ -660,7 +660,11 @@ class InstinctMasterNode\(BaseNode\):
 
         """Register a normal or reflex instinct\.
 
-        Reflex nodes \(node\.reflex == True\) go to the reflex registry\."""
+        Reflex nodes \(node\.reflex == True\) go to the reflex registry\.
+
+        Normal and reflex node\_ids share one namespace: a node\_id already
+
+        registered in either registry raises NodeRegistrationError\."""
 
     def get\_node\(self, node\_id: str\) \-> BaseInstinctNode | None: \.\.\.
 
@@ -684,9 +688,25 @@ class InstinctMasterNode\(BaseNode\):
 
         ReflexConflictError carrying every proposal; the runtime logs it
 
-        at ERROR and still launches them in priority order\.
+        at ERROR and still launches them in priority order\."""
 
-        Called by the runtime before evaluate\_all\(\)\."""
+    async def evaluate\_reflex\_pairs\(
+
+        self, ctx: Context,
+
+        nodes: Sequence\[BaseReflexInstinctNode\] | None = None,
+
+    \) \-> list\[tuple\[BaseReflexInstinctNode, Proposal\]\]:
+
+        """As evaluate\_reflexes\(\), but each proposal comes with the reflex
+
+        node that produced it \(ReflexConflictError\.fired carries the same
+
+        pairs\)\. Called by the runtime \(tick stage and event lane\), which
+
+        takes the reflex's ``preemption`` from that node — never by looking
+
+        up ``Proposal\.instinct\_id``\."""
 
     async def evaluate\_all\(self, ctx: Context\) \-> list\[Proposal\]:
 
@@ -740,7 +760,7 @@ class EmergencyStopReflex\(BaseReflexInstinctNode\):
 
 __5\.6  Decision Nodes__
 
-DecisionNodes receive the full list of Proposals from InstinctMasterNode and select exactly one to execute\. The framework ships with two built\-in strategies; developers can extend BaseDecisionNode to implement their own\.
+DecisionNodes receive the full list of Proposals from InstinctMasterNode and select the ones to execute, one at a time through decide\(\)\. The framework ships with four built\-in strategies; developers can extend BaseDecisionNode to implement their own\.
 
 ### __BaseDecisionNode__
 
@@ -750,11 +770,23 @@ class BaseDecisionNode\(BaseNode, ABC\):
 
     async def decide\(self, proposals: list\[Proposal\]\) \-> Proposal | None:
 
-        """Select one Proposal from the list, or return None if no action
+        """Select one Proposal from the list, or return None if no \(further\)
 
-        should be taken this tick\. Receives proposals sorted by priority
+        action should be taken this tick\. Receives proposals sorted by
 
-        descending\. The list may be empty\."""
+        priority descending\. Must return one of the list's own objects\."""
+
+    async def decide\_many\(
+
+        self, proposals: list\[Proposal\],
+
+        running\_action\_ids: set\[str\] | None = None,
+
+    \) \-> list\[Proposal\]:
+
+        """What the runtime calls\. Default: delegate to decide\(\) repeatedly
+
+        \(see Multi\-Proposal Selection\)\. Override for custom multi\-select\."""
 
 ### __DecisionMasterNode__
 
@@ -776,17 +808,17 @@ Selects the proposal with the highest combined score: score = priority × urgenc
 
 __RandomDecisionNode__
 
-Samples probabilistically from proposals weighted by urgency\. Useful for exploratory or creative agents\.
+Samples probabilistically from proposals weighted by urgency\. Useful for exploratory or creative agents\. ``RandomDecisionNode\(bus=bus, seed=7\)`` makes the sequence of choices reproducible \(its own ``random\.Random``\); without a seed the module\-level ``random`` generator is used\.
 
 __ActiveInferenceDecisionNode__
 
-Selects proposals by minimising expected free energy \(EFE\), trading off pragmatic value \(goal achievement\) against epistemic value \(uncertainty reduction\)\. EFE\(p\) = \-priority\(p\) × urgency\(p\) \+ β × \(1 \- avg\_confidence\(p\)\)\. Parameters: `beta` \(0\.0 = pure exploitation equivalent to WeightedDecisionNode; \>0 = exploration\-exploitation balance\), `temperature` \(0\.0 = deterministic argmin; \>0 = softmax probabilistic selection\), `prior_confidence` \(default confidence when evidence lacks \_confidence keys\)\. Confidence is extracted from the proposal's `evidence` dict \(keys ending in `_confidence`\)\. Based on Friston's free\-energy principle and Pezzato et al\.'s active inference for robotics\.
+Selects proposals by minimising expected free energy \(EFE\), trading off pragmatic value \(goal achievement\) against epistemic value \(uncertainty reduction\)\. EFE\(p\) = \-priority\(p\) × urgency\(p\) \+ β × \(1 \- avg\_confidence\(p\)\)\. Parameters: `beta` \(0\.0 = pure exploitation equivalent to WeightedDecisionNode; \>0 = exploration\-exploitation balance\), `temperature` \(0\.0 = deterministic argmin; \>0 = softmax probabilistic selection\), `prior_confidence` \(default confidence when evidence lacks \_confidence keys\), `seed` \(reproducible softmax sampling\)\. Confidence is extracted from the proposal's `evidence` dict \(keys ending in `_confidence`\)\. Based on Friston's free\-energy principle and Pezzato et al\.'s active inference for robotics\.
 
 ### __Multi\-Proposal Selection \(Concurrent Dispatch\)__
 
-BaseDecisionNode also exposes decide\_many\(\), which selects the best proposal per unique action\_id for concurrent dispatch\. The default implementation iterates proposals by priority descending and picks one per action\_id, skipping those already running\. All built\-in strategies inherit this default\.
+The runtime selects through BaseDecisionNode\.decide\_many\(\), which may start several proposals in one tick \(one per action\_id\)\. Its default delegates to the strategy's decide\(\): drop the candidates whose action\_id is in ``running\_action\_ids``; call decide\(\) on the remaining candidates \(sorted by priority, then urgency, descending\); take its choice and drop every candidate with the same action\_id; repeat until decide\(\) returns None or no candidate is left\. The choices are returned in selection order\. A decide\(\) that returns a proposal it was not offered is a strategy error: it is logged at ERROR and selection stops there\. So a strategy that returns None on its first call idles the agent for the tick, and Weighted, Random, ActiveInference and user strategies decide what runs\. For GreedyDecisionNode the result is the highest\-priority \(then highest\-urgency\) proposal per action\_id, highest first — exactly the selection of the earlier default\. All built\-in strategies follow this default; GreedyDecisionNode and WeightedDecisionNode compute its result directly, in O\(n log n\), unless a subclass overrides their decide\(\)\. A strategy may override decide\_many\(\) for custom multi\-select logic\.
 
-DecisionMasterNode\.on\_new\_proposals\_many\(\) extends this further: it calls decide\_many\(\) to select proposals, then checks each selected proposal against the running actions it conflicts with — same action\_id, shared declared resources, or resources claimed by an armed reflex \(the runtime passes ``conflicts=ActionMasterNode\.conflicting\_owners``\)\. A proposal with no conflict is dispatched\. If every conflicting owner is running, interruptible, not reflex\-owned and of lower priority, an InterruptRequest is issued to each owner \(``target\_action\_id``\) and the proposal is dispatched; otherwise it is held \(§17\.6\)\.
+DecisionMasterNode\.on\_new\_proposals\_many\(\) extends this further: it calls decide\_many\(\) to select proposals, then checks each selected proposal against the running actions it conflicts with — same action\_id, shared declared resources, or resources claimed by an armed reflex \(the runtime passes ``conflicts=ActionMasterNode\.conflicting\_owners``\)\. A proposal with no conflict is dispatched\. If every conflicting owner is running, not reflex\-owned and of lower priority, an InterruptRequest is issued to each owner \(``target\_action\_id``\) and the proposal is dispatched — also when an owner is inside a mandatory block: the request is latched on it and honoured at its first stop point after the block, and the proposal is parked until it releases \(ADR 0009\)\. Otherwise it is held \(§17\.6\)\.
 
 ### __Proposal Persistence__
 
@@ -809,7 +841,7 @@ A dispatched proposal whose launch is ``BLOCKED`` — typically because it just 
 
 ### __Developer Contract__
 
-- Extend BaseDecisionNode and implement decide\(\)\.
+- Extend BaseDecisionNode and implement decide\(\)\. The runtime may call it several times per tick, each time on the candidates left after the previous choice \(different action\_ids\)\.
 - Optionally override decide\_many\(\) for custom multi\-select logic\.
 - The proposals list is pre\-sorted by priority descending\.
 - Returning None is valid and means 'take no action this tick'\.
@@ -823,7 +855,11 @@ ActionNodes are the effectors of the system\. Each one knows how to perform a si
 
 class BaseActionNode\(BaseNode, ABC\):
 
-    timeout\_s: float = 5\.0     \# max execution time before TimeoutError
+    timeout\_s: float = 5\.0     \# max execution time; then execute\(\) is
+
+                               \# cancelled, on\_preempted\(\) runs \(stand\-in
+
+                               \# "timeout" proposal\), then on\_timeout\(\)
 
     max\_retries: int = 0       \# automatic retries on transient failure
 
@@ -857,9 +893,13 @@ class BaseActionNode\(BaseNode, ABC\):
 
     async def on\_timeout\(self, proposal: Proposal\) \-> Result:
 
-        """Called when execute\(\) exceeds timeout\_s\.
+        """Called when execute\(\) exceeds timeout\_s, after the run's
 
-        Default: return Result\(success=False, \.\.\.\)\. Override to clean up\."""
+        safe\-stop \(and, for a multi\-step action, the abort rules of the
+
+        step that was cut\) — see §17\.5\. Default: return
+
+        Result\(success=False, \.\.\.\)\. Override to clean up\."""
 
     async def on\_preempted\(self, proposal: Proposal,
 
@@ -1012,7 +1052,7 @@ Guards run in ``launch\(\)`` and ``dispatch\(\)`` after the not\-found and confl
 - Set node\_id to the action\_id that instincts will reference in their Proposals\.
 - Read action parameters from proposal\.parameters\. Define a schema and validate at the top of execute\(\)\.
 - Return Result\(success=False, error=exc\) instead of raising for expected failure modes\.
-- Use timeout\_s and max\_retries to guard against hardware hangs without custom retry logic\.
+- Use timeout\_s and max\_retries to guard against hardware hangs without custom retry logic\. An action timeout cancels execute\(\) like any other stop, so ``on\_preempted\(\)`` must also bring the actuators to a safe hold after a timeout \(``preempted\_by\.instinct\_id == 'timeout'``\)\.
 - Declare ``resources`` for every actuator the action commands; set ``strict\_resources=True`` on ActionMasterNode to make an undeclared action a registration error\.
 - Write execute\(\) to be cancellation\-safe, and override ``on\_preempted\(\)`` with a forward safe\-stop if a reflex may take this action's resources mid\-execution\.
 
@@ -1282,13 +1322,13 @@ Manages a set of monitors\. `SafetyMonitorRegistry\.default\(bus\)` creates all 
 | Monitor | Property | Severity |
 |---|---|---|
 | `ReflexBypassMonitor` | reflex\_fired ⟹ ¬reflex\_routed\_through\_decision | CRITICAL |
-| `MandatoryBlockMonitor` | no deliberative interrupt honoured strictly inside a mandatory block | CRITICAL |
+| `MandatoryBlockMonitor` | ¬interrupt\_accepted\_during\_block \(no deliberative interrupt honoured strictly inside a mandatory block\) | CRITICAL |
 | `ReflexDispatchMonitor` | reflex\_fired ⟹ reflex\_action\_dispatched | CRITICAL |
 | `ActuatorExclusivityMonitor` | resources\_with\_multiple\_owners = 0 | CRITICAL |
 | `ReflexAvailabilityMonitor` | all reflex nodes available | WARNING |
 | `TickBudgetMonitor` | 3\+ consecutive tick overruns | WARNING |
 
-Field meanings, as ``monitor\_state\(\)`` fills them: ``reflex\_routed\_through\_decision`` — a **reflex node's proposal** was offered to the decision layer \(the decide stage itself runs on every tick, after the reflex stage, so \"the decide stage ran\" is not the property\); ``interrupt\_accepted\_during\_block`` — a completed action reported a **deliberative** stop strictly inside a mandatory block \(a ``PREEMPT`` reflex or ``emergency\_stop\(\)`` ending a block is declared behaviour, §17\.5, not a violation\); ``reflex\_action\_dispatched`` — every ``launch\_reflex\(\)`` since the previous tick returned ``LAUNCHED``, ``ARMED`` or ``DEDUPED``; ``resources\_with\_multiple\_owners`` — declared resources held by more than one running action \(0 by construction\); ``active\_reflex\_nodes`` — reflex nodes not FAULTED, RESTARTING or DEAD\.
+Field meanings, as ``monitor\_state\(\)`` fills them: ``reflex\_routed\_through\_decision`` — a **reflex node's proposal** was offered to the decision layer \(the decide stage itself runs on every tick, after the reflex stage, so \"the decide stage ran\" is not the property\); ``interrupt\_accepted\_during\_block`` — a completed action reported a **deliberative** stop strictly inside a mandatory block \(a cancellation — ``PREEMPT`` reflex, ``cancel\(\)``, shutdown, ``emergency\_stop\(\)``, action timeout, all with ``Result\.cancelled`` — or a reflex hand\-off ending a block is declared behaviour, §17\.5, not a violation\); ``MandatoryBlockMonitor`` checks this field alone, since the violating action has already stopped \(``mandatory\_block\_active`` reports whether some running action is in a block now, for information\); ``reflex\_action\_dispatched`` — every ``launch\_reflex\(\)`` since the previous tick returned ``LAUNCHED``, ``ARMED`` or ``DEDUPED``; ``resources\_with\_multiple\_owners`` — declared resources held by more than one running action \(0 by construction\); ``active\_reflex\_nodes`` — reflex nodes not FAULTED, RESTARTING or DEAD\.
 
 Violations are published as `SafetyViolationSignal` \(kind `"safety_violation"`\) with `monitor_id`, `severity`, `property_name`, and `details`\. Reflex instincts can subscribe and trigger compensating actions\.
 

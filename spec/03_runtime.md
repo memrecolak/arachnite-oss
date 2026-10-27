@@ -229,9 +229,9 @@ async def tick\(self\) \-> None:
 
     try:
 
-        reflex\_proposals = await self\.\_instinct\_master\.evaluate\_reflexes\(
+        fired = await self\.\_instinct\_master\.evaluate\_reflex\_pairs\(
 
-            ctx, nodes=self\.\_tick\_reflex\_nodes\(\)\)
+            ctx, nodes=self\.\_tick\_reflex\_nodes\(\)\)   \# \(reflex node, proposal\)
 
     except ReflexConflictError as exc:
 
@@ -239,11 +239,15 @@ async def tick\(self\) \-> None:
 
         \# the conflicting reflexes are launched in priority order\.
 
-        reflex\_proposals = exc\.proposals
+        fired = exc\.fired
 
-    for rp in reflex\_proposals:            \# priority descending
+    for node, rp in fired:                 \# priority descending
 
         logger\.info\("Reflex fired", \.\.\.\)
+
+        \# The mode comes from the node that produced the proposal, never
+
+        \# from a lookup of rp\.instinct\_id \(ADR 0009\)\.
 
         outcome = self\.\_action\_master\.launch\_reflex\(rp, node\.preemption\)
 
@@ -265,7 +269,9 @@ async def tick\(self\) \-> None:
 
     \#    and resources claimed by armed reflexes\. A reflex\-owned action
 
-    \#    is never reported interruptible\.
+    \#    is never reported interruptible; every deliberative owner is,
+
+    \#    also inside a mandatory block \(the request is latched, ADR 0009\)\.
 
     to\_dispatch, interrupts = await self\.\_decision\_master\.on\_new\_proposals\_many\(
 
@@ -273,7 +279,7 @@ async def tick\(self\) \-> None:
 
         running\_proposals=self\.\_action\_master\.current\_proposals\(\),
 
-        running\_interruptible=\{aid: origin \!= 'reflex' and is\_interruptible\(aid\)\},
+        running\_interruptible=\{aid: origin \!= 'reflex'\},
 
         evaluated\_instinct\_ids=evaluated\_ids,
 
@@ -304,16 +310,6 @@ async def tick\(self\) \-> None:
         try:
 
             await self\.\_action\_master\.request\_interrupt\(interrupt\_req, action\_id=target\)
-
-        except MandatoryBlockViolation:
-
-            \# The target entered a mandatory block since the decision\.
-
-            \# Logged as WARNING with action\_id and detail fields — MUST
-
-            \# NOT be silently suppressed\.
-
-            logger\.warning\("Interrupt blocked by mandatory step", \.\.\.\)
 
         except Exception:
 
@@ -378,7 +374,8 @@ With the default ``reflex\_mode='tick'`` every reflex node is evaluated once per
 - An event\-driven sense node calls ``await self\.push\(signal\)`` from a background task \(e\.g\. a GPIO or ToF interrupt listener started in ``setup\(\)``\)\. The lane evaluates the reflex before ``push\(\)`` returns, outside any tick, which removes tick quantisation from the reflex path\. The pushed signal also reaches the next tick's ``ctx\.signals`` once, for deliberation\.
 - The reflex sees ``ContextNode\.reflex\_view\(signals\)``: the freshest signal per ``\(source, kind\)`` of its trigger kinds received within ``reflex\_signal\_ttl\_s`` \(default: one tick period\), the current ``state``, results and action states, and an **empty** ``history``\.
 - Evaluation is bounded by ``reflex\_eval\_timeout\_s`` \(default 0\.05 s\)\. A timeout or exception is logged at ERROR and never propagates into the publisher; ``ReflexConflictError`` is handled as in step 4\.
-- Proposals go through the same ``launch\_reflex\(\)`` arbitration \(§17\.12\)\.
+- Proposals go through the same ``launch\_reflex\(\)`` arbitration \(§17\.12\), each with the ``preemption`` of the reflex node that produced it\.
+- A reflex is not re\-evaluated by a signal published during its own evaluation \(for example the ``node\_fault`` of a ``node\_fault``\-triggered reflex whose ``evaluate\(\)`` raised\): that would recurse without bound\. The signal is still stored as the latest of its ``\(source, kind\)``, so the reflex's next evaluation within ``reflex\_signal\_ttl\_s`` sees it\. Other lane reflexes it triggers are evaluated as usual\.
 - The lane stays live while the runtime is paused \(polled sensing and deliberation stop; a pushed hazard signal still gets its reflex\)\. ``stop\(\)`` and ``emergency\_stop\(\)`` detach it first; an evaluation still in flight then launches nothing\.
 
 Reflex nodes without ``trigger\_on\_signals`` remain in the tick's reflex stage in both modes\. In ``'tick'`` mode ``trigger\_on\_signals`` has no effect on reflex nodes\.
@@ -1063,17 +1060,17 @@ class MultiStepActionNode\(BaseActionNode, ABC\):
 
 __Cooperative mid\-step interrupt\.__ The framework checks for interrupts *between* steps\. A single long\-running step \(an LLM call, a long subprocess\) cannot be interrupted by the framework on its own\. To let such a step yield mid\-execution, ``execute\_step\(\)`` may poll ``check\_interrupt\(\)`` and, when it returns True, stop and return ``StepResult\(\.\.\., interrupted=True\)``\. ``check\_interrupt\(\)`` returns True only when an interrupt is pending AND the current step may honour it: it returns False inside a non\-interruptible \(mandatory\) step and under ``InterruptPolicy\.NEVER``, and under ``CHECKPOINT`` it is True only at a checkpoint step\. It therefore can **never** bypass a mandatory completion block — the ``MandatoryBlockMonitor`` invariant holds\. As defense\-in\-depth, ``execute\(\)`` ignores an ``interrupted=True`` result returned from a non\-interruptible step\. Polling ``check\_interrupt\(\)`` is optional; steps that never call it behave exactly as before\.
 
-__Cancellation safety\.__ Independently of the cooperative path, a ``PREEMPT`` reflex \(§17\.12\), ``emergency\_stop\(\)``, graceful\-shutdown phase 4 and the node\-level ``timeout\_s`` cancel ``execute\(\)`` at its current ``await`` by delivering ``asyncio\.CancelledError`` — inside a mandatory block too\. Step code must therefore be cancellation\-safe\. A hardware call running in ``asyncio\.to\_thread\(\)`` cannot be cancelled and completes in its thread; the ``on\_preempted\(\)`` safe\-stop hook must cope with such an in\-flight command\.
+__Cancellation safety\.__ Independently of the cooperative path, a ``PREEMPT`` reflex \(§17\.12\), ``emergency\_stop\(\)``, graceful\-shutdown phase 4 and the node\-level ``timeout\_s`` cancel ``execute\(\)`` at its current ``await`` by delivering ``asyncio\.CancelledError`` — inside a mandatory block too — and every one of them then runs the run's ``on\_preempted\(\)`` safe\-stop \(for the timeout with a stand\-in proposal whose ``instinct\_id`` is ``'timeout'``\)\. Step code must therefore be cancellation\-safe\. A hardware call running in ``asyncio\.to\_thread\(\)`` cannot be cancelled and completes in its thread; the ``on\_preempted\(\)`` safe\-stop hook must cope with such an in\-flight command\.
 
 ## __17\.5 Mandatory Completion Blocks__
 
 A mandatory completion block is a sequence of consecutive steps where every step has interruptible=False\. "Mandatory block atomicity" is three separate properties \(ADR 0005\):
 
-1\. __Deliberative atomicity__ \(enforced\)\. No deliberative interrupt cuts into a block: ``ActionMasterNode\.request\_interrupt\(\)`` raises ``MandatoryBlockViolation``, the decision layer never selects an owner inside a block for interruption, ``check\_interrupt\(\)`` returns False there, an interrupt pending when the block is about to start is honoured at the boundary before it \(the block is never entered\), and one arriving inside the block \(e\.g\. the shutdown interrupt\) is held until the first stop point after it\.
+1\. __Deliberative atomicity__ \(enforced\)\. No deliberative interrupt cuts into a block: ``check\_interrupt\(\)`` returns False there and ``execute\(\)`` honours a pending interrupt only at a stop point\. An interrupt pending when the block is about to start is honoured at the boundary before it \(the block is never entered\); one arriving inside the block — a higher\-priority deliberative proposal's \(``ActionMasterNode\.request\_interrupt\(\)``\) or the shutdown interrupt — is latched on the action and honoured at the first stop point after the block, under the action's ``InterruptPolicy``\. Requests are never refused, only deferred \(ADR 0009\)\.
 2\. __Resource exclusivity__ \(enforced for declared resources\)\. While the action runs, no other action can own any of its declared ``resources`` \(§17\.12\)\.
 3\. __Bounded reflex admission__ \(derived, not guaranteed\)\. A reflex whose action needs the owner's resources is admitted within a bound computed from declared timeouts — immediately after the owner's safe\-stop under ``PREEMPT``, after the remaining block under ``WAIT\_FOR\_BLOCK``\. The bounds and their assumptions are in §17\.12; they are not hard real\-time guarantees\.
 
-A block can end before its last step only through: a ``ReflexPreemption\.PREEMPT`` reflex \(owner cancelled, safe\-stop, no rollback unless ``rollback\_on\_preempt``\); ``emergency\_stop\(\)`` \(§15\.3\); a step timeout, ``abort\_sequence=True`` or a raising step \(``on\_aborted\(\)``, §17\.2\); the node\-level ``timeout\_s`` \(``execute\(\)`` is cancelled and ``on\_timeout\(\)`` runs, without safe\-stop or rollback\); and graceful\-shutdown phase 4 cancelling an action that overran its block timeouts \(§15\.1\)\.
+A block can end before its last step only through: a ``ReflexPreemption\.PREEMPT`` reflex \(owner cancelled, safe\-stop, no rollback unless ``rollback\_on\_preempt``\); ``emergency\_stop\(\)`` \(§15\.3\); a step timeout, ``abort\_sequence=True`` or a raising step \(``on\_aborted\(\)``, §17\.2\); the node\-level ``timeout\_s`` \(``execute\(\)`` is cancelled, the run's ``on\_preempted\(\)`` safe\-stop runs, then the abort rules for the step that was cut — ``on\_aborted\(\)``, which rolls back only under ``ROLLBACK`` — then ``on\_timeout\(\)``; the Result keeps ``step\_results`` and ``stopped\_at\_step``, has ``cancelled=True``, and a run cut inside a block is never retried, ADR 0009\); and graceful\-shutdown phase 4 cancelling an action that overran its block timeouts \(§15\.1\)\.
 
 \# Example: valve control sequence\.
 
@@ -1135,9 +1132,9 @@ ActionMasterNode tracks every running action, the resources it owns \(§17\.12\)
 
 \#    an armed reflex \(ActionMasterNode\.conflicting\_owners\)\.
 
-\# 2\. If every owner in O is running, interruptible right now \(not inside
+\# 2\. If every owner in O is running, not reflex\-owned, and of lower
 
-\#    a mandatory block\), not reflex\-owned, and of lower priority than P:
+\#    priority than P — inside a mandatory block or not:
 
 \#    DecisionMasterNode emits one InterruptRequest per owner
 
@@ -1145,13 +1142,15 @@ ActionMasterNode tracks every running action, the resources it owns \(§17\.12\)
 
 \#    Otherwise P is held: not dispatched, kept only under the persist
 
-\#    rules \(§5\.6\)\. Deliberation never cuts into a mandatory block\.
+\#    rules \(§5\.6\)\.
 
 \# 3\. The runtime calls ActionMasterNode\.request\_interrupt\(req, target\)\.
 
-\#    Inside a mandatory block it raises MandatoryBlockViolation \(logged
+\#    It never refuses: it sets the owner's interrupt flag, which is held
 
-\#    at WARNING\)\. Otherwise it sets the owner's interrupt flag:
+\#    through a mandatory block \(deliberation never cuts into one, ADR
+
+\#    0009\) and honoured at the first stop point the policy allows:
 
 \#    ALWAYS     → owner stops at the next interruptible boundary
 
@@ -1189,17 +1188,19 @@ class ActionMasterNode\(BaseNode\):
 
         """Target action\_id, else request\.target\_action\_id, else the
 
-        highest\-priority running action\. Raises MandatoryBlockViolation
+        highest\-priority running action\. Never refuses: inside a
 
-        inside a mandatory block\."""
+        mandatory block the request is latched and honoured at the first
+
+        stop point after it \(ADR 0009\)\."""
 
     def interrupt\_all\(self, request: InterruptRequest\) \-> None:
 
-        """Deliver request to every running multi\-step action, bypassing
+        """Deliver request to every running multi\-step action \(as
 
-        the mandatory\-block gate \(the flag is held until the block
+        request\_interrupt\(\): held through a mandatory block\)\. Used by
 
-        ends\)\. Used by graceful shutdown\."""
+        graceful shutdown\."""
 
     def current\_action\(self\) \-> BaseActionNode \| None: \.\.\.
 
@@ -1438,7 +1439,7 @@ Assume a CollisionReflex whose action ``EmergencyRetractActionNode`` declares ``
 - **``preemption = ReflexPreemption\.PREEMPT``** \(default\): the pick is cancelled at its current ``await``, ``on\_preempted\(\)`` brakes the arm, the pick's Result has ``preempted=True`` and no rollback runs; then the retract starts\. Admission delay ≤ ``safe\_stop\_timeout\_s`` = 0\.5 s\.
 - **``preemption = ReflexPreemption\.WAIT\_FOR\_BLOCK``**: the reflex is armed and claims ``arm``; the block runs to its end; at the boundary before ``move\_to\_target`` the pick stops — regardless of ROLLBACK — runs ``on\_preempted\(\)``, releases, and the retract starts\. Admission delay ≤ remaining block \+ ``safe\_stop\_timeout\_s``; worst case \(just after ``lower\_gripper`` starts\) 2\.0 \+ 1\.5 \+ 2\.0 \+ 0\.5 = 6\.0 s\.
 
-A **deliberative** proposal for the same resources \(say a priority\-120 obstacle\-avoidance instinct\) is held while the pick is in the block\. Once the block has ended and the pick is in an interruptible step, the decision layer interrupts it; the pick stops at the next interruptible boundary and ROLLBACK walks the completed block in reverse: ``\_lower\_gripper`` \(undoes raise\_gripper\), ``\_open\_gripper`` \(undoes close\_gripper\), ``\_raise\_gripper`` \(undoes lower\_gripper\)\. The proposal is parked meanwhile and launches as soon as the pick releases\.
+A **deliberative** proposal for the same resources \(say a priority\-120 obstacle\-avoidance instinct\) that arrives while the pick is in the block interrupts it at once, but the request is latched: the block runs to its end, and the pick stops at the first stop point after it \(the boundary before ``move\_to\_target``\) and ROLLBACK walks the completed block in reverse: ``\_lower\_gripper`` \(undoes raise\_gripper\), ``\_open\_gripper`` \(undoes close\_gripper\), ``\_raise\_gripper`` \(undoes lower\_gripper\)\. The proposal is parked meanwhile and launches as soon as the pick releases\.
 
 ## __17\.11 Directory Structure — Additions__
 
@@ -1484,7 +1485,7 @@ class BaseActionNode\(BaseNode\):
 
         """Forward safe\-stop \("brake, keep the grip"\)\. Default: no\-op\."""
 
-__Arbitration\.__ The runtime launches every reflex proposal with ``ActionMasterNode\.launch\_reflex\(proposal, node\.preemption\)``\. When the reflex must wait, it is **armed**: it claims its resources, so ``conflicting\_owners\(\)`` reports the claim and no deliberative proposal can launch on them meanwhile\. The armed reflex starts the moment its last owner releases — from the owner's task, before any later tick — and armed reflexes are admitted in priority order: a lower\-priority armed reflex is not admitted on a resource that a higher\-priority armed reflex still waits for, and every armed reflex keeps its claim until it starts or is cancelled\. Cancelling an armed reflex \(``ActionMasterNode\.cancel\(\)``\) withdraws it: an owner that was only waiting to hand over to it carries on\. To **preempt** an owner, its task is cancelled at its current ``await`` \(even inside a mandatory block\), ``on\_preempted\(\)`` runs in its own task bounded by ``safe\_stop\_timeout\_s`` \(a hook that raises is logged; one that overruns is cancelled, and abandoned — left running, logged — if it has not ended ``SAFE\_STOP\_ABANDON\_GRACE\_S`` = 0\.1 s later, so even a hook that swallows its cancel holds a reflex back at most ``safe\_stop\_timeout\_s`` \+ 0\.1 s\), and the rollback walk runs only if the owner sets ``rollback\_on\_preempt = True`` — and not if a shutdown \(``cancel\_all\(\)``\) arrives before the safe\-stop has started\. A run walks at most once: a preemption arriving during or after an interrupt or abort rollback walk does not start the walk again \(the Result still reports a walk that completed\)\. The safe\-stop \(with that walk\) runs at most once per run: it is shielded, so a later cancel — a second reflex, ``emergency\_stop\(\)``, shutdown — waits for it instead of cutting it short, and a ``WAIT\_FOR\_BLOCK`` hand\-off runs it in the master's task, outside the action's ``timeout\_s``\. A hook that ends in ``CancelledError`` of its own is reported like a raising hook\. The cancel is also recorded on the node, so a step that completes in the same event\-loop turn cannot swallow it \(``asyncio\.wait\_for`` on Python 3\.10\)\. The owner's Result has ``preempted=True`` and ``interrupted=True`` and is never retried; an awaited ``dispatch\(\)`` preempted before its first step returns that Result rather than raising\. A run the master cancels through ``cancel\(\)`` or ``cancel\_all\(\)`` likewise ends with a Result \(``interrupted=True``, ``preempted=False``\), for ``launch\(\)`` and ``dispatch\(\)`` alike; if the *caller* of an awaited ``dispatch\(\)`` is cancelled, the action is stopped the same way and the caller then gets the ``CancelledError``\. ``ActionMasterNode\.cancel\(action\_id\)`` withdraws a reflex armed under ``action\_id`` if there is one and otherwise cancels the running run; withdrawing never touches a running run, even one under the same id\. ``close\(\)`` drops every armed reflex too\. A cancel that ``execute\(\)`` swallowed \(a Python 3\.10 ``asyncio\.wait\_for``, or an action that turned the ``CancelledError`` into a Result\) still ends the run through its safe\-stop, and one that lands as a safe\-stop finishes keeps that safe\-stop's Result\. A cancel from outside the master that arrives during a safe\-stop still propagates once the safe\-stop is done: the master counts the cancels it sends a run, and a run that received more ends cancelled \(Python 3\.10 cannot count cancel requests, so there only one that arrives as a separate delivery is noticed\)\. ``wait\_idle\(\)`` returns only once the finished runs' Results are buffered\. ``dispatch\_many\(\)`` checks every action exists before starting any\. A reflex that waits only on lower\-priority armed claims, with no running owner, starts at once\. The action and step timeouts run in the action's own task \(``asyncio\.timeout``, or an equivalent on Python 3\.10\), so no inner task can be orphaned: the deadline cancels the work once, clean\-up it runs in response is not cut short, and work that swallows that cancel but returns after the deadline is still a timeout\. Each rollback callable is bounded the same way by its step's ``timeout\_s`` \(the action's if unset\); one that overruns is a rollback failure\. A run whose rollback walk the action timeout cut short is not retried\. Two Python 3\.10 limits: it does not count cancel requests, so a cancel from outside the master \(e\.g\. event\-loop shutdown\) that lands in the same turn as a step timer is reported as the step timeout; and a 3\.10 ``asyncio\.wait\_for`` inside a step can swallow the timer's cancel, so that step ends when it next returns \(still reported as a timeout\)\.
+__Arbitration\.__ The runtime launches every reflex proposal with ``ActionMasterNode\.launch\_reflex\(proposal, node\.preemption\)``\. When the reflex must wait, it is **armed**: it claims its resources, so ``conflicting\_owners\(\)`` reports the claim and no deliberative proposal can launch on them meanwhile\. The armed reflex starts the moment its last owner releases — from the owner's task, before any later tick — and armed reflexes are admitted in priority order: a lower\-priority armed reflex is not admitted on a resource that a higher\-priority armed reflex still waits for, and every armed reflex keeps its claim until it starts or is cancelled\. Cancelling an armed reflex \(``ActionMasterNode\.cancel\(\)``\) withdraws it: an owner that was only waiting to hand over to it carries on\. To **preempt** an owner, its task is cancelled at its current ``await`` \(even inside a mandatory block\), ``on\_preempted\(\)`` runs in its own task bounded by ``safe\_stop\_timeout\_s`` \(a hook that raises is logged; one that overruns is cancelled, and abandoned — left running, logged — if it has not ended ``SAFE\_STOP\_ABANDON\_GRACE\_S`` = 0\.1 s later, so even a hook that swallows its cancel holds a reflex back at most ``safe\_stop\_timeout\_s`` \+ 0\.1 s\), and the rollback walk runs only if the owner sets ``rollback\_on\_preempt = True`` — and not if a shutdown \(``cancel\_all\(\)``\) arrives before the safe\-stop has started\. A run walks at most once: a preemption arriving during or after an interrupt or abort rollback walk does not start the walk again \(the Result still reports a walk that completed\)\. The safe\-stop \(with that walk\) runs at most once per run: it is shielded, so a later cancel — a second reflex, ``emergency\_stop\(\)``, shutdown — waits for it instead of cutting it short, and a ``WAIT\_FOR\_BLOCK`` hand\-off runs it in the master's task, outside the action's ``timeout\_s``\. A hook that ends in ``CancelledError`` of its own is reported like a raising hook\. The cancel is also recorded on the node, so a step that completes in the same event\-loop turn cannot swallow it \(``asyncio\.wait\_for`` on Python 3\.10\)\. The owner's Result has ``preempted=True`` and ``interrupted=True`` and is never retried; an awaited ``dispatch\(\)`` preempted before its first step returns that Result rather than raising\. A run the master cancels through ``cancel\(\)`` or ``cancel\_all\(\)`` likewise ends with a Result \(``interrupted=True``, ``preempted=False``\), for ``launch\(\)`` and ``dispatch\(\)`` alike; if the *caller* of an awaited ``dispatch\(\)`` is cancelled, the action is stopped the same way and the caller then gets the ``CancelledError``\. ``ActionMasterNode\.cancel\(action\_id\)`` withdraws a reflex armed under ``action\_id`` if there is one and otherwise cancels the running run; withdrawing never touches a running run, even one under the same id\. ``close\(\)`` drops every armed reflex too\. A cancel that ``execute\(\)`` swallowed \(a Python 3\.10 ``asyncio\.wait\_for``, or an action that turned the ``CancelledError`` into a Result\) still ends the run through its safe\-stop, and one that lands as a safe\-stop finishes keeps that safe\-stop's Result\. A cancel from outside the master that arrives during a safe\-stop still propagates once the safe\-stop is done: the master counts the cancels it sends a run, and a run that received more ends cancelled \(Python 3\.10 cannot count cancel requests, so there only one that arrives as a separate delivery is noticed\)\. ``wait\_idle\(\)`` returns only once the finished runs' Results are buffered\. ``dispatch\_many\(\)`` checks every action exists before starting any\. A reflex that waits only on lower\-priority armed claims, with no running owner, starts at once\. The action and step timeouts run in the action's own task \(``asyncio\.timeout``, or an equivalent on Python 3\.10\), so no inner task can be orphaned: the deadline cancels the work once, clean\-up it runs in response is not cut short, and work that swallows that cancel but returns after the deadline is still a timeout\. Each rollback callable is bounded the same way by its step's ``timeout\_s`` \(the action's if unset\); one that overruns is a rollback failure\. A run whose rollback walk the action timeout cut short is not retried\. An action timeout is a cancellation like the others: the run's ``on\_preempted\(\)`` runs \(shielded, bounded by ``safe\_stop\_timeout\_s``, with the stand\-in ``'timeout'`` proposal and without the ``rollback\_on\_preempt`` walk\), then a multi\-step run follows the abort rules for the step that was cut \(``on\_aborted\(\)``\), then ``on\_timeout\(\)`` supplies the Result, which keeps ``step\_results``, ``stopped\_at\_step`` and ``rolled\_back`` and has ``cancelled=True``\. A cancel arriving during that safe\-stop ends the run through the cancel path without running the hook again \(a run's hook runs at most once\)\. A run the timeout cut inside a mandatory block is never retried\. Two Python 3\.10 limits: it does not count cancel requests, so a cancel from outside the master \(e\.g\. event\-loop shutdown\) that lands in the same turn as a step timer is reported as the step timeout; and a 3\.10 ``asyncio\.wait\_for`` inside a step can swallow the timer's cancel, so that step ends when it next returns \(still reported as a timeout\)\.
 
 __Decision table\.__ T\_admit is the time from ``launch\_reflex\(\)`` to the reflex action's ``execute\(\)`` being entered\. With several owners each is handled by its row, and T\_admit is the maximum\.
 
@@ -1500,7 +1501,7 @@ __Decision table\.__ T\_admit is the time from ``launch\_reflex\(\)`` to the ref
 
 In the table, the ``safe\_stop\_timeout\_s`` term grows by 0\.1 s for a hook that overruns \(the abandon grace\), and a rollback walk is bounded by the sum of the ``timeout\_s`` of the steps it undoes\. ``BaseActionNode\.safe\_stop\_bound\_s\(\)`` returns this bound for an action; shutdown and ``emergency\_stop\(\)`` wait for the largest bound of the running actions \(\+ 0\.5 s\)\.
 
-A deliberative proposal is never admitted this way: it is dispatched, interrupts lower\-priority interruptible owners, or is held \(§17\.6\)\. Reflex dispatches \(``origin='reflex'``\) bypass ActionGuards; deliberative ones never do, whatever their priority\.
+A deliberative proposal is never admitted this way: it is dispatched, interrupts lower\-priority deliberative owners \(a request to an owner in a block is latched until the block ends\), or is held \(§17\.6\)\. Reflex dispatches \(``origin='reflex'``\) bypass ActionGuards; deliberative ones never do, whatever their priority\.
 
 __Enforced by the framework\.__
 

@@ -27,7 +27,6 @@ from arachnite.exceptions import (
     ActionNotFoundError,
     ActionTimeoutError,
     ActionVetoed,
-    MandatoryBlockViolation,
     NodeRegistrationError,
     ResourceConflictError,
     RollbackError,
@@ -290,6 +289,10 @@ class BaseActionNode(BaseNode):
     #: this many arriving means one came from outside the master.
     _master_cancels: int = 0
 
+    #: Set when this run's ``on_preempted()`` safe-stop has started (cancel
+    #: path, hand-off or action timeout): a run runs it at most once.
+    _safe_stop_ran: bool = False
+
     def safe_stop_bound_s(self) -> float:
         """Worst-case duration of this action's safe-stop (hook, then any walk)."""
         return self.safe_stop_timeout_s + SAFE_STOP_ABANDON_GRACE_S
@@ -315,8 +318,13 @@ class BaseActionNode(BaseNode):
         the preempting reflex must not be held back by a broken safe-stop.
         An overrunning hook is cancelled; if it has not ended
         ``SAFE_STOP_ABANDON_GRACE_S`` later it is abandoned (left running).
+        A run's hook runs at most once: after an action timeout ran it, the
+        cancel path of the same run does not run it again.
         Returns ``(rolled_back, error)``.
         """
+        if self._safe_stop_ran:
+            return False, None
+        self._safe_stop_ran = True
         hook = asyncio.ensure_future(self.on_preempted(proposal, preempted_by))
         timed_out = False
         try:
@@ -378,7 +386,8 @@ class BaseActionNode(BaseNode):
 
     async def on_timeout(self, proposal: Proposal) -> Result:
         """
-        Called when execute() exceeds timeout_s.
+        Called when execute() exceeds timeout_s, after the run's safe-stop
+        (``on_preempted()`` with a stand-in "timeout" proposal) has run.
         Default: return a failed Result. Override for custom cleanup.
         """
         return Result(
@@ -659,6 +668,7 @@ class MultiStepActionNode(BaseActionNode):
             self._handoff_by          = None
             self._cancel_requested    = False
             self._shutdown_requested  = False
+            self._safe_stop_ran       = False
         self._run_prepared = False
 
         all_steps  = self.steps()
@@ -962,6 +972,34 @@ class MultiStepActionNode(BaseActionNode):
             rolled_back     = rolled_back,
         )
 
+    async def _abort_timed_out(
+        self, proposal: Proposal,
+    ) -> tuple[str | None, bool, RollbackError | None]:
+        """
+        Apply the abort rules to the step the action timeout cut (its
+        safe-stop has run): ``on_aborted()`` — by default the rollback walk
+        under ``InterruptPolicy.ROLLBACK``, nothing otherwise — as for a step
+        that timed out. A run that already walked, or started to, does not
+        walk again. Returns ``(stopped_at_step, rolled_back, walk_error)``.
+        """
+        step = self._current_step
+        rolled_back = False
+        walk_error: RollbackError | None = None
+        if step is not None and self._walk is None:
+            self._walk = "running"  # see _handle_interrupt
+            try:
+                rolled_back = await self.on_aborted(
+                    self._completed_steps.copy(), step, proposal,
+                )
+            except RollbackError as exc:
+                walk_error = exc
+            if rolled_back or walk_error is not None:
+                self._end_walk(walk_error)
+            else:
+                self._walk = None  # on_aborted() undid nothing
+        self._current_step = None
+        return (step.name if step is not None else None), rolled_back, walk_error
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # ActionMasterNode
@@ -996,6 +1034,16 @@ _SHUTDOWN_PROPOSAL = Proposal(
     priority    = 9999,
     urgency     = 1.0,
     rationale   = "Runtime shutdown cancelled the action",
+)
+
+# Stand-in "preempting" proposal handed to on_preempted() when the action
+# exceeded its timeout_s: the timeout cancels the run like any other stop.
+_TIMEOUT_PROPOSAL = Proposal(
+    instinct_id = "timeout",
+    action_id   = "__timeout__",
+    priority    = 9999,
+    urgency     = 1.0,
+    rationale   = "The action exceeded its timeout_s",
 )
 
 
@@ -1201,29 +1249,34 @@ class ActionMasterNode(FaultReportingMixin, BaseNode):
         action_id: str | None = None,
     ) -> None:
         """
-        Signal a running action to stop at its next safe point (deliberative
+        Signal a running action to stop at its next stop point (deliberative
         interrupt). If ``action_id`` is None, targets
         ``request.target_action_id`` or else the highest-priority running
-        action. Raises ``MandatoryBlockViolation`` inside a mandatory block —
-        deliberation never cuts into one.
+        action.
+
+        A request is never refused, only deferred (ADR 0009): inside a
+        mandatory block it is latched on the action and honoured at the first
+        stop point after the block, under the action's ``InterruptPolicy`` —
+        deliberation never cuts into a block. A single-step action cannot be
+        interrupted; the request is a no-op for it.
         """
         target = action_id or request.target_action_id
         node = self._running_nodes.get(target) if target is not None else self.current_action()
         if node is None:
             return
-        if not self.is_interruptible(node.node_id):
-            step = self.current_step(node.node_id)
-            raise MandatoryBlockViolation(
-                node.node_id,
-                step.name if step is not None else "unknown",
-            )
         if isinstance(node, MultiStepActionNode):
+            if not node.is_interruptible():
+                self.logger.debug(
+                    "Interrupt held until the mandatory block ends",
+                    action_id=node.node_id,
+                    step=node._current_step.name if node._current_step else None,
+                )
             node.request_interrupt(request)
 
     def interrupt_all(self, request: InterruptRequest) -> None:
         """
-        Deliver ``request`` to every running multi-step action, bypassing the
-        mandatory-block gate: the flag is held until the block ends. Used by
+        Deliver ``request`` to every running multi-step action (as
+        ``request_interrupt()``: held through a mandatory block). Used by
         graceful shutdown so ROLLBACK actions stop at a boundary and unwind.
         """
         for node in self._running_nodes.values():
@@ -1505,6 +1558,7 @@ class ActionMasterNode(FaultReportingMixin, BaseNode):
         node._cancel_requested = False
         node._shutdown_requested = False
         node._master_cancels = 0
+        node._safe_stop_ran = False
         if isinstance(node, MultiStepActionNode):
             node._prepare_run()
         self._idle.clear()
@@ -1594,6 +1648,7 @@ class ActionMasterNode(FaultReportingMixin, BaseNode):
                     stopped_at_step = stopped_at,
                     step_results    = step_results,
                     rolled_back     = rolled_back,
+                    cancelled       = True,
                 )
             if isinstance(node, MultiStepActionNode) and node._handoff_by is not None:
                 # WAIT_FOR_BLOCK hand-off at a step boundary: the safe-stop
@@ -1632,6 +1687,7 @@ class ActionMasterNode(FaultReportingMixin, BaseNode):
                 step_results    = result.step_results,
                 rolled_back     = result.rolled_back,
                 preempted       = result.preempted,
+                cancelled       = result.cancelled,
             )
         finally:
             self._live_runs.discard(run_token)
@@ -1726,6 +1782,7 @@ class ActionMasterNode(FaultReportingMixin, BaseNode):
                 success     = False,
                 interrupted = True,
                 preempted   = preempted,
+                cancelled   = True,
             )
             if buffered:
                 self._buffer_result(result)
@@ -2016,8 +2073,10 @@ class ActionMasterNode(FaultReportingMixin, BaseNode):
                     attempt=attempt + 1,
                     max_attempts=attempts,
                 )
+                node._safe_stop_ran = False
                 if isinstance(node, MultiStepActionNode):
                     node._prepare_run()  # a fresh, still master-managed run
+            timed_out_in_block = False
             try:
                 result = await _within(
                     node.execute(proposal),
@@ -2028,6 +2087,9 @@ class ActionMasterNode(FaultReportingMixin, BaseNode):
                 # Note: ``asyncio.TimeoutError`` is aliased to the builtin
                 # ``TimeoutError`` only on Python >= 3.11. On 3.10 the two are
                 # distinct classes, so catch the asyncio one explicitly.
+                timed_out_in_block = (
+                    isinstance(node, MultiStepActionNode) and not node.is_interruptible()
+                )
                 result = await self._timed_out(node, proposal)
             except Exception as exc:  # noqa: BLE001
                 # Spec contract: execute() must always return a Result, never
@@ -2054,13 +2116,15 @@ class ActionMasterNode(FaultReportingMixin, BaseNode):
                 raise asyncio.CancelledError()
             last_result = result
             # Never retry an interrupted/preempted run (the stop was requested,
-            # not a fault) or a failed or unfinished rollback walk (e.g. one
-            # the action timeout cut): the plant is in an unknown partial
-            # state, and re-running from step 1 could compound it.
+            # not a fault), a failed or unfinished rollback walk (e.g. one
+            # the action timeout cut), or a run the timeout cut inside a
+            # mandatory block: the plant is in an unknown partial state, and
+            # re-running from step 1 could compound it.
             if (
                 result.success
                 or result.interrupted
                 or result.preempted
+                or timed_out_in_block
                 or isinstance(result.error, RollbackError)
                 or (isinstance(node, MultiStepActionNode) and node.walk_cut_short())
             ):
@@ -2069,6 +2133,65 @@ class ActionMasterNode(FaultReportingMixin, BaseNode):
         return last_result  # type: ignore[return-value]
 
     async def _timed_out(self, node: BaseActionNode, proposal: Proposal) -> Result:
+        """
+        The action timeout cut ``execute()`` at its current await: a
+        cancellation of the run like any other (ADR 0009).
+
+        1. The run's safe-stop runs first: ``on_preempted()`` with the
+           stand-in "timeout" proposal, shielded and bounded by
+           ``safe_stop_timeout_s`` as for preemption, without the
+           ``rollback_on_preempt`` walk (that one is for reflex preemption).
+           A cancel arriving meanwhile ends the run through the cancel path,
+           which does not run the hook again.
+        2. A multi-step run then follows the abort rules for the step that
+           was cut, as a step timeout does: ``on_aborted()`` (by default the
+           rollback walk under ``InterruptPolicy.ROLLBACK`` only).
+        3. ``on_timeout()`` supplies the Result (a raising override becomes a
+           failed one). A multi-step Result keeps ``step_results``,
+           ``stopped_at_step`` and ``rolled_back``; ``cancelled`` is True.
+
+        The caller never retries a run the timeout cut inside a mandatory
+        block.
+        """
+        self.logger.warning(
+            "Action timed out; running its safe-stop",
+            action_id=node.node_id,
+            timeout_s=node.timeout_s,
+        )
+        (_, stop_error), absorbed = await _run_shielded(
+            node._run_safe_stop(proposal, _TIMEOUT_PROPOSAL, allow_rollback=False),
+            if_cancelled=lambda: (False, self._safe_stop_cancelled(node)),
+        )
+        if absorbed:
+            # A preemption, cancel() or shutdown (or a foreign cancel) arrived
+            # during the safe-stop: the cancel path ends the run.
+            raise asyncio.CancelledError()
+        stopped_at: str | None = None
+        rolled_back = False
+        walk_error: RollbackError | None = None
+        if isinstance(node, MultiStepActionNode):
+            stopped_at, rolled_back, walk_error = await node._abort_timed_out(proposal)
+        result = await self._on_timeout_result(node, proposal)
+        step_results = (
+            node._completed_steps.copy()
+            if isinstance(node, MultiStepActionNode)
+            else result.step_results
+        )
+        return Result(
+            action_id       = result.action_id,
+            success         = result.success,
+            output          = result.output,
+            error           = walk_error or result.error or stop_error,
+            duration_s      = result.duration_s,
+            interrupted     = result.interrupted,
+            stopped_at_step = stopped_at or result.stopped_at_step,
+            step_results    = step_results,
+            rolled_back     = rolled_back or result.rolled_back,
+            preempted       = result.preempted,
+            cancelled       = True,
+        )
+
+    async def _on_timeout_result(self, node: BaseActionNode, proposal: Proposal) -> Result:
         """``on_timeout()``, with a raising override turned into a failed Result."""
         try:
             return await node.on_timeout(proposal)

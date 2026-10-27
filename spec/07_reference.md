@@ -16,7 +16,7 @@ A subscriber raised during publish\(\)\.
 
 __NodeRegistrationError__
 
-Duplicate node\_id registered to a master node\.
+Duplicate node\_id registered to a master node\. InstinctMasterNode checks normal and reflex instincts against one namespace\.
 
 __ActionTimeoutError__
 
@@ -68,7 +68,7 @@ One or more rollback callables raised during a rollback walk \(on\_interrupted\(
 
 __MandatoryBlockViolation__
 
-Raised by ActionMasterNode\.request\_interrupt\(\) when a deliberative interrupt targets an action inside a mandatory completion block\. Only a ReflexPreemption\.PREEMPT reflex or emergency\_stop\(\) can cut into a block \(§17\.5\)\.
+No longer raised by the framework: since ADR 0009 ``ActionMasterNode\.request\_interrupt\(\)`` latches a deliberative interrupt that targets an action inside a mandatory completion block and the action honours it at the first stop point after the block\. Kept, and exported, for compatibility\. Only a ReflexPreemption\.PREEMPT reflex, a cancellation \(``cancel\(\)``, shutdown, ``emergency\_stop\(\)``\) or the action timeout can cut into a block \(§17\.5\)\.
 
 __StepAbortError__
 

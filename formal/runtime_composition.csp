@@ -9,7 +9,7 @@
 -- isolation).  Model derived from the v0.13 source:
 --   MultiStepActionNode.execute / check_interrupt / on_interrupted /
 --     _run_safe_stop / _handle_reflex_preempt
---   ActionMasterNode.request_interrupt (MandatoryBlockViolation gate),
+--   ActionMasterNode.request_interrupt (gate; latches inside a block, ADR 0009),
 --     interrupt_all, launch, launch_reflex, _preempt, _admit_armed
 --   ArachniteRuntime.emergency_stop, ArachniteRuntime.tick
 --
@@ -102,7 +102,7 @@ ENV(p, m, rb, is, done, pnd, rp, ins) =
       BACK(np, nrp) = if ins then INSTEP(p, m, rb, is, done, np, nrp)
                       else EXEC(p, m, rb, is, done, np, nrp)
   within
-     (if Interruptible(cur) then reqA -> BACK(true, rp) else reqR -> BACK(pnd, rp))
+     (if Interruptible(cur) then reqA -> BACK(true, rp) else reqR -> BACK(true, rp))
   [] sreq -> BACK(true, rp)
   [] estop -> ESTOP
   [] rlaunch_dedup -> BACK(pnd, rp)
@@ -174,9 +174,9 @@ ATOMIC = ([] i : STEPS @ begin.i ->
 INMAND(i) = end_.i -> ATOMIC [] estop -> ATOMIC
             [] ([] x : diff(Events, {| end_, estop, ack, roll, bail |}) @ x -> INMAND(i))
 
--- 6. no spurious interrupt: ack/roll/bail only after reqA or sreq
-COLD = ([] x : diff(Events, {| ack, roll, bail, reqA, sreq |}) @ x -> COLD)
-       [] reqA -> ARMED [] sreq -> ARMED [] SKIP
+-- 6. no spurious interrupt: ack/roll/bail only after reqA, reqR or sreq
+COLD = ([] x : diff(Events, {| ack, roll, bail, reqA, reqR, sreq |}) @ x -> COLD)
+       [] reqA -> ARMED [] reqR -> ARMED [] sreq -> ARMED [] SKIP
 ARMED = ([] x : diff(Events, {| dispatch |}) @ x -> ARMED)
         [] dispatch -> COLD [] SKIP
 

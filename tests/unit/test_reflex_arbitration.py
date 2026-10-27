@@ -2088,3 +2088,179 @@ class TestFourthReviewRegressions:
         other = rt._action_master.get_node("Other")
         assert isinstance(other, _SlowTeardown)
         assert other.torn_down is True
+
+
+# ── Sixth review: action timeout and latched deliberative interrupts ─────────
+
+
+class _TimedPick(MultiStepActionNode):
+    """Approach, a two-step mandatory block, move; one step hangs until cut."""
+
+    node_id          = "TimedPick"
+    resources        = frozenset({"arm"})
+    interrupt_policy = InterruptPolicy.ROLLBACK
+    timeout_s        = 0.3
+    max_retries      = 1
+
+    def __init__(self, bus: SignalBus, hang_in: str | None) -> None:
+        super().__init__(bus)
+        self.log: list[str] = []
+        self.hang_in = hang_in
+        self.brake_s = 0.0
+        self.safe_stop_timeout_s = 1.0
+        self.go: dict[str, asyncio.Event] = {}
+
+    async def _undo(self, name: str) -> None:
+        self.log.append(f"undo {name}")
+
+    async def _undo_lower(self) -> None:
+        await self._undo("lower")
+
+    async def _undo_close(self) -> None:
+        await self._undo("close")
+
+    def steps(self) -> list[ActionStep]:
+        return [
+            ActionStep("approach", interruptible=True, timeout_s=5.0),
+            ActionStep("lower", interruptible=False, timeout_s=5.0, rollback=self._undo_lower),
+            ActionStep("close", interruptible=False, timeout_s=5.0, rollback=self._undo_close),
+            ActionStep("move", interruptible=True, timeout_s=5.0),
+        ]
+
+    async def execute_step(
+        self, step: ActionStep, proposal: Proposal, completed: list[StepResult],
+    ) -> StepResult:
+        self.log.append(f"do {step.name}")
+        if step.name == self.hang_in:
+            await asyncio.Event().wait()
+        gate = self.go.get(step.name)
+        if gate is not None:
+            await gate.wait()
+        await asyncio.sleep(0)
+        return StepResult(step_name=step.name, success=True)
+
+    async def on_preempted(self, proposal: Proposal, preempted_by: Proposal) -> None:
+        self.log.append(f"brake ({preempted_by.instinct_id})")
+        await asyncio.sleep(self.brake_s)
+        self.log.append("brake end")
+
+
+class _HangingSingle(BaseActionNode):
+    node_id     = "HangingSingle"
+    resources   = frozenset({"arm"})
+    timeout_s   = 0.1
+
+    def __init__(self, bus: SignalBus) -> None:
+        super().__init__(bus)
+        self.log: list[str] = []
+
+    async def execute(self, proposal: Proposal) -> Result:
+        self.log.append("execute")
+        await asyncio.Event().wait()
+        return Result(action_id=self.node_id, success=True)
+
+    async def on_preempted(self, proposal: Proposal, preempted_by: Proposal) -> None:
+        self.log.append(f"brake ({preempted_by.instinct_id})")
+
+    async def on_timeout(self, proposal: Proposal) -> Result:
+        self.log.append("on_timeout")
+        return await super().on_timeout(proposal)
+
+
+class TestSixthReviewRegressions:
+    @pytest.mark.asyncio
+    async def test_action_timeout_in_a_block_runs_safe_stop_and_is_not_retried(self) -> None:
+        """R6-F5: a timeout inside a block runs the safe-stop, keeps the steps, no retry"""
+        am = ActionMasterNode(bus=SignalBus())
+        pick = _TimedPick(am.bus, hang_in="close")
+        am.register(pick)
+        result = await am.dispatch(_p("TimedPick"))
+        # Safe-stop first, then the ROLLBACK abort walk of the completed block
+        # step; the run is not re-run from step 1.
+        assert pick.log == [
+            "do approach", "do lower", "do close",
+            "brake (timeout)", "brake end", "undo lower",
+        ]
+        assert result.success is False
+        assert isinstance(result.error, ActionTimeoutError)
+        assert result.cancelled is True
+        assert result.interrupted is False
+        assert result.stopped_at_step == "close"
+        assert [s.step_name for s in result.step_results] == ["approach", "lower"]
+        assert result.rolled_back is True
+
+    @pytest.mark.asyncio
+    async def test_action_timeout_outside_a_block_brakes_each_attempt_then_retries(self) -> None:
+        """R6-F5: outside a block the timed-out run safe-stops, then the retry budget applies"""
+        am = ActionMasterNode(bus=SignalBus())
+        pick = _TimedPick(am.bus, hang_in="approach")
+        pick.interrupt_policy = InterruptPolicy.ALWAYS
+        am.register(pick)
+        result = await am.dispatch(_p("TimedPick"))
+        assert pick.log == [
+            "do approach", "brake (timeout)", "brake end",
+            "do approach", "brake (timeout)", "brake end",
+        ]
+        assert result.cancelled is True
+        assert result.stopped_at_step == "approach"
+        assert result.rolled_back is False
+
+    @pytest.mark.asyncio
+    async def test_single_step_timeout_runs_safe_stop_then_on_timeout(self) -> None:
+        """R6-F5: a single-step action's timeout runs on_preempted(), then on_timeout() as before"""
+        am = ActionMasterNode(bus=SignalBus())
+        node = _HangingSingle(am.bus)
+        am.register(node)
+        am.launch(_p("HangingSingle"))
+        assert await am.wait_idle(2.0)
+        result = _results_by_id(am)["HangingSingle"]
+        assert node.log == ["execute", "brake (timeout)", "on_timeout"]
+        assert isinstance(result.error, ActionTimeoutError)
+        assert result.cancelled is True
+
+    @pytest.mark.asyncio
+    async def test_preemption_during_the_timeout_safe_stop_runs_the_hook_once(self) -> None:
+        """R6-F5: a reflex during the timeout safe-stop waits for it; one hook, no retry"""
+        am = ActionMasterNode(bus=SignalBus())
+        pick = _TimedPick(am.bus, hang_in="close")
+        pick.brake_s = 0.2
+        am.register(pick)
+        log = pick.log
+        _gated(am, "Retract", {"arm"}, hold=False, log=log)
+        am.launch(_p("TimedPick"))
+        await _until(lambda: "brake (timeout)" in log)
+        assert am.launch_reflex(_p("Retract", 250)).status is LaunchStatus.ARMED
+        assert await am.wait_idle(3.0)
+        results = _results_by_id(am)
+        assert log.count("brake (timeout)") == 1
+        assert not any(e.startswith("brake (inst)") for e in log)
+        assert log.index("brake end") < log.index("Retract")
+        assert "undo lower" not in log            # preempted: no rollback_on_preempt walk
+        assert log.count("do approach") == 1
+        assert results["TimedPick"].preempted is True
+        assert results["TimedPick"].stopped_at_step == "close"
+
+    @pytest.mark.asyncio
+    async def test_interrupt_inside_a_block_is_latched_and_honoured_after_it(self) -> None:
+        """R6-F6: a deliberative interrupt in a block is held, then honoured at the next stop"""
+        am = ActionMasterNode(bus=SignalBus())
+        pick = _TimedPick(am.bus, hang_in=None)
+        pick.timeout_s = 10.0
+        pick.go = {"close": asyncio.Event()}
+        am.register(pick)
+        am.launch(_p("TimedPick"))
+        await _until(lambda: pick.log[-1:] == ["do close"])
+        request = InterruptRequest(
+            new_proposal=_p("Abort", 150), requesting_instinct_id="inst",
+            target_action_id="TimedPick",
+        )
+        await am.request_interrupt(request)       # inside the block: latched, never refused
+        assert pick._interrupt_requested is True
+        pick.go["close"].set()
+        assert await am.wait_idle(2.0)
+        result = _results_by_id(am)["TimedPick"]
+        assert "do move" not in pick.log
+        assert result.interrupted is True
+        assert result.stopped_at_step == "move"
+        assert [s.step_name for s in result.step_results] == ["approach", "lower", "close"]
+        assert pick.log[-2:] == ["undo close", "undo lower"]

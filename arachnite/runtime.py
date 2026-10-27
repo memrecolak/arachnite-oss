@@ -17,10 +17,7 @@ from typing import Protocol, runtime_checkable
 
 from arachnite.bus import SignalBus
 from arachnite.context import ContextNode
-from arachnite.exceptions import (
-    MandatoryBlockViolation,
-    ReflexConflictError,
-)
+from arachnite.exceptions import ReflexConflictError
 from arachnite.health import HealthMonitor
 from arachnite.logging import BaseLogSink, LogLevel, StdoutLogSink, StructuredLogger
 from arachnite.models import (
@@ -58,6 +55,13 @@ from arachnite.supervisor import NodeSupervisor
 # runtime's live tokens: a task that outlives that work is no longer inside.
 _RUNTIME_CONTEXT: contextvars.ContextVar[object | None] = contextvars.ContextVar(
     "arachnite_runtime_context", default=None,
+)
+
+# Event-lane evaluations whose code runs in this context, as (token, reflex
+# node_ids) frames. A frame counts only while its token is in the runtime's
+# live set, so a task that outlives the evaluation is no longer "inside" it.
+_LANE_FRAMES: contextvars.ContextVar[tuple[tuple[object, frozenset[str]], ...]] = (
+    contextvars.ContextVar("arachnite_lane_frames", default=())
 )
 
 # Event-lane launch outcomes kept for monitor_state() between ticks (the lane
@@ -127,8 +131,9 @@ class ArachniteRuntime:
     1b. Inject buffered supervisor + node_fault signals captured since the
         previous tick (a node raising during tick N surfaces here on tick N+1)
     2. ContextNode.update(signals, results) → context
-    3. InstinctMasterNode.evaluate_reflexes(ctx) → reflex proposals
-       └─ launch_reflex() each (bypass decision; preempt per ReflexPreemption)
+    3. InstinctMasterNode.evaluate_reflex_pairs(ctx) → (reflex, proposal)
+       └─ launch_reflex() each (bypass decision; preempt per the reflex
+          node's ReflexPreemption)
     4. InstinctMasterNode.evaluate_all(ctx) → normal proposals
     5. DecisionMasterNode.on_new_proposals_many() → proposals + interrupts
     6. ActionMasterNode.launch(chosen)    → tasks (blocked ones parked)
@@ -320,6 +325,8 @@ class ArachniteRuntime:
         self._lane_kinds: set[str] = set()
         # (source, kind) -> (latest signal, monotonic receipt time)
         self._lane_latest: dict[tuple[str, str], tuple[Signal, float]] = {}
+        # Frame tokens of the event-lane evaluations in progress (_LANE_FRAMES).
+        self._lane_live: set[object] = set()
 
         # Observations for monitor_state(): reflex launch outcomes (tick
         # stage and event lane) since the last completed tick, and facts
@@ -1023,10 +1030,22 @@ class ArachniteRuntime:
             return
         generation = self._generation
         now = time.perf_counter()
+        # Kept as the latest even when no reflex is evaluated for it now, so
+        # a later evaluation within the TTL still sees it.
         self._lane_latest[(signal.source, signal.kind)] = (signal, now)
+        frames = _LANE_FRAMES.get()
+        busy = {
+            node_id
+            for token, node_ids in frames if token in self._lane_live
+            for node_id in node_ids
+        } if frames else set()
+        # A reflex is not re-evaluated by a signal published during its own
+        # evaluation (e.g. the node_fault of a reflex that raised): that
+        # would recurse without bound.
         nodes = [
             n for n in self._lane_nodes()
             if n.enabled and signal.kind in (n.trigger_on_signals or ())
+            and n.node_id not in busy
         ]
         if not nodes:
             return
@@ -1038,9 +1057,14 @@ class ArachniteRuntime:
             if kind in kinds and now - received <= self._reflex_signal_ttl_s
         ]
         ctx = self._context.reflex_view(fresh)
+        frame = object()
+        self._lane_live.add(frame)
+        frames_token = _LANE_FRAMES.set(
+            (*frames, (frame, frozenset(n.node_id for n in nodes))),
+        )
         try:
-            proposals = await asyncio.wait_for(
-                self._instinct_master.evaluate_reflexes(ctx, nodes=nodes),
+            fired = await asyncio.wait_for(
+                self._instinct_master.evaluate_reflex_pairs(ctx, nodes=nodes),
                 timeout=self._reflex_eval_timeout_s,
             )
         except ReflexConflictError as exc:
@@ -1049,7 +1073,7 @@ class ArachniteRuntime:
                 priority=exc.priority,
                 instinct_ids=exc.node_ids,
             )
-            proposals = list(exc.proposals)
+            fired = list(exc.fired)
         except asyncio.TimeoutError:
             self._logger.error(
                 "Event-lane reflex evaluation timed out",
@@ -1065,14 +1089,20 @@ class ArachniteRuntime:
                 error_type=type(exc).__name__,
             )
             return
+        finally:
+            _LANE_FRAMES.reset(frames_token)
+            self._lane_live.discard(frame)
         if not self._lane_active or not self._running or generation != self._generation:
             return  # a stop (and maybe a restart) happened during the evaluation
-        await self._launch_reflexes(proposals)
+        await self._launch_reflexes(fired)
 
-    async def _launch_reflexes(self, reflex_proposals: list[Proposal]) -> None:
+    async def _launch_reflexes(
+        self, fired: list[tuple[BaseReflexInstinctNode, Proposal]],
+    ) -> None:
         """
         Launch reflex proposals (priority order) through the action master's
-        arbitration, then yield a few loop turns so a started reflex action
+        arbitration, each with the ``preemption`` mode of the reflex node that
+        produced it, then yield a few loop turns so a started reflex action
         enters ``execute()``, and a preempted owner starts its safe-stop
         (which runs in a shielded inner task), now rather than after the rest
         of the tick.
@@ -1083,7 +1113,7 @@ class ArachniteRuntime:
         claimed, before deliberation; only the stage it is charged to differs.
         """
         started = False
-        for rp in reflex_proposals:
+        for node, rp in fired:
             # Emit a framework-level "Reflex fired" event so safety auditors
             # can reconstruct every reflex-arc activation from the log stream
             # alone (spec §13.3). This is INFO-level and low-volume because
@@ -1091,11 +1121,13 @@ class ArachniteRuntime:
             self._logger.info(
                 "Reflex fired",
                 instinct_id=rp.instinct_id,
+                reflex_node_id=node.node_id,
                 action_id=rp.action_id,
                 priority=rp.priority,
                 urgency=rp.urgency,
             )
-            node = self._instinct_master.get_node(rp.instinct_id)
+            # A node registered as a reflex through ``reflex = True`` without
+            # extending BaseReflexInstinctNode has no mode: PREEMPT (default).
             preemption = (
                 node.preemption
                 if isinstance(node, BaseReflexInstinctNode)
@@ -1189,8 +1221,19 @@ class ArachniteRuntime:
         )
 
     def _stopped_inside_block(self, result: Result) -> bool:
-        """True if a non-preempted interrupt stopped the action inside a block."""
-        if not result.interrupted or result.preempted or result.stopped_at_step is None:
+        """
+        True if a deliberative interrupt stopped the action strictly inside a
+        mandatory block. A cancellation (``Result.cancelled``: reflex PREEMPT,
+        cancel(), shutdown, emergency stop, action timeout) and a reflex
+        hand-off (``preempted``) are the declared ways into a block, not
+        violations.
+        """
+        if (
+            not result.interrupted
+            or result.cancelled
+            or result.preempted
+            or result.stopped_at_step is None
+        ):
             return False
         node = self._action_master.get_node(result.action_id)
         if not isinstance(node, MultiStepActionNode):
@@ -1419,7 +1462,7 @@ class ArachniteRuntime:
         #    awaited, and take their resources from running owners per the
         #    reflex's preemption mode (ADR 0005). Charged to `reflex`.
         try:
-            reflex_proposals = await self._instinct_master.evaluate_reflexes(
+            fired = await self._instinct_master.evaluate_reflex_pairs(
                 ctx, nodes=self._tick_reflex_nodes(),
             )
         except ReflexConflictError as exc:
@@ -1432,8 +1475,8 @@ class ArachniteRuntime:
                 priority=exc.priority,
                 instinct_ids=exc.node_ids,
             )
-            reflex_proposals = list(exc.proposals)
-        await self._launch_reflexes(reflex_proposals)
+            fired = list(exc.fired)
+        await self._launch_reflexes(fired)
 
         if instrumenter is not None:
             now = time.monotonic()
@@ -1450,12 +1493,12 @@ class ArachniteRuntime:
 
         # 5. Decide — build interruptibility map, resolve proposals, notify
         #    rejected, and issue interrupts (all charged to `decide`).
-        # A reflex-owned action is never interruptible by deliberation.
+        # A reflex-owned action is never interruptible by deliberation. A
+        # deliberative owner inside a mandatory block is: the request is
+        # latched on it and honoured at its first stop point after the block
+        # (ADR 0009); the proposal is parked until the owner releases.
         running_interruptible = {
-            aid: (
-                self._action_master.origin_of(aid) != "reflex"
-                and self._action_master.is_interruptible(aid)
-            )
+            aid: self._action_master.origin_of(aid) != "reflex"
             for aid in self._action_master.running_action_ids()
         }
 
@@ -1489,12 +1532,6 @@ class ArachniteRuntime:
             try:
                 await self._action_master.request_interrupt(
                     interrupt_req, action_id=target,
-                )
-            except MandatoryBlockViolation as exc:
-                self._logger.warning(
-                    "Interrupt blocked by mandatory step",
-                    action_id=target,
-                    detail=str(exc),
                 )
             except Exception as exc:  # noqa: BLE001
                 self._logger.error(

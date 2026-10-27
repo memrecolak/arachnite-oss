@@ -8,7 +8,6 @@ from unittest.mock import AsyncMock, patch
 import pytest
 
 from arachnite import ContextNode, SignalBus
-from arachnite.exceptions import MandatoryBlockViolation
 from arachnite.logging import BaseLogSink, LogLevel
 from arachnite.models import Context, InterruptRequest, LogEvent, Proposal, Result, Signal
 from arachnite.nodes.action import ActionMasterNode, BaseActionNode
@@ -236,7 +235,7 @@ class TestRuntimeSignalBus:
         await rt.stop()
 
 
-# ── MandatoryBlockViolation logging ──────────────────────────────────────────
+# ── Interrupt request error logging ──────────────────────────────────────────
 
 
 class CaptureSink(BaseLogSink):
@@ -250,8 +249,11 @@ class CaptureSink(BaseLogSink):
         self.events.append(event)
 
 
-class TestMandatoryBlockViolationLogging:
-    """A-03: MandatoryBlockViolation must be logged, not silently suppressed."""
+class TestInterruptRequestErrorLogging:
+    """A-03: a failing interrupt request must be logged, not silently suppressed.
+
+    (Since R6-F6 request_interrupt() no longer raises MandatoryBlockViolation:
+    inside a block the request is latched, ADR 0009.)"""
 
     @staticmethod
     def _build_runtime_with_sink() -> tuple[
@@ -288,62 +290,8 @@ class TestMandatoryBlockViolationLogging:
         return rt, action_master, decision_master, sink
 
     @pytest.mark.asyncio
-    async def test_mandatory_block_violation_logs_warning(self) -> None:
-        """When request_interrupt raises MandatoryBlockViolation the runtime
-        logs a warning and the tick completes without crashing."""
-        rt, action_master, decision_master, sink = self._build_runtime_with_sink()
-
-        # Craft an interrupt that the runtime will try to issue
-        interrupt = InterruptRequest(
-            new_proposal=Proposal(
-                instinct_id="HighInstinct",
-                action_id="RunningAction",
-                priority=150,
-                urgency=0.9,
-            ),
-            requesting_instinct_id="HighInstinct",
-            reason="higher priority",
-        )
-
-        # Patch decision layer to return the interrupt
-        original_on_new = decision_master.on_new_proposals_many
-
-        async def fake_on_new(*args, **kwargs):  # type: ignore[no-untyped-def]
-            to_dispatch, _ = await original_on_new(*args, **kwargs)
-            return to_dispatch, [interrupt]
-
-        await rt.start()
-
-        with patch.object(decision_master, "on_new_proposals_many", side_effect=fake_on_new), \
-             patch.object(
-                 action_master,
-                 "request_interrupt",
-                 new=AsyncMock(
-                     side_effect=MandatoryBlockViolation("RunningAction", "mandatory_step"),
-                 ),
-             ):
-            await rt.tick()
-
-        # Allow fire-and-forget log tasks to complete
-        await asyncio.sleep(0)
-        await rt.stop()
-
-        # Tick must have completed (no crash)
-        assert rt.tick_count >= 1
-
-        # A warning about the mandatory block must have been logged
-        warnings = [
-            e for e in sink.events
-            if e.level == LogLevel.WARNING
-            and "mandatory" in e.message.lower()
-        ]
-        assert len(warnings) >= 1
-        assert warnings[0].data.get("action_id") == "RunningAction"
-        assert "detail" in warnings[0].data
-
-    @pytest.mark.asyncio
     async def test_generic_interrupt_error_logs_error(self) -> None:
-        """When request_interrupt raises a non-MandatoryBlockViolation exception
+        """When request_interrupt raises an exception
         the runtime logs an error and the tick still completes."""
         rt, action_master, decision_master, sink = self._build_runtime_with_sink()
 

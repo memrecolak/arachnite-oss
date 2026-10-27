@@ -86,11 +86,14 @@ The contract is simple:
 
 - `decide()` is async and gets a list of `Proposal` objects pre-sorted by
   priority (highest first).
-- Return one of them, or `None` to do nothing this tick.
+- Return one of them (the same object), or `None` to start nothing more this tick.
+- The runtime may call `decide()` several times per tick: after each choice the
+  candidates with the same `action_id` are removed and `decide()` is asked again,
+  until it returns `None` or nothing is left. So actions with different
+  `action_id`s — "play sound" and "blink light" — can start in the same tick, in
+  the order your strategy picks them.
 
-You can also override `decide_many()` to return *multiple* proposals when
-you want concurrent action dispatch — useful when "play sound" and "blink
-light" can both happen at once.
+You can also override `decide_many()` for custom multi-select logic.
 
 ## A complete example
 

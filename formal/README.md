@@ -13,7 +13,7 @@ The two-reflex model has the Python checker only.
 |---|---|
 | `interrupt_policies.csp`, `verify_interrupt_policies.py` | The four interrupt policies (ALWAYS, NEVER, CHECKPOINT, ROLLBACK) in isolation, on the five-step harmonised action (steps 1–3 mandatory with rollback, 4–5 interruptible, 5 a checkpoint). |
 | `runtime_composition.csp`, `verify_runtime_composition.py` | The policies composed with the runtime: the `ActionMasterNode` interrupt gate, cooperative mid-step observation points, the graceful-stop request, emergency stop, non-blocking action tasks, and a reflex action that shares one actuator resource with the deliberative action (PREEMPT / WAIT_FOR_BLOCK, `rollback_on_preempt`). |
-| `mutation_check_composition.py` | Discriminative power of the composition checks. It seeds 18 semantic faults into the model and requires each to be rejected by the check designed for it. |
+| `mutation_check_composition.py` | Discriminative power of the composition checks. It seeds 19 semantic faults into the model and requires each to be rejected by the check designed for it. |
 | `verify_two_reflexes.py` | Arbitration with **two** resource-sharing reflexes, one PREEMPT and one WAIT_FOR_BLOCK, at different priorities. The deliberative owner can fail a step and be retried once, can time out, and can be stopped by emergency stop. Armed reflexes can be cancelled. This covers the paths of the 2026-10-26 reflex-path review, which the one-reflex model cannot reach. |
 | `mutation_check_two_reflexes.py` | Re-creates each defect class of that review (R01, R03–R07, R10, R11) as a model fault and requires the check designed for it to reject the fault. |
 
@@ -24,9 +24,10 @@ boundary that is not strictly inside a mandatory block. That includes the
 boundary *before* a block, so a request pending as the block starts stops the
 action there. Boundaries between two mandatory steps are never stop points.
 
-**Gate.** `request_interrupt` refuses while the current step is mandatory
-(`reqR`). The graceful-stop request (`interrupt_all`) bypasses the gate and is
-held through a block.
+**Gate.** `request_interrupt` never refuses. While the current step is
+mandatory the request is latched (`reqR`) and held through the block, to be
+honoured at the first stop point after it (ADR 0009). The graceful-stop
+request (`interrupt_all`) is held the same way.
 
 **Emergency stop.** Cancels the action at its current await, runs the
 safe-stop, and never rolls back.

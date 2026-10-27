@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import sys
 import time
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 
 import pytest
 
@@ -720,3 +720,319 @@ class TestReviewRegressionsRuntime:
             await rt.wait_idle(1.0)
         await rt.stop()
         assert log.count("execute Act") == 3
+
+
+# ── Sixth review ──────────────────────────────────────────────────────────────
+
+
+class _GatedPick(MultiStepActionNode):
+    """ROLLBACK pick with a three-step mandatory block; every step waits for the test."""
+
+    node_id = "Pick"
+    resources = frozenset({"arm"})
+    interrupt_policy = InterruptPolicy.ROLLBACK
+    timeout_s = 10.0
+    STEPS = (("approach", True), ("lower", False), ("close", False),
+             ("raise", False), ("move", True), ("release", True))
+
+    def __init__(self, bus: SignalBus, log: list[str]) -> None:
+        super().__init__(bus)
+        self.log = log
+        self.go = {name: asyncio.Event() for name, _ in self.STEPS}
+
+    def _undo(self, name: str) -> Callable[[], Awaitable[None]]:
+        async def undo() -> None:
+            self.log.append(f"undo {name}")
+        return undo
+
+    def steps(self) -> list[ActionStep]:
+        return [
+            ActionStep(name, interruptible=inter,
+                       rollback=None if inter else self._undo(name))
+            for name, inter in self.STEPS
+        ]
+
+    async def execute_step(
+        self, step: ActionStep, proposal: Proposal, completed: list[StepResult],
+    ) -> StepResult:
+        self.log.append(step.name)
+        await self.go[step.name].wait()
+        return StepResult(step_name=step.name, success=True)
+
+
+class _Logged(BaseActionNode):
+    def __init__(self, bus: SignalBus, node_id: str, log: list[str],
+                 resources: frozenset[str] = frozenset({"arm"})) -> None:
+        self.node_id = node_id  # type: ignore[misc]
+        self.resources = resources  # type: ignore[misc]
+        super().__init__(bus)
+        self.log = log
+
+    async def execute(self, proposal: Proposal) -> Result:
+        self.log.append(f"RAN {self.node_id}")
+        return Result(action_id=self.node_id, success=True)
+
+
+class _OneShotInstinct(BaseInstinctNode):
+    """Proposes ``action_id`` once each time ``fire`` is set (persist=False)."""
+
+    def __init__(self, bus: SignalBus, node_id: str, action_id: str, priority: int) -> None:
+        self.node_id = node_id  # type: ignore[misc]
+        super().__init__(bus)
+        self.priority = priority
+        self.action_id = action_id
+        self.fire = False
+
+    async def evaluate(self, ctx: Context) -> Proposal | None:
+        if not self.fire:
+            return None
+        self.fire = False
+        return Proposal(instinct_id=self.node_id, action_id=self.action_id,
+                        priority=self.priority, urgency=0.5)
+
+
+class _MismatchedWaitReflex(BaseReflexInstinctNode):
+    """Tick-stage WAIT_FOR_BLOCK reflex; its Proposal.instinct_id is not its node_id."""
+
+    node_id = "Guard"
+    priority = 250
+    preemption = ReflexPreemption.WAIT_FOR_BLOCK
+
+    def __init__(self, bus: SignalBus) -> None:
+        super().__init__(bus)
+        self.armed = False
+
+    async def evaluate(self, ctx: Context) -> Proposal | None:
+        if not self.armed:
+            return None
+        self.armed = False
+        return Proposal(instinct_id="guard-reflex", action_id="Brace",
+                        priority=self.priority, urgency=1.0)
+
+
+class _BlockPair(MultiStepActionNode):
+    """grip + raise: one mandatory block, then swing; steps wait for the test."""
+
+    node_id = "Lift"
+    resources = frozenset({"arm"})
+    interrupt_policy = InterruptPolicy.ALWAYS
+    timeout_s = 10.0
+
+    def __init__(self, bus: SignalBus) -> None:
+        super().__init__(bus)
+        self.go = {name: asyncio.Event() for name in ("grip", "raise", "swing")}
+        self.log: list[str] = []
+
+    def steps(self) -> list[ActionStep]:
+        return [
+            ActionStep("grip", interruptible=False),
+            ActionStep("raise", interruptible=False),
+            ActionStep("swing", interruptible=True),
+        ]
+
+    async def execute_step(
+        self, step: ActionStep, proposal: Proposal, completed: list[StepResult],
+    ) -> StepResult:
+        self.log.append(step.name)
+        await self.go[step.name].wait()
+        return StepResult(step_name=step.name, success=True)
+
+
+class _BadHold(MultiStepActionNode):
+    """Fault injection: stops between two mandatory steps (the P2 violation)."""
+
+    node_id = "BadHold"
+    resources = frozenset({"arm"})
+    interrupt_policy = InterruptPolicy.ALWAYS
+
+    def steps(self) -> list[ActionStep]:
+        return [ActionStep("a", interruptible=False), ActionStep("b", interruptible=False)]
+
+    async def execute_step(
+        self, step: ActionStep, proposal: Proposal, completed: list[StepResult],
+    ) -> StepResult:
+        await asyncio.sleep(0)
+        return StepResult(step_name=step.name, success=True)
+
+    async def execute(self, proposal: Proposal) -> Result:
+        steps = self.steps()
+        self._current_step = steps[0]
+        self._completed_steps = [await self.execute_step(steps[0], proposal, [])]
+        self._current_step = steps[1]          # strictly inside the block
+        return await self._handle_interrupt(proposal, [], time.monotonic())
+
+
+class _SloppyReflex(BaseReflexInstinctNode):
+    node_id = "Sloppy"
+    priority = 210
+
+    async def evaluate(self, ctx: Context) -> Proposal | None:
+        return True  # type: ignore[return-value]  # contract violation under test
+
+
+class _SloppyInstinct(BaseInstinctNode):
+    node_id = "SloppyInstinct"
+    priority = 60
+
+    async def evaluate(self, ctx: Context) -> Proposal | None:
+        return {"action_id": "Brake"}  # type: ignore[return-value]  # contract violation
+
+
+class _CollisionReflex(BaseReflexInstinctNode):
+    node_id = "Collision"
+    priority = 250
+
+    async def evaluate(self, ctx: Context) -> Proposal | None:
+        return Proposal(instinct_id=self.node_id, action_id="Brake",
+                        priority=self.priority, urgency=1.0)
+
+
+def _runtime(
+    bus: SignalBus, im: InstinctMasterNode, am: ActionMasterNode,
+) -> ArachniteRuntime:
+    return ArachniteRuntime(
+        sense_master=SenseMasterNode(bus=bus), context=ContextNode(), instinct_master=im,
+        decision_master=DecisionMasterNode(bus=bus, strategy=GreedyDecisionNode(bus=bus)),
+        action_master=am, bus=bus, tick_rate_hz=TICK_HZ,
+    )
+
+
+async def _until_true(predicate: Callable[[], bool], timeout: float = 2.0) -> None:
+    deadline = time.perf_counter() + timeout
+    while not predicate():
+        assert time.perf_counter() < deadline, "condition not reached"
+        await asyncio.sleep(0.002)
+
+
+class TestSixthReviewRegressions:
+    @pytest.mark.asyncio
+    async def test_proposal_arriving_in_a_block_is_held_and_launched_after_it(self) -> None:
+        """R6-F6: a one-shot higher-priority proposal in a block interrupts at its next stop"""
+        log: list[str] = []
+        bus = SignalBus()
+        im = InstinctMasterNode(bus=bus)
+        start = _OneShotInstinct(bus, "StartPick", "Pick", 50)
+        supervisor = _OneShotInstinct(bus, "Supervisor", "Abort", 150)
+        im.register(start)
+        im.register(supervisor)
+        am = ActionMasterNode(bus=bus)
+        pick = _GatedPick(bus, log)
+        am.register(pick)
+        am.register(_Logged(bus, "Abort", log))
+        rt = _runtime(bus, im, am)
+        await rt.start()
+        await rt.pause()
+        try:
+            start.fire = True
+            await rt.tick()
+            pick.go["approach"].set()
+            pick.go["lower"].set()
+            await _until_true(lambda: log[-1:] == ["close"])
+
+            supervisor.fire = True                       # proposes exactly once
+            await rt.tick()
+            assert am.running_action_ids() == {"Pick"}   # deliberation never cuts in
+            assert "Supervisor" in rt._decision_master.handoff_proposals
+
+            pick.go["close"].set()
+            pick.go["raise"].set()
+            await _until_true(lambda: "Pick" not in am.running_action_ids(), timeout=1.0)
+            await rt.tick()                              # the parked proposal starts
+            assert await rt.wait_idle(1.0)
+        finally:
+            for gate in pick.go.values():
+                gate.set()
+            await rt.stop()
+        assert "RAN Abort" in log
+        assert "move" not in log
+        assert log.index("undo lower") < log.index("RAN Abort")
+
+    @pytest.mark.asyncio
+    async def test_tick_reflex_keeps_its_preemption_whatever_its_instinct_id(self) -> None:
+        """R6-F7: a WAIT_FOR_BLOCK reflex keeps its mode when Proposal.instinct_id != node_id"""
+        log: list[str] = []
+        bus = SignalBus()
+        im = InstinctMasterNode(bus=bus)
+        guard = _MismatchedWaitReflex(bus)
+        im.register(guard)
+        am = ActionMasterNode(bus=bus)
+        lift = _BlockPair(bus)
+        am.register(lift)
+        am.register(_Logged(bus, "Brace", log))
+        rt = _runtime(bus, im, am)
+        await rt.start()
+        await rt.pause()
+        try:
+            am.launch(Proposal(instinct_id="op", action_id="Lift", priority=50, urgency=0.5))
+            await _until_true(lambda: lift.log == ["grip"])
+            guard.armed = True
+            await rt.tick()
+            assert am.running_action_ids() == {"Lift"}    # the block is not cut
+            lift.go["grip"].set()
+            lift.go["raise"].set()
+            assert await rt.wait_idle(1.0)
+            results = {r.action_id: r for r in am.drain_completed()}
+        finally:
+            for gate in lift.go.values():
+                gate.set()
+            await rt.stop()
+        assert results["Lift"].preempted is True
+        assert results["Lift"].stopped_at_step == "swing"
+        assert "RAN Brace" in log
+
+    @pytest.mark.asyncio
+    async def test_non_proposal_result_is_the_nodes_fault_not_the_ticks(self) -> None:
+        """R6-F8: a reflex/instinct returning a non-Proposal is reported; siblings still act"""
+        log: list[str] = []
+        bus = SignalBus()
+        im = InstinctMasterNode(bus=bus)
+        im.register(_SloppyReflex(bus))
+        im.register(_CollisionReflex(bus))
+        im.register(_SloppyInstinct(bus))
+        am = ActionMasterNode(bus=bus)
+        am.register(_Logged(bus, "Brake", log, resources=frozenset()))
+        rt = _runtime(bus, im, am)
+        rt._supervisors[1]._restart_delay = 10.0
+        await rt.tick()                                  # must not raise
+        assert await rt.wait_idle(1.0)
+        assert log == ["RAN Brake"]
+        states = rt._supervisors[1].all_states()
+        assert states["Sloppy"].value == "faulted"
+        assert states["SloppyInstinct"].value == "faulted"
+        assert states["Collision"].value != "faulted"
+
+    @pytest.mark.asyncio
+    async def test_mandatory_block_monitor_fires_from_monitor_state(self) -> None:
+        """R6-F10: a deliberative stop inside a block is flagged by MandatoryBlockMonitor"""
+        from arachnite.safety_monitor import SafetyMonitorRegistry
+
+        bus = SignalBus()
+        am = ActionMasterNode(bus=bus)
+        am.register(_BadHold(bus))
+        rt = _runtime(bus, InstinctMasterNode(bus=bus), am)
+        registry = SafetyMonitorRegistry.default(bus)
+        am.launch(Proposal(instinct_id="t", action_id="BadHold", priority=50, urgency=0.5))
+        assert await am.wait_idle(1.0)
+        await rt.tick()
+        violations = await registry.check_all(rt.tick_count, rt.monitor_state())
+        assert [v.property_name for v in violations] == ["mandatory_block_atomicity"]
+
+    @pytest.mark.asyncio
+    async def test_a_cancel_inside_a_block_is_not_a_deliberative_violation(self) -> None:
+        """R6-F10: cancel() (like PREEMPT, emergency stop) cutting a block is not flagged"""
+        bus = SignalBus()
+        am = ActionMasterNode(bus=bus)
+        lift = _BlockPair(bus)
+        am.register(lift)
+        rt = _runtime(bus, InstinctMasterNode(bus=bus), am)
+        am.launch(Proposal(instinct_id="t", action_id="Lift", priority=50, urgency=0.5))
+        lift.go["grip"].set()
+        await _until_true(lambda: lift.log == ["grip", "raise"])
+        await am.cancel("Lift", timeout=1.0)
+        completed = am.drain_completed()
+        assert [(r.stopped_at_step, r.interrupted) for r in completed] == [("raise", True)]
+        for r in completed:
+            am._buffer_result(r)                 # hand it to the tick as usual
+        await rt.tick()
+        assert rt.monitor_state().interrupt_accepted_during_block is False
+        assert completed[0].cancelled is True
