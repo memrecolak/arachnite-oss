@@ -163,22 +163,31 @@ class FaultReportingMixin:
         caller may pair it with its node list.
         """
         dead = self._dead_nodes
-        skipped: set[int] = set()
         if dead:
+            # Rare path: skip the DEAD nodes, keep their result slots (None)
+            # so the caller's positional pairing with its node list holds.
+            live: list[tuple[str, Awaitable[_T]]] = []
+            dead_slots: list[int] = []
             for index, (node_id, aw) in enumerate(calls):
                 if node_id in dead:
-                    skipped.add(index)
+                    dead_slots.append(index)
                     if asyncio.iscoroutine(aw):
                         aw.close()
-        live = [c for i, c in enumerate(calls) if i not in skipped]
-        outcomes = await asyncio.gather(*(aw for _, aw in live), return_exceptions=True)
+                else:
+                    live.append((node_id, aw))
+            results = await self._gather_live(what, live)
+            for index in dead_slots:
+                results.insert(index, None)
+            return results
+        return await self._gather_live(what, calls)
+
+    async def _gather_live(
+        self, what: str, calls: Sequence[tuple[str, Awaitable[_T]]],
+    ) -> list[_T | None]:
+        """``_gather_nodes`` for calls none of which belongs to a DEAD node."""
+        outcomes = await asyncio.gather(*(aw for _, aw in calls), return_exceptions=True)
         results: list[_T | None] = []
-        live_outcomes = iter(zip(live, outcomes, strict=True))
-        for index in range(len(calls)):
-            if index in skipped:
-                results.append(None)
-                continue
-            (node_id, _), outcome = next(live_outcomes)
+        for (node_id, _), outcome in zip(calls, outcomes, strict=True):
             if not isinstance(outcome, BaseException):
                 results.append(outcome)
                 continue

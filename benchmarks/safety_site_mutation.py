@@ -103,7 +103,10 @@ SITES: tuple[Site, ...] = (
                 "arachnite/runtime.py",
                 ("ArachniteRuntime._launch_reflexes", "ArachniteRuntime._on_reflex_signal"),
             ),
-            ("arachnite/nodes/base.py", ("FaultReportingMixin._gather_nodes",)),
+            (
+                "arachnite/nodes/base.py",
+                ("FaultReportingMixin._gather_nodes", "FaultReportingMixin._gather_live"),
+            ),
         ),
         tests=(
             "tests/unit/test_instinct.py",
