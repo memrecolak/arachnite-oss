@@ -110,6 +110,7 @@ SITES: tuple[Site, ...] = (
             "tests/integration/test_reflex_arbitration_runtime.py",
             "tests/integration/test_reflex_event_lane.py",
             "tests/integration/test_shutdown_semantics.py",
+            "tests/unit/test_mutation_gaps_reflex_supervisor.py",
         ),
         note="v0.13 R4: masters isolate node calls (_gather_nodes), so one "
              "node's raise or own CancelledError cannot suppress the reflex stage.",
@@ -121,7 +122,11 @@ SITES: tuple[Site, ...] = (
             ("arachnite/distributed/manifest.py", ("DeploymentManifest.validate",)),
             ("arachnite/distributed/colocation.py", ("validate_colocation",)),
         ),
-        tests=("tests/unit/test_manifest.py", "tests/unit/test_permissions.py"),
+        tests=(
+            "tests/unit/test_manifest.py",
+            "tests/unit/test_permissions.py",
+            "tests/unit/test_mutation_gaps_reflex_supervisor.py",
+        ),
         note="DeploymentManifest.validate() enforces both the co-location "
              "invariant and permission isolation (Table 6 lists it for both), "
              "so its mutants are judged against the union of the two "
@@ -192,7 +197,11 @@ SITES: tuple[Site, ...] = (
                 ),
             ),
         ),
-        tests=("tests/unit/test_supervisor.py", "tests/integration/test_shutdown_semantics.py"),
+        tests=(
+            "tests/unit/test_supervisor.py",
+            "tests/integration/test_shutdown_semantics.py",
+            "tests/unit/test_mutation_gaps_reflex_supervisor.py",
+        ),
     ),
     Site(
         key="permission_isolation",
