@@ -170,6 +170,7 @@ SITES: tuple[Site, ...] = (
         tests=(
             "tests/unit/test_action.py",
             "tests/unit/test_reflex_arbitration.py",
+            "tests/unit/test_mutation_gaps_action_totality.py",
             "tests/integration/test_framework_contracts.py",
         ),
         note="v0.13: actions run as tasks, so execute() is wrapped by the task "
