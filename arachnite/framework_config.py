@@ -28,6 +28,8 @@ Usage::
     rt = ArachniteRuntime(
         ...,
         tick_rate_hz         = cfg.runtime.tick_rate_hz,
+        overrun_warn_pct     = cfg.runtime.overrun_warn_pct,
+        overrun_warn_consecutive = cfg.runtime.overrun_warn_consecutive,
         log_sinks            = log_sinks,
         shutdown_coordinator = cfg.build_shutdown_coordinator(),
     )

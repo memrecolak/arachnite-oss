@@ -46,6 +46,8 @@ Development install from source:
 git clone https://github.com/memrecolak/arachnite-oss.git arachnite
 cd arachnite
 pip install -e ".[all,dev]"
+# The editable install of this pyproject-only package needs pip >= 21.3 (PEP 660); a venv
+# created by an older CPython ships pip 21.2, so run `python -m pip install --upgrade pip` first.
 ```
 
 ## Quick start
