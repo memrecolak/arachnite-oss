@@ -8,7 +8,7 @@ Protocol:
   - 2 InstinctNodes (1 normal + 1 reflex, neither fires)
   - 1 WeightedDecisionNode
   - 1 ActionNode (no-op)
-  - 10,000 warm-up ticks discarded; 10,000 measurement ticks recorded
+  - 1,000 warm-up ticks discarded; 10,000 measurement ticks recorded
   - Metric: wall-clock time of ArachniteRuntime.tick() call
     (excludes asyncio.sleep scheduling overhead from the tick loop)
 

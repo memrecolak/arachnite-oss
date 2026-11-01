@@ -289,7 +289,9 @@ class TestSupervisorRestartTasks:
         await _until_true(lambda: sv.state_of(node_b.node_id) is NodeState.RUNNING)
         assert node_b.setup_count == 1
         assert node_a.setup_count == 0
-        assert sv.restart_task_count == 0
+        # The restart task leaves the registry in its done-callback, one loop turn
+        # after the RUNNING transition; wait for it instead of racing it (flaky on 3.14).
+        await _until_true(lambda: sv.restart_task_count == 0)
 
     @pytest.mark.asyncio
     async def test_scheduled_restart_exhausting_the_budget_ends_quietly(self) -> None:

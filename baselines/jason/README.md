@@ -21,10 +21,10 @@ Mirrors the existing `baselines/py_trees/robot_arm.py` structure: exports a
 1. Install **JDK 11+**. Verify `javac -version` and `java -version`.
 2. Download Jason 3.x from <https://github.com/jason-lang/jason/releases>
    (pick the `jason-bin-3.x.zip` archive).
-3. Unzip somewhere stable, e.g. `~/jason-3.4.0`.
+3. Unzip somewhere stable, e.g. `~/jason-3.3.0`.
 4. Set `JASON_HOME`:
-   - bash: `export JASON_HOME=~/jason-3.4.0`
-   - PowerShell: `$env:JASON_HOME = "$HOME\jason-3.4.0"`
+   - bash: `export JASON_HOME=~/jason-3.3.0`
+   - PowerShell: `$env:JASON_HOME = "$HOME\jason-3.3.0"`
 
 ## Build
 

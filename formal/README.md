@@ -99,7 +99,7 @@ scenario it guards is reachable, so none passes vacuously:
 
 ```bash
 cd formal
-python verify_interrupt_policies.py      # 13 checks
+python verify_interrupt_policies.py      # 12 checks
 python verify_runtime_composition.py     # a few seconds; RESULT: ALL PASS
 python mutation_check_composition.py     # MUTATION RESULT: ALL CAUGHT
 python verify_two_reflexes.py            # under a second; RESULT: ALL PASS

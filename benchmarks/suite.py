@@ -886,8 +886,8 @@ async def run_scalability_extended(n_runs: int) -> dict[str, Any]:
     return {
         "name": "scalability_extended",
         "unit": "mixed",
-        "protocol": "Bus: 10k signals per config; Actions/History: "
-                    "500 warmup, 2000 measurement ticks per run",
+        "protocol": "Bus: 10k signals per config; Actions: 500 warmup; History: "
+                    "depth+100 warmup; 2000 measurement ticks per run",
         "n_runs": n_runs,
         "results": results,
     }

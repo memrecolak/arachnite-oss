@@ -270,7 +270,7 @@ The ContextNode is the working memory of the agent\. It receives all signals fro
 
 class ContextNode\(BaseNode\):
 
-    history\_length: int = 10   \# number of past ticks to retain
+    history\_length: int = 10   \# number of ticks to retain (the current tick included)
 
     def \_\_init\_\_\(
 

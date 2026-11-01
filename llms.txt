@@ -4,7 +4,7 @@
 > Models the nervous system of arachnids: sense → context → reflex → instinct → decide → act.
 > Designed for edge devices (Raspberry Pi, Jetson Nano), laptops, and cloud servers.
 
-Full spec: SPEC.md  |  Examples: examples/  |  Tests: tests/ (1203)
+Full spec: SPEC.md  |  Examples: examples/  |  Tests: tests/ (1646)
 
 ---
 

@@ -20,7 +20,7 @@ produces it). The Context has these fields:
 ```python
 ctx.tick: int                    # current tick number (0, 1, 2, ...)
 ctx.signals: list[Signal]        # this tick's signals (you've used this)
-ctx.history: deque[list[Signal]] # rolling window of past ticks' signals
+ctx.history: deque[list[Signal]] # rolling window of per-tick signal lists (current tick last)
 ctx.state: dict[str, Any]        # persistent key/value store
 ctx.last_result: Result | None   # first of last_results (or None)
 ctx.last_results: list[Result]   # actions that finished since the previous tick, in completion order
@@ -30,8 +30,9 @@ ctx.action_states: list[ActionExecutionState]  # all running multi-step actions 
 
 ## Detecting trends with `ctx.history`
 
-`ctx.history` is a deque (a fixed-size queue) of past signal lists. Each
-entry is the `signals` list from one previous tick. The default size is
+`ctx.history` is a deque (a fixed-size queue) of per-tick signal lists. Each
+entry is the `signals` list of one tick, and the last entry is the current
+tick's `ctx.signals`, so `ctx.history[-2]` is the previous tick. The default size is
 small; you set it when you create the `ContextNode`:
 
 ```python
@@ -223,7 +224,7 @@ class SustainedHeatInstinct(BaseInstinctNode):
         for s in ctx.signals:
             if s.kind == "temperature":
                 recent.append(s.value)
-        for past in list(ctx.history)[-2:]:
+        for past in list(ctx.history)[-3:-1]:   # history ends with the current tick
             for s in past:
                 if s.kind == "temperature":
                     recent.append(s.value)
