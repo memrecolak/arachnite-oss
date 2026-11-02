@@ -103,7 +103,10 @@ class BaseReflexInstinctNode(BaseInstinctNode):
     - Set ``preemption`` to choose what happens when the target action needs a
       resource a running action owns (ADR 0005): PREEMPT (default) cuts in
       even inside a mandatory block via the owner's safe-stop hook;
-      WAIT_FOR_BLOCK lets a running mandatory block finish first.
+      WAIT_FOR_BLOCK lets a running mandatory block finish first. The mode
+      belongs to the node and is read at launch; do not reassign it in
+      evaluate(). For a situation-dependent choice use two reflex nodes with
+      disjoint predicates and distinct target actions.
     - Set ``trigger_on_signals`` to have the event-driven reflex lane
       evaluate this reflex the moment a matching signal arrives
       (``ArachniteRuntime(reflex_mode="event")``).

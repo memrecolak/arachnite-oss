@@ -844,6 +844,19 @@ for example a collision or a person in the workspace, and the owner has a meanin
 safe-stop. Use WAIT_FOR_BLOCK when an interrupted block is itself a hazard, for example
 half-poured material or a weld, and the hazard tolerates the remaining block time.
 
+**Context-dependent modes.** `preemption` belongs to the reflex node and is read when the
+proposal is launched; do not reassign it inside `evaluate()`. A re-fire while the reflex is
+armed is de-duplicated, so its mode cannot change mid-wait. When the right response depends
+on the situation (cut the block for an obstacle, finish it when a person is down beside the
+load), write two reflex nodes with disjoint predicates and distinct target actions, one per
+mode. A higher-priority PREEMPT reflex still cuts a block that a WAIT_FOR_BLOCK reflex is
+armed to wait out, so a waiting response can be escalated.
+
+**Scope of exclusion.** Exclusion covers the commands the framework schedules, in one
+runtime. A cancellation stops the action's coroutine, not a command it handed to a worker
+thread or a device controller; the safe-stop hook must halt such a command. Actions on
+different AgentNodes (or machines sharing a workspace) are not arbitrated against each other.
+
 **Writing a safe-stop.** `on_preempted()` brings actuators to a safe *hold*: brake, freeze
 the joints, keep the grip. It must not undo work, and it must finish within
 `safe_stop_timeout_s`. Hardware calls made through `asyncio.to_thread()` cannot be
