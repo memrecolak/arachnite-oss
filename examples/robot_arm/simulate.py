@@ -35,6 +35,7 @@ import time
 from arachnite import (
     ActionMasterNode,
     ArachniteRuntime,
+    BaseLogSink,
     ContextNode,
     DecisionMasterNode,
     InstinctMasterNode,
@@ -58,6 +59,11 @@ from examples.robot_arm.nodes import (
 )
 
 _RUN_SECONDS = 35.0
+# After _RUN_SECONDS the session drains: it keeps ticking until no action is running and
+# the gripper is empty, so the shutdown never cuts a pick in half (an interrupted pick is
+# rolled back, which opens the gripper and counts as a dropped object). Bounded so a
+# stuck action cannot hold the demo open.
+_DRAIN_MAX_SECONDS = 15.0
 
 
 async def _collide_at(seconds: float) -> None:
@@ -97,7 +103,7 @@ async def _status_printer() -> None:
 
 
 async def main(collide_at: float, collide_in_block: bool, reflex_mode: str) -> None:
-    log_sinks = [StdoutLogSink(level=LogLevel.WARNING)]  # only warnings + errors
+    log_sinks: list[BaseLogSink] = [StdoutLogSink(level=LogLevel.WARNING)]  # only warnings + errors
     bus = SignalBus()
 
     sense_master    = SenseMasterNode(bus=bus)
@@ -136,8 +142,8 @@ async def main(collide_at: float, collide_in_block: bool, reflex_mode: str) -> N
         "inside the mandatory block" if collide_in_block else f"at t={collide_at:.0f} s"
     )
     print("Robot arm simulation -- pick-and-place + collision reflex")
-    print(f"Running for {_RUN_SECONDS:.0f} s at 10 Hz, reflex_mode={reflex_mode}. "
-          f"Collision {scenario}.")
+    print(f"Running for {_RUN_SECONDS:.0f} s at 10 Hz (then until the arm is idle), "
+          f"reflex_mode={reflex_mode}. Collision {scenario}.")
     print("-" * 60)
 
     await rt.start()
@@ -148,6 +154,10 @@ async def main(collide_at: float, collide_in_block: bool, reflex_mode: str) -> N
 
     try:
         await asyncio.sleep(_RUN_SECONDS)
+        loop = asyncio.get_running_loop()
+        drain_until = loop.time() + _DRAIN_MAX_SECONDS
+        while (action_master.running_action_ids() or SIM.holding) and loop.time() < drain_until:
+            await asyncio.sleep(0.05)
     finally:
         await rt.stop()
         for task in tasks:
