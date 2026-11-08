@@ -193,7 +193,6 @@ from typing import Any
 
 from benchmarks.stats import (
     DescriptiveStats,
-    bootstrap_ci,
     format_stats_table,
     percentile,
 )
