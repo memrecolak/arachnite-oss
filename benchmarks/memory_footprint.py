@@ -327,7 +327,13 @@ def _summarise_readings(
     readings: list[float], description: str,
 ) -> dict[str, Any]:
     from benchmarks.stats import bootstrap_ci
-    ci_lo, ci_hi = bootstrap_ci(readings)
+    # ci_lower/ci_upper is the 95 % bootstrap CI of the *median* (seed 42,
+    # percentile method), matching the central-tendency column reported in
+    # the paper and the other suite benchmarks; the mean's CI is kept in
+    # ci_mean_lower/ci_mean_upper. Before 2026-11-08 ci_lower/ci_upper held
+    # the mean's CI while the reported brackets were median CIs.
+    ci_lo, ci_hi = bootstrap_ci(readings, stat_fn=statistics.median)
+    ci_mean_lo, ci_mean_hi = bootstrap_ci(readings)
     return {
         "description": description,
         "n_runs": len(readings),
@@ -336,6 +342,9 @@ def _summarise_readings(
         "std_dev": round(statistics.stdev(readings) if len(readings) > 1 else 0.0, 3),
         "ci_lower": round(ci_lo, 3),
         "ci_upper": round(ci_hi, 3),
+        "ci_statistic": "median",
+        "ci_mean_lower": round(ci_mean_lo, 3),
+        "ci_mean_upper": round(ci_mean_hi, 3),
         "readings": [round(r, 3) for r in readings],
     }
 
