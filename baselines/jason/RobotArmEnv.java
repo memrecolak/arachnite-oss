@@ -33,6 +33,7 @@ import java.util.logging.Level;
 public class RobotArmEnv extends Environment {
 
     private ArmState sim = new ArmState();
+    private boolean plantReset = false;
 
     private long lastActionNanos = -1L;
     private int actionsSeen = 0;
@@ -111,12 +112,17 @@ public class RobotArmEnv extends Environment {
         lastActionNanos = now;
         actionsSeen++;
 
-        // Reset the plant at the end of the warm-up window so the measured
+        // Reset the plant once the warm-up window has passed, at the first
+        // pick boundary (the gripper has just released), so the measured
         // window starts from the same state as the three Python arms
         // (compare.py, py_trees and ROS 2 runners re-create ArmState after
         // warm-up). Without this, warm-up picks entered pick_durations_ms.
-        if (actionsSeen == warmup) {
+        // Resetting mid-pick instead left the agent's beliefs (holding,
+        // picking) disagreeing with the fresh plant and could stall it.
+        if (!plantReset && warmup > 0 && actionsSeen >= warmup
+                && functor.equals("open_gripper") && !sim.holding) {
             sim = new ArmState();
+            plantReset = true;
         }
 
         // Optional collision injection at a fixed cycle index (post-warmup).

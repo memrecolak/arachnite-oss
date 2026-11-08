@@ -43,7 +43,7 @@ joints([0.0, 0.0, 0.0, 0.0, 0.0, 0.0]).
 
 // Object in reach: initiate pick-and-place
 +distance(D)
-  : D >= 0.10 & D <= 0.35 & holding(nothing) & not collision(true)
+  : D >= 0.10 & D <= 0.35 & holding(nothing) & not collision(true) & not picking
   <- !pick_and_place.
 
 // ── Plans ───────────────────────────────────────────────────────────────────
@@ -61,7 +61,8 @@ joints([0.0, 0.0, 0.0, 0.0, 0.0, 0.0]).
 // Pick-and-place plan — no mandatory block, no rollback
 +!pick_and_place
   : holding(nothing)
-  <- .print("Starting pick-and-place");
+  <- +picking;
+     .print("Starting pick-and-place");
      move_to_object;
      // NOTE: In Arachnite, the next 3 steps form a mandatory block
      // that cannot be interrupted. In Jason, any belief change between
@@ -73,15 +74,17 @@ joints([0.0, 0.0, 0.0, 0.0, 0.0, 0.0]).
      -holding(nothing);
      raise_gripper;
      move_to_target;
-     open_gripper;
+     .print("Pick-and-place complete");
      -holding(object);
      +holding(nothing);
-     .print("Pick-and-place complete").
+     -picking;
+     open_gripper.
 
 // Failure handling — no structured rollback
 -!pick_and_place
   : true
   <- .print("Pick-and-place FAILED — no rollback available");
+     -picking;
      home_joints;
      open_gripper.
 
