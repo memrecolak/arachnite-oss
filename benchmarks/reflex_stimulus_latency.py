@@ -77,6 +77,10 @@ _RUNS = 5
 _TRIALS = 200
 _TICK_RATE_HZ = 10.0
 _SEED = 20260810
+# Onset phase window within the tick period (fraction of the period after the
+# inter-trial gap). The campaign default 0.2-0.8 keeps every onset clear of the
+# tick boundaries; 0.0-1.0 samples the whole period, boundaries included.
+_PHASE_DEFAULT = (0.2, 0.8)
 
 SERIES: tuple[str, ...] = ("total", "detect_wait", "pipeline")
 
@@ -143,6 +147,7 @@ async def run(
     trials: int = _TRIALS,
     tick_rate_hz: float = _TICK_RATE_HZ,
     rng: random.Random | None = None,
+    phase: tuple[float, float] = _PHASE_DEFAULT,
 ) -> tuple[dict[str, list[float]], int]:
     """One independent run under a live tick loop.
 
@@ -187,7 +192,8 @@ async def run(
         for _ in range(trials):
             # Random phase within the tick period so onsets are uniformly
             # distributed relative to the sense poll.
-            await asyncio.sleep(period_s * (0.2 + 0.6 * rng.random()))
+            lo, hi = phase
+            await asyncio.sleep(period_s * (lo + (hi - lo) * rng.random()))
 
             action.fired.clear()
             action.exec_time = 0.0
@@ -221,6 +227,7 @@ async def multi_run(
     n_runs: int,
     trials: int = _TRIALS,
     tick_rate_hz: float = _TICK_RATE_HZ,
+    phase: tuple[float, float] = _PHASE_DEFAULT,
 ) -> tuple[dict[str, DescriptiveStats], int]:
     run_samples_by_name: dict[str, list[list[float]]] = {n: [] for n in SERIES}
     run_medians_by_name: dict[str, list[float]] = {n: [] for n in SERIES}
@@ -230,7 +237,7 @@ async def multi_run(
     for i in range(n_runs):
         # Distinct seed per run — independent stimulus phases, reproducible.
         rng = random.Random(_SEED + i)
-        samples, missed = await run(trials, tick_rate_hz, rng)
+        samples, missed = await run(trials, tick_rate_hz, rng, phase)
         total_missed += missed
         for name in SERIES:
             if not samples[name]:
@@ -304,7 +311,18 @@ def main() -> None:
         "--output-dir", "-o", type=str, default="benchmarks/results",
         help="Directory for the JSON output file.",
     )
+    parser.add_argument(
+        "--phase-min", type=float, default=_PHASE_DEFAULT[0],
+        help=f"Earliest onset phase within the tick period (default: {_PHASE_DEFAULT[0]:g}).",
+    )
+    parser.add_argument(
+        "--phase-max", type=float, default=_PHASE_DEFAULT[1],
+        help=f"Latest onset phase within the tick period (default: {_PHASE_DEFAULT[1]:g}).",
+    )
     args = parser.parse_args()
+    if not 0.0 <= args.phase_min < args.phase_max <= 1.0:
+        parser.error("--phase-min/--phase-max must satisfy 0 <= min < max <= 1")
+    phase = (args.phase_min, args.phase_max)
 
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -313,14 +331,15 @@ def main() -> None:
     est_s = args.runs * args.trials * (period_ms / 1_000.0) * 2.1
     print("Arachnite stimulus-onset reflex latency benchmark")
     print(f"Trials per run: {args.trials}  |  Runs: {args.runs}  |  "
-          f"Tick rate: {args.tick_rate:g} Hz")
+          f"Tick rate: {args.tick_rate:g} Hz  |  Onset phase: "
+          f"{phase[0]:g}-{phase[1]:g}")
     print(f"Platform : {sys.platform} / CPython {platform.python_version()}")
     print(f"Estimated duration: ~{est_s / 60.0:.1f} min "
           "(trials are paced by the live tick loop)")
     print("-" * 72)
 
     stats_by_name, missed = asyncio.run(
-        multi_run(args.runs, args.trials, args.tick_rate)
+        multi_run(args.runs, args.trials, args.tick_rate, phase)
     )
     report(stats_by_name, args.tick_rate, missed)
 
@@ -335,6 +354,7 @@ def main() -> None:
         "tick_rate_hz": args.tick_rate,
         "tick_period_ms": period_ms,
         "seed": _SEED,
+        "onset_phase": [phase[0], phase[1]],
         "missed_trials": missed,
         "series": {
             name: asdict(stats) for name, stats in stats_by_name.items()

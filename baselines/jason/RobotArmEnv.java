@@ -32,7 +32,7 @@ import java.util.logging.Level;
 
 public class RobotArmEnv extends Environment {
 
-    private final ArmState sim = new ArmState();
+    private ArmState sim = new ArmState();
 
     private long lastActionNanos = -1L;
     private int actionsSeen = 0;
@@ -110,6 +110,14 @@ public class RobotArmEnv extends Environment {
         }
         lastActionNanos = now;
         actionsSeen++;
+
+        // Reset the plant at the end of the warm-up window so the measured
+        // window starts from the same state as the three Python arms
+        // (compare.py, py_trees and ROS 2 runners re-create ArmState after
+        // warm-up). Without this, warm-up picks entered pick_durations_ms.
+        if (actionsSeen == warmup) {
+            sim = new ArmState();
+        }
 
         // Optional collision injection at a fixed cycle index (post-warmup).
         if (injectCollisionAt >= 0 && actionsSeen - warmup == injectCollisionAt) {

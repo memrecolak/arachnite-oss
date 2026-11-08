@@ -103,13 +103,26 @@ def run_benchmark(
         if inject_collision_at is not None:
             cmd += ["--inject", str(inject_collision_at)]
 
-        completed = subprocess.run(
-            cmd,
-            capture_output=True,
-            timeout=timeout_s,
-            check=False,
-            cwd=str(_HERE),
-        )
+        # One retry on a wall-clock timeout: a JVM that stalls (observed once
+        # on the Raspberry Pi 4, 2026-11-07, run 5/30 of the deterministic
+        # arm) would otherwise abort the whole 30-run comparison. The retry
+        # is a fresh JVM and is logged; a second timeout is a real failure.
+        for attempt in (1, 2):
+            try:
+                completed = subprocess.run(
+                    cmd,
+                    capture_output=True,
+                    timeout=timeout_s,
+                    check=False,
+                    cwd=str(_HERE),
+                )
+                break
+            except subprocess.TimeoutExpired:
+                if attempt == 2:
+                    raise
+                print(f"  [Jason] JVM exceeded {timeout_s:.0f} s; retrying once "
+                      f"with a fresh JVM", flush=True)
+                out_file.unlink(missing_ok=True)
 
         # JasonBench's RobotArmEnv calls System.exit(0) when it has
         # collected enough cycles; any other exit code is a real failure.

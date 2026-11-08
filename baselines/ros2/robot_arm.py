@@ -81,6 +81,16 @@ def run_benchmark(
     from baselines.shared_sim import ArmState, BenchmarkResult
     pt_mod.SIM = ArmState()
 
+    # DDS isolation. The campaign hosts run this arm concurrently on one
+    # subnet with identical topic names and the default domain, so without
+    # this every host's executor also drained the other hosts' publishers
+    # (the Humble hosts logged Fast-DDS "sequence size exceeds remaining
+    # buffer" on the Jazzy hosts' samples). Loopback-only discovery keeps the
+    # measurement in-process, which is what the comparison describes. Set
+    # unconditionally: RoboStack activation exports ROS_LOCALHOST_ONLY=0.
+    import os
+    os.environ["ROS_LOCALHOST_ONLY"] = "1"                      # Humble
+    os.environ["ROS_AUTOMATIC_DISCOVERY_RANGE"] = "LOCALHOST"   # Iron and later
     rclpy.init()
     try:
         sim_ref = pt_mod.SIM
@@ -180,9 +190,13 @@ def run_benchmark(
             if inject_collision_at is not None and tick == inject_collision_at:
                 sim_ref.collision_imminent = True
 
-            sensor.publish()
-
+            # The sensor publish is part of the cycle: it reads the plant
+            # (which starts the per-pick stopwatch) and pushes the DDS
+            # samples the tree consumes, so it belongs inside the tick timer.
+            # Timing it after publish() made the ROS 2 per-pick figure cover
+            # work the per-tick figure excluded (pick >= tick on every host).
             t0 = time.perf_counter()
+            sensor.publish()
             executor.spin_once(timeout_sec=0)
             tree.tick()
             tick_ms = (time.perf_counter() - t0) * 1_000

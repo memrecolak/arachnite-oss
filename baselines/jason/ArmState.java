@@ -84,9 +84,20 @@ public class ArmState {
         }
         double ms = NOISE_DELAY_MIN_MS
                 + noiseRng.nextDouble() * (NOISE_DELAY_MAX_MS - NOISE_DELAY_MIN_MS);
-        try {
-            Thread.sleep((long) ms, (int) ((ms % 1.0) * 1_000_000));
-        } catch (InterruptedException e) {
+        // Honour the full delay even if the agent thread carries a pending
+        // interrupt: a set interrupt flag makes Thread.sleep() return at once,
+        // which silently removed the delay from every later pick on one host.
+        boolean interrupted = Thread.interrupted();
+        long deadline = System.nanoTime() + (long) (ms * 1_000_000.0);
+        long remaining;
+        while ((remaining = deadline - System.nanoTime()) > 0) {
+            try {
+                Thread.sleep(remaining / 1_000_000, (int) (remaining % 1_000_000));
+            } catch (InterruptedException e) {
+                interrupted = true;
+            }
+        }
+        if (interrupted) {
             Thread.currentThread().interrupt();
         }
     }
