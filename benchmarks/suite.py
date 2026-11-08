@@ -632,22 +632,18 @@ async def run_memory_footprint(n_runs: int) -> dict[str, Any]:
     """
     from benchmarks.memory_footprint import (
         RobotArmUnavailable,
+        _summarise_readings,
         measure_n_subprocess,
     )
 
     def _summarise(readings: list[float], description: str) -> dict[str, Any]:
-        ci_lo, ci_hi = bootstrap_ci(readings)
-        return {
-            "description": description,
-            "mean_mb": round(statistics.mean(readings), 3),
-            "median_mb": round(statistics.median(readings), 3),
-            "std_dev": round(
-                statistics.stdev(readings) if len(readings) > 1 else 0.0, 3,
-            ),
-            "ci_lower": round(ci_lo, 3),
-            "ci_upper": round(ci_hi, 3),
-            "readings": [round(r, 3) for r in readings],
-        }
+        # One summariser for both entry points (memory_footprint.py and the
+        # suite): ci_lower/ci_upper is the median's bootstrap CI, the mean's
+        # CI is ci_mean_lower/ci_mean_upper (2026-11-08; before that the
+        # suite stored the mean's CI under ci_lower/ci_upper).
+        summary = _summarise_readings(readings, description)
+        summary.pop("n_runs", None)
+        return summary
 
     # subprocess.run is blocking; offload to a worker thread so the
     # asyncio event loop running the suite stays responsive.
