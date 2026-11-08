@@ -418,7 +418,14 @@ async def run(
                     bucket_index=bucket_index,
                     tick_start=tick_start,
                     tick_end=tick_end,
-                    mean_ms=statistics.mean(bucket_samples),
+                    # fmean, not mean: statistics.mean() over 100,000 floats takes
+                    # ~175 ms on the Pi 4 / Jetson Nano (exact-fraction summation),
+                    # which, together with the percentile sort and the checkpoint
+                    # fsync, pushed the bucket-closing bookkeeping past one 100 ms
+                    # period and registered one skip-ahead overrun per bucket
+                    # boundary on those boards (9 of 9 in the 2026-10 campaign).
+                    # The bookkeeping runs outside every timed window either way.
+                    mean_ms=statistics.fmean(bucket_samples),
                     p99_ms=percentile(bucket_samples, 99.0),
                     rss_mb=_rss_mb(),
                 )
@@ -437,7 +444,7 @@ async def run(
                 bucket_index=bucket_index,
                 tick_start=tick_start,
                 tick_end=tick_end,
-                mean_ms=statistics.mean(bucket_samples),
+                mean_ms=statistics.fmean(bucket_samples),
                 p99_ms=percentile(bucket_samples, 99.0),
                 rss_mb=_rss_mb(),
             )
