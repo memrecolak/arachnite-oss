@@ -1497,9 +1497,9 @@ class TestThirdReviewRegressions:
     async def test_step_timeout_holds_when_the_step_swallows_its_cancel(self) -> None:
         """
         X4: a step whose inner wait_for swallows the timer's cancel still fails (timeout).
-        On 3.11+ it is cut on time. On 3.10 a stdlib ``asyncio.wait_for`` can swallow
-        the timer's one cancel (R4-A1: no re-cancel, so clean-up is never cut), so the
-        step ends when it next returns — a documented 3.10 limitation.
+        On 3.12+ it is cut on time. On 3.10 and 3.11 a stdlib ``asyncio.wait_for`` (rewritten
+        only in 3.12) can swallow the timer's one cancel (R4-A1: no re-cancel, so clean-up
+        is never cut), so the step ends when it next returns — a documented limitation.
         """
 
         class Stepper(MultiStepActionNode):
@@ -1524,7 +1524,7 @@ class TestThirdReviewRegressions:
         am.register(Stepper(am.bus))
         started = time.perf_counter()
         result = await am.dispatch(_p("S"))
-        if sys.version_info >= (3, 11):
+        if sys.version_info >= (3, 12):
             assert time.perf_counter() - started < 0.5
         assert result.success is False
 

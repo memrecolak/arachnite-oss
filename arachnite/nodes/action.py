@@ -109,7 +109,10 @@ if sys.version_info >= (3, 11):
 
         The deadline cancels ``work`` once; clean-up it runs in response is
         not cut short. Work that swallows that cancel and returns after the
-        deadline anyway is still a timeout (as on Python 3.10).
+        deadline anyway is still a timeout (as on Python 3.10). A stdlib
+        ``asyncio.wait_for`` inside ``work`` can still swallow that cancel on
+        Python 3.11 (its implementation predates the 3.12 rewrite), so such
+        work ends when it next returns, still reported as a timeout.
         """
         async with asyncio.timeout(timeout) as scope:
             result = await work
@@ -137,7 +140,7 @@ else:  # pragma: no cover - exercised by the Python 3.10 CI leg
         Clean-up ``work`` runs in response to the cancel is not cut short,
         and work that returns after the deadline is still a timeout.
 
-        Two Python 3.10 limits (3.11+ has neither): 3.10 does not count
+        Two Python 3.10 limits (3.11 keeps the second, 3.12+ has neither): 3.10 does not count
         cancel requests, so a cancel from outside the master (e.g. event-loop
         shutdown) that lands in the same turn as this scope's timer is
         reported as the timeout; and a 3.10 ``asyncio.wait_for`` inside
@@ -2139,7 +2142,7 @@ class ActionMasterNode(FaultReportingMixin, BaseNode):
                 )
             if node._cancel_requested:
                 # The master's cancel never reached a step boundary: it was
-                # swallowed (Python 3.10 ``asyncio.wait_for``, or an
+                # swallowed (Python 3.10/3.11 ``asyncio.wait_for``, or an
                 # execute() that turned CancelledError into a Result). The
                 # run still ends through the cancel path, with its safe-stop.
                 raise asyncio.CancelledError()
