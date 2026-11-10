@@ -22,7 +22,7 @@ from arachnite.models import (
     StepResult,
 )
 from arachnite.nodes.action import ActionMasterNode, BaseActionNode, MultiStepActionNode
-from arachnite.nodes.decision import DecisionMasterNode, GreedyDecisionNode
+from arachnite.nodes.decision import BaseDecisionNode, DecisionMasterNode, GreedyDecisionNode
 from arachnite.nodes.instinct import BaseInstinctNode, BaseReflexInstinctNode, InstinctMasterNode
 from arachnite.nodes.sense import BaseSenseNode, SenseMasterNode
 from arachnite.runtime import ArachniteRuntime
@@ -356,7 +356,9 @@ class _OneShot(BaseInstinctNode):
 
 class TestSameTickResourceConflict:
     @staticmethod
-    async def _run(persist: bool) -> tuple[_ArmMove, _ArmMove]:
+    async def _run(
+        persist: bool, strategy: type[BaseDecisionNode] = GreedyDecisionNode,
+    ) -> tuple[_ArmMove, _ArmMove]:
         bus = SignalBus()
         am = ActionMasterNode(bus=bus)
         high, low = _ArmMove(bus, "HighMove"), _ArmMove(bus, "LowMove")
@@ -368,7 +370,7 @@ class TestSameTickResourceConflict:
         rt = ArachniteRuntime(
             sense_master=SenseMasterNode(bus=bus), context=ContextNode(),
             instinct_master=im,
-            decision_master=DecisionMasterNode(bus=bus, strategy=GreedyDecisionNode(bus=bus)),
+            decision_master=DecisionMasterNode(bus=bus, strategy=strategy(bus=bus)),
             action_master=am, bus=bus, tick_rate_hz=TICK_HZ,
         )
         await rt.start()
@@ -389,6 +391,25 @@ class TestSameTickResourceConflict:
         high, low = await self._run(persist=True)
         assert high.calls == 1
         assert low.calls == 0
+
+    @pytest.mark.asyncio
+    async def test_strategy_choice_order_decides_the_shared_resource(self) -> None:
+        """The runtime launches in selection order, not priority order (ADR 0009).
+
+        A strategy that chooses the lower-priority proposal first gets the
+        shared resource for it; the higher-priority sibling loses the
+        same-tick conflict.
+        """
+        high, low = await self._run(persist=False, strategy=_LowestPriorityFirst)
+        assert low.calls == 1
+        assert high.calls == 0
+
+
+class _LowestPriorityFirst(BaseDecisionNode):
+    """Chooses the lowest-priority candidate on every call."""
+
+    async def decide(self, proposals: list[Proposal]) -> Proposal | None:
+        return min(proposals, key=lambda p: p.priority) if proposals else None
 
 
 # ── Mutation-evidence hardening (v0.13) ───────────────────────────────────────

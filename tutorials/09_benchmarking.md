@@ -23,9 +23,11 @@ When you deploy an agent on real hardware, you need to know:
 - **Does performance degrade as I add more nodes?** Going from 3 nodes to 30
   should be predictable, not surprising.
 
-## The six benchmarks
+## Six key benchmarks
 
-Arachnite provides six benchmarks, each measuring a different aspect:
+Here are six of Arachnite's benchmarks, each measuring a different aspect
+(the `benchmarks/` folder has a few more, for example multi-step action
+latency and a soak test):
 
 | Benchmark | What it measures | Unit |
 |-----------|-----------------|------|
@@ -219,7 +221,7 @@ This gives you:
    outliers. Medians are more stable.
 5. **Set `poll_interval_s = 0.0` on benchmark stubs.** Otherwise the
    default 0.1 s throttle will cause sensors to be silently skipped,
-   producing misleading results (see Lesson 3 and 4 for details).
+   producing misleading results (see Lesson 3 for details).
 
 ## The JSON report
 
@@ -228,7 +230,7 @@ The suite outputs a JSON file you can process with any tool:
 ```python
 import json
 
-with open("benchmarks/results/suite_MyPC_20260413_140000.json") as f:
+with open("benchmarks/results/suite_MyPC_py3.12.0_20260413_140000.json") as f:
     report = json.load(f)
 
 # Device info

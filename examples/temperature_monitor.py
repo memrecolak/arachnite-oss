@@ -9,7 +9,7 @@ A realistic thermal-monitoring agent demonstrating:
   - Multi-step cooling action with a mandatory sustain block and rollback
   - Emergency shutdown action triggered by the reflex
   - Declared actuator resources: CoolFan owns "fan", EmergencyStop owns "heater"
-  - NodeSupervisor restart policy on the action master
+  - Default NodeSupervisor tracking (ON_FAILURE restart), created by the runtime
   - Structured logging to stdout
 
 Pipeline:
@@ -23,8 +23,9 @@ CoolFan is inside its mandatory sustain block. EmergencyStop commands a
 different actuator ("heater") than CoolFan ("fan"), so it runs alongside the
 fan sequence instead of preempting it. While CoolFan runs, WarnInstinct's
 equal-priority re-proposals are held, and the next cycle starts once it
-finishes. Ctrl+C triggers a graceful stop(). A running CoolFan finishes its
-sustain block, stops before ramp_down, and its rollback spins the fan down.
+finishes. Ctrl+C triggers a graceful stop(). A CoolFan inside its sustain
+block finishes the block, stops before ramp_down, and its rollback spins the
+fan down; one still in ramp_up stops before the block (nothing to roll back).
 
 Run:
     python examples/temperature_monitor.py
@@ -33,6 +34,7 @@ Run:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import math
 import random
 import time
@@ -240,7 +242,8 @@ async def main() -> None:
     await rt.start()
     try:
         await rt.wait()
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, asyncio.CancelledError):
+        # Ctrl+C cancels main() (asyncio.run); stop gracefully below.
         pass
     finally:
         await rt.stop()
@@ -248,4 +251,5 @@ async def main() -> None:
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    with contextlib.suppress(KeyboardInterrupt):
+        asyncio.run(main())

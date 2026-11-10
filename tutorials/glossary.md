@@ -110,8 +110,10 @@ proposes an action when it spots a situation it cares about. Implemented by
 
 ### Mandatory block
 One or more steps of a multi-step action marked `interruptible=False`. The
-decision layer can never interrupt them. Only a reflex (with the default
-`ReflexPreemption.PREEMPT`) or `emergency_stop()` can cut into one. See the
+decision layer can never cut into them (a request from it waits until the
+block is over). Only a reflex (with the default `ReflexPreemption.PREEMPT`),
+the action's own time limit (`timeout_s`) or `emergency_stop()` can cut into
+one. See the
 advanced lesson on multi-step actions.
 
 ### Master node

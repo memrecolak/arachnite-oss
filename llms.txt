@@ -4,7 +4,7 @@
 > Models the nervous system of arachnids: sense → context → reflex → instinct → decide → act.
 > Designed for edge devices (Raspberry Pi, Jetson Nano), laptops, and cloud servers.
 
-Full spec: SPEC.md  |  Examples: examples/  |  Tests: tests/ (1646)
+Full spec: spec/  |  Examples: examples/  |  Tests: tests/ (1646)
 
 ---
 
@@ -40,7 +40,7 @@ One pipeline cycle ("tick") in order:
 6. **InstinctMasterNode.evaluate_all(ctx)** — normal instincts produce list[Proposal] (trigger_interval_s throttling applied). In both stages an `evaluate()` that returns anything but a Proposal or None is that node's fault (logged, reported to its supervisor) and counts as None.
 7. **DecisionMasterNode.on_new_proposals_many(..., conflicts=action_master.conflicting_owners)** — pick proposals + interrupt requests. Selection is the strategy's: `decide_many()` calls `strategy.decide()` repeatedly (each choice removes its action_id) until it returns None. A proposal that shares an `action_id` **or a declared resource** with a running action is a conflict. When every owner is deliberative and of lower priority, an `InterruptRequest(target_action_id=owner)` is issued — inside a mandatory block too, where it is latched until the block ends; otherwise the proposal is held. Reflex-owned actions are reported non-interruptible. Rejected instincts are notified via on_proposal_rejected() (covers fresh, carried-forward pending, and parked hand-off proposals).
 7b. **Interrupt dispatch** — `request_interrupt(req, action_id=req.target_action_id)` for each; it never refuses (inside a mandatory block the request is latched and honoured at the first stop point after it, ADR 0009); exceptions logged as ERROR
-8. **ActionMasterNode.launch(proposal, origin="decision")** for each chosen proposal (highest priority per action_id) — starts `execute()` as a tracked `asyncio.Task` and returns a `LaunchOutcome` at once; **the tick never waits for an action**. `BLOCKED` (owner still unwinding after an interrupt) → `DecisionMasterNode.park(proposal)` for hand-off; `NOT_FOUND` → WARNING.
+8. **ActionMasterNode.launch(proposal, origin="decision")** for each chosen proposal (highest priority per action_id), in the strategy's selection order, so of two chosen actions sharing a resource the one chosen first gets it — starts `execute()` as a tracked `asyncio.Task` and returns a `LaunchOutcome` at once; **the tick never waits for an action**. `BLOCKED` (owner still unwinding after an interrupt) → `DecisionMasterNode.park(proposal)` for hand-off; `NOT_FOUND` → WARNING.
 9. **on_tick_end(tick, duration_s)** — called on all leaf nodes via masters
 
 **Actions run beside the tick (ADR 0005).** A long `MultiStepActionNode` keeps executing while later ticks sense, evaluate reflexes and deliberate. A Result is buffered when the task ends and appears in `ctx.last_results` on the **next** tick after completion (one-tick lifetime), so `tick()` returning does *not* mean the dispatched actions have finished. Use `await runtime.wait_idle(timeout)` to wait for in-flight actions. Different actions run concurrently unless they conflict. Two actions conflict when they share an `action_id` or any declared `resources`, and at most one running action owns a resource at any time (actuator exclusivity).
@@ -142,6 +142,7 @@ from arachnite import (
     ReflexPreemption,                      # PREEMPT (default) | WAIT_FOR_BLOCK
     NodeState, RestartPolicy, MergePolicy, SupervisorSignal, NodeFaultSignal,
     LogLevel, LogEvent, ShutdownPhase, HistoryConfig,
+    Permission, DecisionEvent, RemoteNodeState,
 
     # Node base classes — extend these
     BaseNode,
@@ -173,10 +174,14 @@ from arachnite import (
     NodeSupervisor, HealthMonitor,
     NodeConfig,
     StructuredLogger, BaseLogSink, StdoutLogSink, JSONLogSink,
-    SignalCodec, CodecRegistry,
+    SignalCodec, CodecRegistry, default_registry,
 
-    # Config
-    FrameworkConfig,
+    # Config ([runtime], [transport], [logging], [supervisor], [context] sections)
+    FrameworkConfig, RuntimeSettings, TransportSettings, MQTTSettings, NATSSettings,
+    RedisSettings, LoggingSettings, SupervisorSettings, ContextSettings,
+
+    # Tool-call codec (text-embedded tool calls; ADR 0004)
+    ParsedToolCall, parse_tool_calls, render_tool_schemas,
 
     # Web dashboard (requires: pip install arachnite[web])
     SignalDashboard, FileLogSink,
@@ -185,7 +190,8 @@ from arachnite import (
     make_signal, make_proposal, make_result, make_context, MockBus,
 
     # Exceptions
-    DependencyValidationError,
+    ArachniteError,                        # base class of every framework exception
+    DependencyValidationError, PermissionValidationError, PathTraversalError,
     ResourceConflictError,                 # action needs a resource a running action owns
     ActionVetoed,
     UnsafeCodecError,
@@ -531,7 +537,7 @@ protocol.
 
 ## LLM providers
 
-Three backends, one interface. All are sync (called via asyncio.to_thread()):
+Three backends, one interface. `complete()` is sync; `LLMInstinctNode` calls it in a daemon thread:
 
 ```python
 from arachnite import AnthropicProvider, OllamaProvider, LocalProvider
@@ -1184,8 +1190,10 @@ sm = SenseMasterNode(
 | `LATEST` | Keep signal with latest timestamp |
 | `HIGHEST_CONFIDENCE` | Keep signal with highest confidence |
 | `MEAN` | Average numeric values and confidences; falls back to `HIGHEST_CONFIDENCE` for non-numeric |
+| `BAYESIAN` | Inverse-variance (precision-weighted) fusion, confidence read as precision; metadata adds `fused_variance`; non-numeric falls back to `HIGHEST_CONFIDENCE` |
+| `ENSEMBLE` | Confidence-weighted mean; confidence from epistemic + aleatoric variance (in metadata); non-numeric falls back to `HIGHEST_CONFIDENCE` |
 
-Merged signals carry metadata: `merge_policy`, `merged_from` (source node_ids), `sample_count` (MEAN only).
+Merged signals carry metadata: `merge_policy`, `merged_from` (source node_ids), `sample_count` (MEAN, BAYESIAN, ENSEMBLE).
 Single signals pass through unchanged. Zero overhead when no policies are configured.
 
 ---
@@ -1213,7 +1221,6 @@ nodes:
 class ProximitySense(BaseSenseNode):
     node_id = "ProximitySense"
     signal_kind = "proximity"
-    permissions = frozenset({Permission.GPIO})  # optional capability declaration
 
     async def setup(self) -> None:
         pin = self.config.get_int("gpio_pin", 17)
@@ -1333,10 +1340,10 @@ framework overhead on your target hardware.
 
 `pip install -e ".[benchmarks]"` — enables psutil-based RSS measurement in memory_footprint and soak_test (also in `[all]`); without it, RSS columns render `nan` on platforms without `/proc`, latency numbers unaffected.
 
-`pip install -e ".[baselines]"` — enables the py_trees row of the cross-framework comparison harness (`python -m baselines.compare`); also rolled into `[all]`. Jason and ROS 2 are not pip-installable and stay opt-in via JVM / sourced ROS distro respectively.
+`pip install py-trees` — enables the py_trees row of the cross-framework comparison harness (`python -m baselines.compare`); there is no `baselines` extra. Jason and ROS 2 are not pip-installable and stay opt-in via JVM / sourced ROS distro respectively.
 
 ```bash
-# Full suite (all 5 benchmarks, 30 runs each, JSON output)
+# Full suite (8 registered benchmarks, 30 runs each, JSON output)
 python benchmarks/suite.py
 
 # Quick run for development
@@ -1353,6 +1360,8 @@ python benchmarks/multistep_action_latency.py  # interrupt/rollback/mandatory-bl
 python benchmarks/soak_test.py            # 1M-tick stability soak; per-100k-bucket mean/P99/RSS + drift verdict (§8.2.8)
 python benchmarks/transport_latency.py    # publish-to-wake latency across 4 transports × 3 payload sizes; env-gated brokers (§8.2.9)
 python -m benchmarks.active_inference_comparison # decision strategy A/B (Greedy/Weighted/Random/AI)
+python benchmarks/reflex_arbitration.py e9 --trials 200   # collision injected per stage of a running pick (ADR 0005)
+python benchmarks/reflex_arbitration.py e10 --trials 200  # reflex latency under a long-running action
 ```
 
 ### Key metrics
@@ -1390,6 +1399,7 @@ benchmarks/
   soak_test.py           1M-tick stability soak: per-100k-bucket mean/P99/RSS + drift verdict (§8.2.8)
   transport_latency.py   publish-to-wake latency × 4 transports × 3 payload sizes; brokers env-gated (§8.2.9)
   active_inference_comparison.py  Greedy/Weighted/Random/ActiveInference A/B (latency + bias)
+  reflex_arbitration.py  E9 stage-wise collision injection, E10 reflex latency under a running action
   results/               JSON output directory (gitignored)
 ```
 
@@ -1411,7 +1421,7 @@ python -m baselines.compare --runs 30 --ticks 10000
 | Framework | Available | Safety features |
 |-----------|-----------|----------------|
 | Arachnite | Always | Reflex arc, mandatory blocks, rollback, distributed |
-| py_trees | `pip install -e ".[baselines]"` (or `[all]`) | None (BT priority only) |
+| py_trees | `pip install py-trees` | None (BT priority only) |
 | Jason | LoC only (needs JVM) | None (BDI plan priority) |
 | ROS 2 BT | LoC only (needs ROS 2) | None (DDS callback priority) |
 
@@ -1441,6 +1451,37 @@ baselines/
   ros2/                 ROS 2 BT reference (LoC only)
   results/              JSON output directory
 ```
+
+---
+
+## Web dashboard and runtime observers
+
+`SignalDashboard` (requires `pip install "arachnite[web]"`) is a log sink and a `'*'` bus
+subscriber that streams every signal and log event to a browser and to a plain-text log file:
+
+```python
+from arachnite import SignalDashboard, LogLevel
+
+dashboard = SignalDashboard(bus, host="127.0.0.1", port=7070, log_file="run.log",
+                            level=LogLevel.DEBUG, backlog=500)
+rt = ArachniteRuntime(..., log_sinks=[dashboard],
+                      context_observers=[dashboard.submit_context],     # per-tick Context
+                      decision_observers=[dashboard.submit_decision])   # per-tick DecisionEvent
+await dashboard.start()      # then open http://localhost:7070
+...
+await dashboard.stop()
+```
+
+- `/ws` refuses cross-origin WebSocket handshakes: only the dashboard's own origin and clients
+  that send no `Origin` (scripts) are accepted; `allowed_origins=["https://ops.example:8443"]`
+  adds exact origins (`"*"` allows all, not recommended).
+- `auth_token=` requires a Bearer token / `?token=` / cookie on every request. Binding a
+  non-loopback host without a token raises in `start()` unless `allow_unauthenticated=True`.
+  `ssl_certfile` + `ssl_keyfile` serve HTTPS/WSS.
+- Observers are plain callables, also added with `rt.add_context_observer()` /
+  `rt.add_decision_observer()`. A raising observer is logged at WARNING and never stalls the
+  tick. `DecisionEvent` carries `tick`, `strategy`, `considered`, `dispatched` (selected for
+  launch this tick) and `interrupts`.
 
 ---
 
@@ -1580,7 +1621,7 @@ arachnite/
     permissions.py  permission validation helpers
 examples/
   minimal_agent.py          simplest complete pipeline
-  temperature_monitor.py    realistic: reflex, multi-step action, supervisor
+  temperature_monitor.py    realistic: reflex, multi-step action, disjoint resources (fan / heater)
   web_dashboard_demo.py     adds SignalDashboard to temperature_monitor
   robot_arm/                pick-and-place: resources, PREEMPT reflex + safe-stop, recovery, manifest
 tests/

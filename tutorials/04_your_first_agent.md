@@ -1,4 +1,4 @@
-   # Lesson 4 — Your First Agent
+# Lesson 4 — Your First Agent
 
 Time to build something that actually runs! In this lesson we'll write a
 complete agent and walk through every line of code together.
@@ -133,10 +133,12 @@ its internal bus, or pass **instances** when you need custom constructor
 arguments:
 
 ```python
+from arachnite import RandomDecisionNode, StdoutLogSink
+
 builder = RuntimeBuilder()
 rt = (
     builder
-    .sense(TempSense(bus=builder.bus, value=42.0))   # pre-built instance
+    .sense(TempSense(bus=builder.bus, log_sinks=[StdoutLogSink()]))  # pre-built instance
     .instinct(HotInstinct)                            # class — auto-instantiated
     .action(CoolDown)
     .strategy(RandomDecisionNode)                     # override decision strategy

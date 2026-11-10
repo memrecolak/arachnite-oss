@@ -3,7 +3,8 @@
 You've made it! In this final lesson we'll build a **complete, slightly
 realistic project** from scratch using everything you've learned:
 
-- Two sensors (a light sensor and a motion sensor)
+- Three sensors (a light sensor, a motion sensor and a lamp temperature
+  sensor)
 - Two normal instincts (turn on when dark + motion, turn off when bright)
 - One reflex (panic if the lamp gets way too hot)
 - Three actions (turn lamp on, turn lamp off, emergency shut down)
@@ -328,7 +329,7 @@ You now know:
 
 That's the entire core of the framework. There's more to learn — multi-step
 actions, supervisors, distributed agents, transport layers — but you're
-ready to explore the [main README](../README.md), [SPEC.md](../SPEC.md), and
+ready to explore the [main README](../README.md), [spec](../spec/), and
 the [examples/](../examples/) folder on your own.
 
 ## Where to go from here

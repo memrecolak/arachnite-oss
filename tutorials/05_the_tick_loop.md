@@ -149,8 +149,9 @@ async functions go with `await`. Eventually you'll meet `asyncio.gather`,
 Suppose you set `tick_rate_hz=10.0` (one tick every 100 ms), but one of your
 sensors takes 300 ms to `read()`. What happens?
 
-The runtime will log a warning ("tick overrun") and run the next tick *late*.
-It doesn't skip ticks or crash. Your agent slows down, but it keeps working.
+The runtime will log a warning ("tick overrun") once it has happened a few
+ticks in a row (three by default), and run the next tick *late*. It doesn't
+skip ticks or crash. Your agent slows down, but it keeps working.
 
 Slow *actions* don't cause this, because the tick only starts them and
 doesn't wait (see above). What makes a tick long is slow work inside the

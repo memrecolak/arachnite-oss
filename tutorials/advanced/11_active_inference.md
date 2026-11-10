@@ -48,8 +48,13 @@ dm = DecisionMasterNode(bus=bus, strategy=strategy)
 | beta | Behaviour |
 |------|-----------|
 | 0.0 | Pure exploitation — identical to `WeightedDecisionNode` |
-| 1.0 | Balanced — considers both goal value and uncertainty |
-| 5.0+ | Exploration-biased — prefers acting in uncertain contexts |
+| 1.0 | Balanced — uncertainty acts as a tie-breaker between proposals of similar value |
+| 5.0+ | Uncertainty-averse — noticeably prefers well-evidenced (high-confidence) proposals |
+
+The uncertainty term *adds* to EFE, so a larger `beta` penalises
+low-confidence proposals. The penalty is at most `beta`, while
+`priority * urgency` ranges up to `priority`, so it only changes the choice
+between proposals whose pragmatic values are within `beta` of each other.
 
 ## How Confidence Flows Through
 
@@ -74,8 +79,11 @@ class PatrolInstinct(BaseInstinctNode):
 ```
 
 With `beta=0`, the agent ignores the confidence values.
-With `beta=5`, the agent notices the low lidar confidence and may prefer
-actions that would improve lidar readings first.
+With `beta=5`, the low lidar confidence costs this proposal up to 5 points of
+EFE, so a competing proposal of similar value backed by more confident
+evidence wins instead. (Non-numeric or non-finite `_confidence` values are
+ignored and the rest are clamped to [0, 1]; a proposal with no usable
+confidence gets `prior_confidence`, default 0.5.)
 
 ## Probabilistic Selection
 
@@ -86,6 +94,7 @@ strategy = ActiveInferenceDecisionNode(
     bus=bus,
     beta=1.0,
     temperature=10.0,  # higher = more random
+    seed=42,           # optional: reproducible choices
 )
 ```
 

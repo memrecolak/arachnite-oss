@@ -35,6 +35,12 @@ blocked. While the call is in flight, the instinct returns its most recent
 cached proposal. This means LLM instincts feel fast even when the underlying
 model takes seconds to respond.
 
+A call that fails, returns an invalid answer, or takes longer than
+`call_timeout_s` (default 30 seconds; `None` means no limit) **clears** the
+cached proposal, so the instinct proposes nothing until a later call
+succeeds. A decision based on old observations is never re-proposed while
+the LLM is failing.
+
 ## Providers
 
 You don't talk to the LLM directly. You inject a **provider** — a small
@@ -228,7 +234,7 @@ see beginner lesson 6.) Best of both worlds.
 
 1. **Set `min_interval_s`.** LLM calls cost money and time. Don't call them
    every tick — once every few seconds is usually plenty. The default is
-   1.0 seconds.
+   10.0 seconds.
 2. **Use a small/fast model first.** Claude Haiku, Llama 3.1 8B — these
    respond in under a second and cost almost nothing. Save the big models
    for when you really need them.

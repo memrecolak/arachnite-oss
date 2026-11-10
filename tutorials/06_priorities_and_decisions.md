@@ -248,12 +248,17 @@ This is decision-making by priority, in action.
 priority. But Arachnite has others, and you can write your own. Some
 built-ins:
 
-- **Greedy** — pick the highest priority. (You've used this one.)
-- **Weighted random** — pick randomly, but with higher-priority proposals
-  more likely to win. (Useful for exploration.)
-- **Top-K** — run the top K proposals concurrently. (Useful when actions
-  don't conflict — for example, "turn on a light" and "play a sound" can
-  happen at the same time.)
+- **Greedy** (`GreedyDecisionNode`) — pick the highest priority. (You've
+  used this one.)
+- **Weighted** (`WeightedDecisionNode`) — pick the highest
+  `priority × urgency`, so a very urgent proposal can beat a slightly more
+  important one.
+- **Random** (`RandomDecisionNode`) — pick randomly, but with more urgent
+  proposals more likely to win. (Useful for exploration.)
+
+Each of these picks one proposal per action, so actions that don't share a
+resource still run side by side whichever strategy you use: "turn on a
+light" and "play a sound" can happen at the same time.
 
 You don't need any of these for now. Just know they exist for when your agent
 gets fancier.
@@ -261,7 +266,8 @@ gets fancier.
 ## When two instincts have the same priority
 
 What if `MildHeat` and `HotEmergency` *both* have priority 80? The greedy
-strategy picks one, but you don't get to control which. **Best practice:
+strategy then compares `urgency`, and if that is equal too, it picks one,
+but you don't get to control which. **Best practice:
 give every instinct a different priority** so you always know which one will
 win.
 

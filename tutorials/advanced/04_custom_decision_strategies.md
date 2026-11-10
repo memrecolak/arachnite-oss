@@ -4,18 +4,19 @@ In the beginner course, every example used `GreedyDecisionNode` — the
 strategy that picks the highest-priority proposal and ignores the rest.
 That's a sensible default, but it's not the only option.
 
-Arachnite ships three built-in strategies, and you can write your own.
+Arachnite ships built-in strategies, and you can write your own.
 
 ## The built-in strategies
 
-All decision strategies inherit from `BaseDecisionNode`. Three are exported
-out of the box:
+All decision strategies inherit from `BaseDecisionNode`. Three simple ones
+are exported out of the box (a fourth, `ActiveInferenceDecisionNode`, gets
+its own lesson, [Active Inference](11_active_inference.md)):
 
 | Class | Behaviour | When to use |
 |---|---|---|
 | `GreedyDecisionNode` | Picks the highest priority. Ties broken by urgency. | Default — when priorities cleanly express importance. |
 | `WeightedDecisionNode` | Picks the proposal with the highest `priority * urgency`. | When some instincts have low priority but high urgency, and you want both to matter. |
-| `RandomDecisionNode` | Samples randomly, weighted by urgency. | Exploration — when you want the agent to occasionally pick "lesser" options to learn. |
+| `RandomDecisionNode` | Samples randomly, weighted by urgency. Pass `seed=` for a reproducible sequence. | Exploration — when you want the agent to occasionally pick "lesser" options to learn. |
 
 You swap strategies by passing one to the `DecisionMasterNode`:
 
@@ -32,7 +33,9 @@ That's the only change. Every other part of your agent stays the same.
 
 ## When `Greedy` isn't enough
 
-Imagine these three proposals fire on the same tick:
+Imagine three instincts ask the same action (say a single `Worker` that does
+one job at a time) for different jobs on the same tick, so only one of the
+proposals can win:
 
 | Proposal | Priority | Urgency |
 |---|---|---|
@@ -90,16 +93,22 @@ The contract is simple:
 - The runtime may call `decide()` several times per tick: after each choice the
   candidates with the same `action_id` are removed and `decide()` is asked again,
   until it returns `None` or nothing is left. So actions with different
-  `action_id`s — "play sound" and "blink light" — can start in the same tick, in
-  the order your strategy picks them.
+  `action_id`s — "play sound" and "blink light" — can start in the same tick.
+  Proposals only compete with proposals for the *same* action: your strategy
+  picks the winner for each action, and returning `None` is how it leaves the
+  rest idle.
+- The runtime launches the chosen proposals in the order `decide()` returned
+  them. If two chosen actions share a declared resource, the one your strategy
+  chose first gets it and the other does not start this tick (it is kept for a
+  later tick only if it has `persist=True`).
 
 You can also override `decide_many()` for custom multi-select logic.
 
 ## A complete example
 
 Let's build an agent with two instincts (high priority + low urgency, low
-priority + high urgency) and watch how the strategy choice changes the
-outcome.
+priority + high urgency) that both want the same `Worker` action, and watch
+how the strategy choice changes the outcome.
 
 ```python
 import asyncio
@@ -130,8 +139,9 @@ class CleanupInstinct(BaseInstinctNode):
     priority = 90  # high priority
     async def evaluate(self, ctx) -> Proposal | None:
         return Proposal(
-            instinct_id=self.node_id, action_id="Cleanup",
+            instinct_id=self.node_id, action_id="Worker",
             priority=self.priority, urgency=0.1,  # low urgency
+            parameters={"job": "Cleanup"},
         )
 
 
@@ -140,22 +150,16 @@ class UserRequestInstinct(BaseInstinctNode):
     priority = 70  # lower priority
     async def evaluate(self, ctx) -> Proposal | None:
         return Proposal(
-            instinct_id=self.node_id, action_id="AnswerUser",
+            instinct_id=self.node_id, action_id="Worker",
             priority=self.priority, urgency=0.95,  # very urgent
+            parameters={"job": "AnswerUser"},
         )
 
 
-class Cleanup(BaseActionNode):
-    node_id = "Cleanup"
+class Worker(BaseActionNode):
+    node_id = "Worker"
     async def execute(self, p) -> Result:
-        print("[Cleanup]")
-        return Result(action_id=self.node_id, success=True)
-
-
-class AnswerUser(BaseActionNode):
-    node_id = "AnswerUser"
-    async def execute(self, p) -> Result:
-        print("[AnswerUser]")
+        print(f"[{p.parameters['job']}]")
         return Result(action_id=self.node_id, success=True)
 
 
@@ -172,8 +176,7 @@ async def run_with(strategy_factory, label: str) -> None:
     sense_master.register(TickSensor(bus=bus))
     instinct_master.register(CleanupInstinct(bus=bus))
     instinct_master.register(UserRequestInstinct(bus=bus))
-    action_master.register(Cleanup(bus=bus))
-    action_master.register(AnswerUser(bus=bus))
+    action_master.register(Worker(bus=bus))
 
     rt = ArachniteRuntime(
         sense_master=sense_master,

@@ -68,7 +68,7 @@ The merged signal's metadata tells you what happened:
 signal.metadata = {
     "merge_policy": "bayesian",
     "sample_count": 2,
-    "fused_variance": 0.049,
+    "fused_variance": 0.043478,
     "per_sensor_precisions": [4.0, 19.0],
     "merged_from": ["TempA", "TempB"],
 }
@@ -95,11 +95,13 @@ The metadata breaks down the uncertainty:
 ```python
 signal.metadata = {
     "merge_policy": "ensemble",
-    "epistemic_variance": 0.18,     # sensors disagree
-    "aleatoric_variance": 0.15,     # individual uncertainty
-    "total_uncertainty": 0.33,
+    "sample_count": 2,
+    "epistemic_variance": 0.09,     # sensors disagree
+    "aleatoric_variance": 0.125,    # individual uncertainty
+    "total_uncertainty": 0.215,
     "per_sensor_values": [36.5, 37.1],
     "per_sensor_confidences": [0.8, 0.95],
+    "merged_from": ["TempA", "TempB"],
 }
 ```
 

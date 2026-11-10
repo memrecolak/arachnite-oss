@@ -120,7 +120,7 @@ Let's break this down:
 > **Tip — `poll_interval_s`:** By default, sensors are throttled to read
 > once every 0.1 seconds (even if the tick rate is faster). If you need a
 > sensor to read on **every** tick, add `poll_interval_s = 0.0` to your
-> class. See [Lesson 4](04_your_first_agent.md) and
+> class. See [Lesson 8](08_smart_lamp_project.md) for an example and
 > [the spec](../spec/02_nodes.md) for details.
 
 ### BaseInstinctNode — for thinking

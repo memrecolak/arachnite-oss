@@ -88,6 +88,22 @@ class ArachniteRuntime:
 
         timeout\. The Results reach ctx\.last\_results on the next tick\."""
 
+    async def wait\(self\) \-> None:
+
+        """Block until stop\(\) or emergency\_stop\(\) has been called and the
+
+        shutdown has finished \(§15\.3\)\."""
+
+    def inject\_remote\_signal\(self, signal: Signal\) \-> None:
+
+        """Queue a signal from another AgentNode for the next tick's
+
+        ctx\.signals \(bounded 1024, oldest dropped\); see §10\.5\."""
+
+    def monitor\_state\(self\) \-> MonitorState:
+
+        """The safety\-monitor state observed in the last tick \(§6\.7\)\."""
+
     @property
 
     def tick\_count\(self\) \-> int: \.\.\.
@@ -271,7 +287,9 @@ async def tick\(self\) \-> None:
 
         \# NOT\_FOUND: logged at WARNING\.
 
-    await asyncio\.sleep\(0\)   \# if any launched: execute\(\) is entered now
+    \# if any launched or armed: a few asyncio\.sleep\(0\) turns, so execute\(\)
+
+    \# \(and a preempted owner's safe\-stop\) is entered now
 
     \# 5\. Normal instinct evaluation
 
@@ -333,11 +351,19 @@ async def tick\(self\) \-> None:
 
     \# 7\. Act — launch the selected proposals \(highest priority per
 
-    \#    action\_id\) as tasks; nothing is awaited\. A launch that is
+    \#    action\_id\) as tasks, in the strategy's selection order; nothing is awaited\. A launch that is
 
-    \#    BLOCKED by a running owner — typically one that is unwinding
+    \#    BLOCKED by a running owner that is unwinding from the interrupt
 
-    \#    from the interrupt just issued — is parked for hand\-off\.
+    \#    just issued is parked for hand\-off; one that only lost a same\-tick
+
+    \#    resource conflict to a sibling is deferred \(pending rules\)\. A tick
+
+    \#    during which stop\(\) or pause\(\) arrived launches nothing here and
+
+    \#    issues no interrupts\.
+
+    interrupting = \{ir\.new\_proposal\.instinct\_id for ir in interrupts\}
 
     for p in best\_per\_action\_id\(to\_dispatch\):
 
@@ -345,7 +371,13 @@ async def tick\(self\) \-> None:
 
         if outcome\.status is LaunchStatus\.BLOCKED:
 
-            self\.\_decision\_master\.park\(p\)
+            if p\.instinct\_id in interrupting:
+
+                self\.\_decision\_master\.park\(p\)
+
+            else:
+
+                self\.\_decision\_master\.defer\(p\)
 
     \# 8\. Notify all leaf nodes that the tick has ended
 
@@ -508,10 +540,10 @@ are the elements of `TICK\_STAGE\_NAMES` and map to §7\.2 as follows:
 |---|---|---|
 | 1 | `sense` | `notify\_tick\_start` gather \+ buffer and completed\-result drain \+ `SenseMasterNode\.read\_all\(\)` \(in `'event'` mode including the reflex\-lane work it triggers\) |
 | 2 | `context` | `ContextNode\.update\(\)` \(includes action\-state assembly\) |
-| 3 | `reflex` | `evaluate\_reflexes\(\)` \+ the `launch\_reflex\(\)` loop \+ one event\-loop yield \(fused because the reflex arc bypasses decision; see §7\.2 step 4\) |
+| 3 | `reflex` | `evaluate\_reflex\_pairs\(\)` \+ the `launch\_reflex\(\)` loop \+ a few event\-loop yields when a reflex launched or armed \(fused because the reflex arc bypasses decision; see §7\.2 step 4\) |
 | 4 | `instinct` | `InstinctMasterNode\.evaluate\_all\(ctx\)` \(evaluate only — proposals launch in `act`\) |
 | 5 | `decide` | Interruptibility\-map build \+ `on\_new\_proposals\_many` \+ `notify\_rejected` \+ interrupt issuing |
-| 6 | `act` | `ActionMasterNode\.launch\(\)` per selected proposal \(\+ `park\(\)` on `BLOCKED`\) \+ `notify\_tick\_end` gather |
+| 6 | `act` | `ActionMasterNode\.launch\(\)` per selected proposal \(\+ `park\(\)` or `defer\(\)` on `BLOCKED`\) \+ `notify\_tick\_end` gather |
 
 The `reflex` and `act` stages measure **launch cost only**: `execute\(\)` runs in its own task, outside every stage, and its duration is not part of any tick\.
 
@@ -568,7 +600,7 @@ __What happens__
 
 __1\. Stop sensing__
 
-The tick loop is told to stop \(``on\_shutdown\_action`` runs here if configured\)\. No new tick starts, so no new signals enter the pipeline\.
+The tick loop is told to stop \(``on\_shutdown\_action`` runs here if configured\)\. No new tick starts, so no new signals enter the pipeline\. The shutdown interrupt \(an InterruptRequest with reason 'stop\(\) called', ``ActionMasterNode\.interrupt\_all\(\)``\) is delivered to every running multi\-step action now — held while a mandatory block runs — so no action starts another step while the in\-flight tick drains\.
 
 __2\. Drain reflexes__
 
@@ -576,7 +608,7 @@ The in\-flight tick, including its reflex stage, runs to completion \(bounded by
 
 __3\. Complete mandatory block__
 
-Every running multi\-step action receives an InterruptRequest with reason 'stop\(\) called' \(``ActionMasterNode\.interrupt\_all\(\)``\)\. Inside a mandatory block the interrupt is held, so the block runs to its end; the coordinator waits until no running action is inside a block\. Timeout: the longest remaining mandatory\-block time across running actions × ``mandatory\_block\_timeout\_multiplier`` \(default 1\.1\), or ``teardown\_timeout\_s`` when no action is in a block\. No new step starts after the block: each action stops at the first boundary its policy allows\.
+The shutdown interrupt is delivered again, so it also reaches actions the drained tick launched\. Inside a mandatory block the interrupt is held, so the block runs to its end; the coordinator waits until no running action is inside a block\. Timeout: the longest remaining mandatory\-block time across running actions × ``mandatory\_block\_timeout\_multiplier`` \(default 1\.1\), or ``teardown\_timeout\_s`` when no action is in a block\. No new step starts after the block: each action stops at the first boundary its policy allows\.
 
 __4\. Interrupt remaining action__
 
@@ -592,7 +624,7 @@ teardown\(\) is called on all nodes concurrently, with a configurable grace peri
 
 __7\. Disconnect transport__
 
-Transport connections closed cleanly\. Pending outbound signals are flushed or dropped\.
+Transport connections closed cleanly\. Pending outbound signals are flushed or dropped\. The runtime itself owns no transport, so this phase is a no\-op there; ``AgentNode\.stop\(\)`` disconnects its transport after ``stop\(\)`` returns \(§10\)\.
 
 ## __15\.2 ShutdownCoordinator__
 
@@ -835,7 +867,7 @@ ROS 2: heavy; AutoGen: cloud\-oriented
 
 Language
 
-Python 3\.11\+
+Python 3\.10\+
 
 py\_trees: Python; ROS 2: C\+\+/Python; LangChain: Python
 
@@ -1501,7 +1533,7 @@ class BaseActionNode\(BaseNode\):
 
 __Mode per node\.__ ``preemption`` is a property of the reflex node, read when its proposal is launched; it is not reassigned inside ``evaluate\(\)``\. A re\-fire while the reflex is armed is de\-duplicated, so the mode of an armed reflex does not change\. A situation\-dependent choice is two reflex nodes with disjoint predicates and distinct target actions; a higher\-priority ``PREEMPT`` reflex still cuts a block that a ``WAIT\_FOR\_BLOCK`` reflex is armed to wait out \(``formal/verify\_two\_reflexes\.py``\)\. Exclusion is per runtime \(one ``ActionMasterNode``\) and over framework\-scheduled commands: a command handed to a worker thread or a device controller is halted by the safe\-stop hook, not by the cancellation\.
 
-__Arbitration\.__ The runtime launches every reflex proposal with ``ActionMasterNode\.launch\_reflex\(proposal, node\.preemption\)``\. When the reflex must wait, it is **armed**: it claims its resources, so ``conflicting\_owners\(\)`` reports the claim and no deliberative proposal can launch on them meanwhile\. The armed reflex starts the moment its last owner releases — from the owner's task, before any later tick — and armed reflexes are admitted in priority order: a lower\-priority armed reflex is not admitted on a resource that a higher\-priority armed reflex still waits for, and every armed reflex keeps its claim until it starts or is cancelled\. Cancelling an armed reflex \(``ActionMasterNode\.cancel\(\)``\) withdraws it: an owner that was only waiting to hand over to it carries on\. To **preempt** an owner, its task is cancelled at its current ``await`` \(even inside a mandatory block\), ``on\_preempted\(\)`` runs in its own task bounded by ``safe\_stop\_timeout\_s`` \(a hook that raises is logged; one that overruns is cancelled, and abandoned — left running, logged — if it has not ended ``SAFE\_STOP\_ABANDON\_GRACE\_S`` = 0\.1 s later, so even a hook that swallows its cancel holds a reflex back at most ``safe\_stop\_timeout\_s`` \+ 0\.1 s\), and the rollback walk runs only if the owner sets ``rollback\_on\_preempt = True`` — and not if a shutdown \(``cancel\_all\(\)``\) arrives before the safe\-stop has started\. A run walks at most once: a preemption arriving during or after an interrupt or abort rollback walk does not start the walk again \(the Result still reports a walk that completed\)\. The safe\-stop \(with that walk\) runs at most once per run: it is shielded, so a later cancel — a second reflex, ``emergency\_stop\(\)``, shutdown — waits for it instead of cutting it short, and a ``WAIT\_FOR\_BLOCK`` hand\-off runs it in the master's task, outside the action's ``timeout\_s``\. A hook that ends in ``CancelledError`` of its own is reported like a raising hook\. The cancel is also recorded on the node, so a step that completes in the same event\-loop turn cannot swallow it \(``asyncio\.wait\_for`` on Python 3\.10\)\. The owner's Result has ``preempted=True`` and ``interrupted=True`` and is never retried; an awaited ``dispatch\(\)`` preempted before its first step returns that Result rather than raising\. A run the master cancels through ``cancel\(\)`` or ``cancel\_all\(\)`` likewise ends with a Result \(``interrupted=True``, ``preempted=False``\), for ``launch\(\)`` and ``dispatch\(\)`` alike; if the *caller* of an awaited ``dispatch\(\)`` is cancelled, the action is stopped the same way and the caller then gets the ``CancelledError``\. ``ActionMasterNode\.cancel\(action\_id\)`` withdraws a reflex armed under ``action\_id`` if there is one and otherwise cancels the running run; withdrawing never touches a running run, even one under the same id\. ``close\(\)`` drops every armed reflex too\. A cancel that ``execute\(\)`` swallowed \(a Python 3\.10 ``asyncio\.wait\_for``, or an action that turned the ``CancelledError`` into a Result\) still ends the run through its safe\-stop, and one that lands as a safe\-stop finishes keeps that safe\-stop's Result\. A cancel from outside the master that arrives during a safe\-stop still propagates once the safe\-stop is done: the master counts the cancels it sends a run, and a run that received more ends cancelled \(Python 3\.10 cannot count cancel requests, so there only one that arrives as a separate delivery is noticed\)\. ``wait\_idle\(\)`` returns only once the finished runs' Results are buffered\. ``dispatch\_many\(\)`` checks every action exists before starting any\. A reflex that waits only on lower\-priority armed claims, with no running owner, starts at once\. The action and step timeouts run in the action's own task \(``asyncio\.timeout``, or an equivalent on Python 3\.10\), so no inner task can be orphaned: the deadline cancels the work once, clean\-up it runs in response is not cut short, and work that swallows that cancel but returns after the deadline is still a timeout\. Each rollback callable is bounded the same way by its step's ``timeout\_s`` \(the action's if unset\); one that overruns is a rollback failure\. A run whose rollback walk the action timeout cut short is not retried\. An action timeout is a cancellation like the others: the run's ``on\_preempted\(\)`` runs \(shielded, bounded by ``safe\_stop\_timeout\_s``, with the stand\-in ``'timeout'`` proposal and without the ``rollback\_on\_preempt`` walk\), then a multi\-step run follows the abort rules for the step that was cut \(``on\_aborted\(\)``\), then ``on\_timeout\(\)`` supplies the Result, which keeps ``step\_results``, ``stopped\_at\_step`` and ``rolled\_back`` and has ``cancelled=True``\. A cancel arriving during that safe\-stop ends the run through the cancel path without running the hook again \(a run's hook runs at most once\)\. A run the timeout cut inside a mandatory block is never retried\. Two Python 3\.10 limits: it does not count cancel requests, so a cancel from outside the master \(e\.g\. event\-loop shutdown\) that lands in the same turn as a step timer is reported as the step timeout; and a 3\.10 ``asyncio\.wait\_for`` inside a step can swallow the timer's cancel, so that step ends when it next returns \(still reported as a timeout\)\.
+__Arbitration\.__ The runtime launches every reflex proposal with ``ActionMasterNode\.launch\_reflex\(proposal, node\.preemption\)``\. When the reflex must wait, it is **armed**: it claims its resources, so ``conflicting\_owners\(\)`` reports the claim and no deliberative proposal can launch on them meanwhile\. The armed reflex starts the moment its last owner releases — from the owner's task, before any later tick — and armed reflexes are admitted in priority order: a lower\-priority armed reflex is not admitted on a resource that a higher\-priority armed reflex still waits for, and every armed reflex keeps its claim until it starts or is cancelled\. Cancelling an armed reflex \(``ActionMasterNode\.cancel\(\)``\) withdraws it: an owner that was only waiting to hand over to it carries on\. To **preempt** an owner, its task is cancelled at its current ``await`` \(even inside a mandatory block\), ``on\_preempted\(\)`` runs in its own task bounded by ``safe\_stop\_timeout\_s`` \(a hook that raises is logged; one that overruns is cancelled, and abandoned — left running, logged — if it has not ended ``SAFE\_STOP\_ABANDON\_GRACE\_S`` = 0\.1 s later, so even a hook that swallows its cancel holds a reflex back at most ``safe\_stop\_timeout\_s`` \+ 0\.1 s\), and the rollback walk runs only if the owner sets ``rollback\_on\_preempt = True`` — and not if a shutdown \(``cancel\_all\(\)``\) arrives before the safe\-stop has started\. A run walks at most once: a preemption arriving during or after an interrupt or abort rollback walk does not start the walk again \(the Result still reports a walk that completed\)\. The safe\-stop \(with that walk\) runs at most once per run: it is shielded, so a later cancel — a second reflex, ``emergency\_stop\(\)``, shutdown — waits for it instead of cutting it short, and a ``WAIT\_FOR\_BLOCK`` hand\-off runs it in the master's task, outside the action's ``timeout\_s``\. A hook that ends in ``CancelledError`` of its own is reported like a raising hook\. The cancel is also recorded on the node, so a step that completes in the same event\-loop turn cannot swallow it \(``asyncio\.wait\_for`` on Python 3\.10\)\. The owner's Result has ``preempted=True`` and ``interrupted=True`` and is never retried; an awaited ``dispatch\(\)`` preempted before its first step returns that Result rather than raising\. A run the master cancels through ``cancel\(\)`` or ``cancel\_all\(\)`` likewise ends with a Result \(``interrupted=True``, ``preempted=False``\), for ``launch\(\)`` and ``dispatch\(\)`` alike; if the *caller* of an awaited ``dispatch\(\)`` is cancelled, the action is stopped the same way and the caller then gets the ``CancelledError``\. ``ActionMasterNode\.cancel\(action\_id\)`` withdraws a reflex armed under ``action\_id`` if there is one and otherwise cancels the running run; withdrawing never touches a running run, even one under the same id\. ``close\(\)`` drops every armed reflex too\. A cancel that ``execute\(\)`` swallowed \(a Python 3\.10/3\.11 ``asyncio\.wait\_for``, or an action that turned the ``CancelledError`` into a Result\) still ends the run through its safe\-stop, and one that lands as a safe\-stop finishes keeps that safe\-stop's Result\. A cancel from outside the master that arrives during a safe\-stop still propagates once the safe\-stop is done: the master counts the cancels it sends a run, and a run that received more ends cancelled \(Python 3\.10 cannot count cancel requests, so there only one that arrives as a separate delivery is noticed\)\. ``wait\_idle\(\)`` returns only once the finished runs' Results are buffered\. ``dispatch\_many\(\)`` checks every action exists before starting any\. A reflex that waits only on lower\-priority armed claims, with no running owner, starts at once\. The action and step timeouts run in the action's own task \(``asyncio\.timeout``, or an equivalent on Python 3\.10\), so no inner task can be orphaned: the deadline cancels the work once, clean\-up it runs in response is not cut short, and work that swallows that cancel but returns after the deadline is still a timeout\. Each rollback callable is bounded the same way by its step's ``timeout\_s`` \(the action's if unset\); one that overruns is a rollback failure\. A run whose rollback walk the action timeout cut short is not retried\. An action timeout is a cancellation like the others: the run's ``on\_preempted\(\)`` runs \(shielded, bounded by ``safe\_stop\_timeout\_s``, with the stand\-in ``'timeout'`` proposal and without the ``rollback\_on\_preempt`` walk\), then a multi\-step run follows the abort rules for the step that was cut \(``on\_aborted\(\)``\), then ``on\_timeout\(\)`` supplies the Result, which keeps ``step\_results``, ``stopped\_at\_step`` and ``rolled\_back`` and has ``cancelled=True``\. A cancel arriving during that safe\-stop ends the run through the cancel path without running the hook again \(a run's hook runs at most once\)\. A run the timeout cut inside a mandatory block is never retried\. Two limits of older Python versions: 3\.10 does not count cancel requests, so a cancel from outside the master \(e\.g\. event\-loop shutdown\) that lands in the same turn as a step timer is reported as the step timeout; and on 3\.10 and 3\.11 an ``asyncio\.wait\_for`` inside a step \(its implementation predates the 3\.12 rewrite\) can swallow the timer's cancel, so that step ends when it next returns \(still reported as a timeout\)\.
 
 __Decision table\.__ T\_admit is the time from ``launch\_reflex\(\)`` to the reflex action's ``execute\(\)`` being entered\. With several owners each is handled by its row, and T\_admit is the maximum\.
 

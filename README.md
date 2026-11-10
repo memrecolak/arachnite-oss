@@ -36,6 +36,9 @@ pip install "arachnite[nats]"           # NATS transport
 pip install "arachnite[redis]"          # Redis transport
 pip install "arachnite[web]"            # bundled signal dashboard
 pip install "arachnite[llm]"            # Anthropic LLM provider
+pip install "arachnite[ollama]"         # OllamaProvider (OpenAI-compatible client)
+pip install "arachnite[local-llm]"      # LocalProvider (llama-cpp-python)
+pip install "arachnite[numpy]"          # NumpyCodec for array payloads
 pip install "arachnite[yaml]"           # DeploymentManifest.from_yaml()
 pip install "arachnite[benchmarks]"     # psutil for RSS measurement
 ```
@@ -126,8 +129,8 @@ asyncio.run(main())
 ```
 
 See the [`examples/`](examples) directory for more complete programs:
-reflex nodes, multi-step actions, supervisor restart policies, and a
-web dashboard.
+reflex nodes, multi-step actions, actuator resources with reflex
+preemption (`robot_arm/`), and a web dashboard.
 
 ## Documentation
 
@@ -152,7 +155,7 @@ registered instances:
 | `BaseSenseNode`     | `Signal`        | Read hardware/state, emit one signal per tick |
 | `BaseInstinctNode`  | `Proposal` or `None` | Evaluate context, propose an action     |
 | `BaseReflexInstinctNode` | `Proposal` or `None` | Same as instinct, but bypasses the decision layer (priority ≥ 200, co-located with target action) |
-| `BaseDecisionNode`  | `Decision`      | Pick which proposal to execute (Greedy / Weighted / Random / ActiveInference built-ins, or your own) |
+| `BaseDecisionNode`  | `Proposal` or `None` | Pick which proposal to execute (Greedy / Weighted / Random / ActiveInference built-ins, or your own) |
 | `BaseActionNode`    | `Result`        | Carry out the work — must always return, never raise |
 | `MultiStepActionNode` | `Result`      | Long-running actions with interrupt/rollback policies |
 
@@ -168,8 +171,9 @@ registered instances:
 
 1. Nodes never hold references to each other; communication goes through `SignalBus`.
 2. `ReflexInstinctNode` and its target `ActionNode` must be on the same `AgentNode`.
-3. `MultiStepActionNode` mandatory blocks cannot be interrupted by deliberation; only a
-   `ReflexPreemption.PREEMPT` reflex (through the owner's safe-stop) or `emergency_stop()` cuts in.
+3. `MultiStepActionNode` mandatory blocks cannot be interrupted by deliberation (the request is
+   held until the block ends); only a `ReflexPreemption.PREEMPT` reflex, `emergency_stop()` /
+   `cancel()` or the action's `timeout_s` cuts in, always through the owner's `on_preempted()` safe-stop.
 4. `execute()` on any `ActionNode` must always return a `Result` — never raise.
 5. `evaluate()` on any `InstinctNode` must return `None` when not applicable — never raise.
 6. All node I/O must be async — wrap blocking hardware calls in `asyncio.to_thread()`.
@@ -226,27 +230,34 @@ own arbitration. See `spec/03_runtime.md` §7.2.2 for the direct-drive pattern.
 
 ## Distributed deployments
 
-A `DeploymentManifest` declares which nodes run on which `AgentNode`. The
-manifest validator enforces co-location rules and fails loudly on missing
-environment variables.
+A `DeploymentManifest` declares which nodes run on which `AgentNode`. It is
+validated when it is loaded (`from_yaml()` needs the `yaml` extra): the
+validator enforces co-location rules and fails loudly on missing environment
+variables.
 
 ```yaml
+mesh:
+  nats_server: ${NATS_URL}
+
 agents:
-  vision:
+  - id: vision
     transport: nats
-    transport_url: ${NATS_URL}
     nodes:
-      - ObjectDetectionSense
-  control:
+      sense:
+        - kind: examples.robot_arm.nodes.ObjectDetectionSenseNode
+  - id: control
     transport: nats
-    transport_url: ${NATS_URL}
     nodes:
-      - ProximitySense      # feeds the reflex: keep it on the reflex's AgentNode
-      - JointPositionSense
-      - CollisionReflex     # priority 250, reflex
-      - EmergencyRetract    # co-located target
-      - GraspInstinct
-      - PickAndPlace
+      sense:
+        - kind: examples.robot_arm.nodes.ProximitySenseNode     # feeds the reflex: keep it on the reflex's AgentNode
+        - kind: examples.robot_arm.nodes.JointPositionSenseNode
+      instinct:
+        - kind: examples.robot_arm.nodes.CollisionReflex        # priority 250, reflex
+          action_id: EmergencyRetractAction
+        - kind: examples.robot_arm.nodes.GraspInstinct
+      action:
+        - kind: examples.robot_arm.nodes.EmergencyRetractAction # co-located target
+        - kind: examples.robot_arm.nodes.PickAndPlaceAction
 ```
 
 See [`examples/robot_arm/`](examples/robot_arm) for a runnable two-agent

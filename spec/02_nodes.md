@@ -148,11 +148,11 @@ class BaseSenseNode\(BaseNode, ABC\):
 
         asyncio\.to\_thread\(\)\."""
 
-    async def on\_error\(self, exc: Exception\) \-> None:
+    async def on\_error\(self, exc: Exception\) \-> Signal | None:
 
-        """Called when read\(\) raises\. Default: log and continue\.
+        """Called when read\(\) raises\. Default: log and return None \(no signal\)\.
 
-        Override to handle sensor failures, trigger fallback signals, etc\."""
+        Override to return a fallback Signal, handle sensor failures, etc\."""
 
     async def push\(self, signal: Signal\) \-> None:
 
@@ -599,7 +599,7 @@ Multiple reflexes can fire in one tick\. They are launched in priority order, al
 
 __Running actions__
 
-Normal: a conflicting running action is interrupted only if it is interruptible, not reflex\-owned and of lower priority; never inside a mandatory block \(§17\.6\)\.
+Normal: a conflicting running action is interrupted only if it is not reflex\-owned and of lower priority; inside a mandatory block the request is latched and honoured at the first stop point after the block, never within it \(§17\.6, ADR 0009\)\.
 Reflex: takes the actuators it needs from a running action according to its ``preemption`` mode, even inside a mandatory block under ``PREEMPT`` \(§17\.12\)\.
 
 __Use cases__
@@ -989,6 +989,12 @@ class ActionMasterNode\(BaseNode\):
 
                  \# cancel \+ safe\-stop, no rollback; drops armed reflexes
 
+    def close\(self\) \-> None: \.\.\.
+
+                 \# refuse new work \(launch → CLOSED, dispatch → failed
+
+                 \# Result\), drop armed reflexes; reopened by setup\(\)
+
     def interrupt\_all\(self, request: InterruptRequest\) \-> None: \.\.\.
 
     \# Awaiting dispatch \(runtime\-less\):
@@ -1306,7 +1312,7 @@ class NodeFaultReflex\(BaseReflexInstinctNode\):
 
         return None
 
-## __6\.5 Runtime Safety Monitors__
+## __6\.7 Runtime Safety Monitors__
 
 The safety monitor subsystem provides continuous runtime verification of the safety properties formalised in the CSP models under ``formal/``\. Monitors are lightweight checkers that verify invariants after each tick and emit `SafetyViolationSignal` on the `SignalBus` when an invariant is breached\. The runtime does not run them automatically: build a `SafetyMonitorRegistry`, and after each tick call `check_all\(rt\.tick\_count, rt\.monitor\_state\(\)\)` \(see the safety\-monitors tutorial\)\. ``ArachniteRuntime\.monitor\_state\(\)`` builds the state from what the runtime observed in the last tick, so no field is left to the caller\. `check_all\(\)` returns the violations directly; violations are also published on the bus but are not injected into `ctx\.signals`\.
 

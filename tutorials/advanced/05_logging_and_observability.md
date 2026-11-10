@@ -81,10 +81,14 @@ Logs are sent to **sinks**. A sink is an object that knows how to format and
 write a log event. Arachnite ships several:
 
 - **`StdoutLogSink`** — coloured human-readable output to your terminal.
-  Default for development.
-- **`JSONLogSink`** — newline-delimited JSON to a file or stream. Default
-  for production.
-- **`FileLogSink`** — file-based output (used by the web dashboard).
+  Good for development. It prints the message only; pass `show_data=True`
+  to see the structured fields too.
+- **`JSONLogSink`** — newline-delimited JSON to a file or stream. Good for
+  production. The fields are top-level keys next to `ts`, `level`,
+  `node_id`, `agent_node_id`, `tick` and `msg`; a field that would clash
+  with one of those is written as `data_<key>`.
+- **`FileLogSink`** — plain-text lines appended to a file (call its
+  `open()` first; the web dashboard uses one).
 
 You can attach as many sinks as you want, and each can have its own minimum
 level:
@@ -104,8 +108,13 @@ logger = StructuredLogger(
 )
 ```
 
-In a real agent you'd configure sinks once at startup and inject them into
-your nodes (or use the framework config to do it automatically).
+In a real agent you configure sinks once, on the runtime:
+`ArachniteRuntime(..., log_sinks=[...])` (or `RuntimeBuilder().log_sinks([...])`)
+applies them to every master and node logger that has no sinks of its own. A
+node built with its own `log_sinks=[...]` keeps those. Without `log_sinks`
+the runtime uses a single `StdoutLogSink(level=LogLevel.WARNING)`, so your
+`info` and `debug` lines are dropped until you configure a sink. You can
+also let the framework config build the sinks for you.
 
 ## What to log — and what not to
 
@@ -221,6 +230,8 @@ async def main() -> None:
         action_master=action_master,
         bus=bus,
         tick_rate_hz=1.0,
+        # Shared with every node; show_data=True prints the structured fields
+        log_sinks=[StdoutLogSink(level=LogLevel.DEBUG, show_data=True)],
     )
     await rt.start()
     await asyncio.sleep(3.0)

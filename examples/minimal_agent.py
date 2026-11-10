@@ -15,6 +15,7 @@ Run:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import time
 
 from arachnite import (
@@ -127,4 +128,5 @@ async def main() -> None:
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    with contextlib.suppress(KeyboardInterrupt):
+        asyncio.run(main())

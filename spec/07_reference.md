@@ -40,7 +40,7 @@ NodeSupervisor encountered an unrecoverable error during restart\.
 
 __ReflexConflictError__
 
-Two reflex nodes with equal top priority both fired in the same evaluation and reflex\_conflict='raise'\. Raised by InstinctMasterNode\.evaluate\_reflexes\(\) and carries every evaluated proposal in ``proposals``; the runtime logs it at ERROR and still launches them in priority order — it never aborts the tick\. The default reflex\_conflict='dispatch\_all' launches them without raising\.
+Two reflex nodes with equal top priority both fired in the same evaluation and reflex\_conflict='raise'\. Raised by InstinctMasterNode\.evaluate\_reflexes\(\) / evaluate\_reflex\_pairs\(\) and carries every evaluated proposal in ``proposals`` and the same proposals as \(reflex node, proposal\) pairs in ``fired``; the runtime logs it at ERROR and still launches them in priority order — it never aborts the tick\. The default reflex\_conflict='dispatch\_all' launches them without raising\.
 
 __TransportError__
 
@@ -168,7 +168,7 @@ A reflex proposal waiting for its owners to release\. It claims its resources, s
 
 __Safe\-stop Hook__
 
-BaseActionNode\.on\_preempted\(\): brings the actuators to a safe hold when the action is preempted by a reflex or cancelled by shutdown; bounded by safe\_stop\_timeout\_s; does not undo work\.
+BaseActionNode\.on\_preempted\(\): brings the actuators to a safe hold when the action is preempted by a reflex, cancelled \(``cancel\(\)``, shutdown, emergency\_stop\(\)\) or cut by its timeout\_s \(ADR 0009\); bounded by safe\_stop\_timeout\_s; does not undo work\.
 
 __LaunchStatus / LaunchOutcome__
 
@@ -461,6 +461,16 @@ Members added with ADR 0005 \(non\-blocking dispatch and reflex arbitration\), s
 \- ``DecisionMasterNode\(max\_handoff\_ticks=\.\.\.\)``, ``park\(\)``, ``handoff\_proposals``; ``on\_new\_proposals\_many\(conflicts=\.\.\.\)``\.
 
 \- ``ArachniteRuntime\(reflex\_mode=\.\.\., reflex\_signal\_ttl\_s=\.\.\., reflex\_eval\_timeout\_s=\.\.\.\)``, ``wait\_idle\(\)``; ``RuntimeBuilder\.reflex\_mode\(\)``, ``strict\_resources\(\)``\.
+
+Members added later in 0\.13 \(ADR 0006–0009 and the review fixes\):
+
+\- ``Result\.cancelled``; ``RollbackError\.failures``; ``ReflexConflictError\.fired``\.
+
+\- ``ActionMasterNode\.close\(\)``, ``LaunchStatus\.CLOSED``; ``BaseActionNode\.safe\_stop\_bound\_s\(\)``\.
+
+\- ``InstinctMasterNode\.evaluate\_reflex\_pairs\(\)``; ``DecisionMasterNode\.defer\(\)``; ``RandomDecisionNode`` / ``ActiveInferenceDecisionNode`` take ``seed=``\.
+
+\- ``ArachniteRuntime\.monitor\_state\(\)``, ``inject\_remote\_signal\(\)``; ``SignalBus\.add\_remote\_listener\(\)``; ``ActuatorExclusivityMonitor``\.
 
 This is enforced by the \_\_all\_\_ list in arachnite/\_\_init\_\_\.py\.
 

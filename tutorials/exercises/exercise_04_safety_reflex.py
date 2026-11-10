@@ -28,7 +28,10 @@ Your job:
   2. Give it a priority >= 200.
   3. Implement evaluate() so it returns a Proposal when temp > 260.
   4. Run the agent. When the temperature randomly spikes, you should see
-     "!!! SHUTDOWN !!!" instead of any normal action.
+     "!!! SHUTDOWN !!!" instead of any normal action. On the next tick with a
+     normal reading the printer carries on (e.g. "layer started" again):
+     this pretend agent does not remember the shutdown, and every tick is
+     decided afresh. A real printer would stay off until someone resets it.
   5. Look for a spike that lands while a layer is printing. You'll see
        [print]   layer cut short by OverheatReflex, head parked
        !!! SHUTDOWN !!! ...

@@ -416,9 +416,11 @@ class CodecRegistry:
 
         Wildcard '\*' applies to all unregistered kinds\."""
 
-    def encode\(self, signal: Signal\) \-> bytes: \.\.\.
+    def encode\(self, kind: str, value: Any\) \-> bytes: \.\.\.
 
     def decode\(self, kind: str, data: bytes\) \-> Any: \.\.\.
+
+    def decode\_network\(self, kind: str, data: bytes\) \-> Any: \.\.\.  \# refuses unsafe codecs \(§14\.2\.1\)
 
 \# Built\-in codecs:
 

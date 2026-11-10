@@ -24,9 +24,17 @@
 #
 #   rt = ArachniteRuntime(
 #       ...,
-#       tick_rate_hz = cfg.runtime.tick_rate_hz,
-#       log_sinks    = log_sinks,
+#       context                  = context,
+#       tick_rate_hz             = cfg.runtime.tick_rate_hz,
+#       overrun_warn_pct         = cfg.runtime.overrun_warn_pct,
+#       overrun_warn_consecutive = cfg.runtime.overrun_warn_consecutive,
+#       shutdown_coordinator     = cfg.build_shutdown_coordinator(),  # teardown_timeout_s
+#       log_sinks                = log_sinks,
 #   )
+#
+# The loader only reads this file; the caller applies each setting as above.
+# [supervisor] feeds cfg.build_supervisor_kwargs() for NodeSupervisor objects
+# you construct yourself; the runtime's built-in supervisors use the defaults.
 # ─────────────────────────────────────────────────────────────────────────────
 
 # ── Tick loop ─────────────────────────────────────────────────────────────────
@@ -81,10 +89,11 @@ restart_delay_s = 1.0
 
 # ── Context / working memory ──────────────────────────────────────────────────
 #
-# history_length  — how many past ticks of signals to retain
+# history_length  — how many ticks of signals ctx.history holds (the current tick included)
 # state_path      — persist context state dict to this JSON file across reboots
 #                   leave empty for in-memory only
-# flush_on_write  — if true, flush to state_path on every set()/delete() call
+# flush_on_write  — if true, flush to state_path on every set()/delete() call and
+#                   every state-changing StateUpdateSignal
 
 [context]
 history_length = 10

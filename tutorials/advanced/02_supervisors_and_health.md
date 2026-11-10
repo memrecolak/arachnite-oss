@@ -1,12 +1,21 @@
 # Advanced 2 — Supervisors and Health
 
 In a real agent, things break. A sensor times out, a network call fails, a
-hardware library throws an unexpected exception. By default, an exception in
-a node will cause the runtime to log a warning and *that node stops working*
-for the rest of the program's life. Not great.
+hardware library throws an unexpected exception. You don't want one bad
+exception to take the whole agent down, and you don't want a node that keeps
+crashing to be called forever either.
 
-The fix is a **supervisor**: a tiny manager that watches your nodes and
+That's the job of a **supervisor**: a tiny manager that watches your nodes and
 **automatically restarts** them when they crash.
+
+`ArachniteRuntime` already comes with supervisors. It tracks every sense,
+instinct, reflex and action node it was built with, using the defaults below
+(`ON_FAILURE`, 3 restarts, 1 s apart). When a node raises, the master logs
+it, the supervisor marks it `FAULTED` and schedules a restart (`teardown()`
+then `setup()`). A node that runs out of restarts is `DEAD`, and its master
+stops calling it. The runtime's supervisors are reachable through
+`rt.health` (a `HealthMonitor`, see below). This lesson shows how a
+supervisor works by driving one yourself.
 
 ## NodeSupervisor
 
@@ -56,7 +65,6 @@ While supervised, every node moves through these states:
 |---|---|
 | `STARTING` | Just registered, hasn't started yet |
 | `RUNNING` | Working normally |
-| `IDLE` | Started but currently doing nothing |
 | `FAULTED` | Raised an unhandled exception |
 | `RESTARTING` | Being torn down and rebuilt |
 | `STOPPED` | Cleanly stopped (intentional) |
@@ -196,9 +204,9 @@ only want faults.
 
 ## Tips
 
-- **Don't supervise every node.** Reserve supervision for nodes that touch
-  unreliable resources (hardware, network, files). Pure-logic nodes don't
-  need it.
+- **Restarts are for nodes that touch unreliable resources** (hardware,
+  network, files). A pure-logic node that raises will usually raise again
+  after a restart and end up `DEAD`; fix the bug instead.
 - **Pick `restart_delay_s` carefully.** Too small → crash loops eat your
   CPU. Too large → an outage takes ages to recover. 1–5 seconds is a good
   default.

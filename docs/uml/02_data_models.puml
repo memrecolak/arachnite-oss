@@ -49,6 +49,7 @@ class Result <<dataclass>> {
   + step_results: list<StepResult>
   + rolled_back: bool
   + preempted: bool
+  + cancelled: bool
 }
 
 ' ── Multi-step action models ─────────────────────────────────
@@ -219,8 +220,11 @@ end note
 note right of Result
   preempted=True: a reflex took the action's
   resources mid-execution (implies interrupted;
-  never retried). Fed into the context of the
-  first tick after the action finished.
+  never retried). cancelled=True: execute() was
+  cancelled at an await and the safe-stop ran
+  (PREEMPT, cancel/shutdown, emergency stop,
+  action timeout; ADR 0009). Fed into the context
+  of the first tick after the action finished.
 end note
 
 @enduml

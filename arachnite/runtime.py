@@ -1660,7 +1660,7 @@ class ArachniteRuntime:
             stage_start = now
 
         # 6. Act — launch the selected proposals as tasks (not awaited: the
-        #    next tick runs while they execute), highest priority first. A
+        #    next tick runs while they execute), in selection order. A
         #    proposal that interrupted an owner which is still unwinding is
         #    parked for hand-off; one that merely lost a same-tick resource
         #    conflict to a sibling falls back to the normal pending rules.
@@ -1676,7 +1676,10 @@ class ArachniteRuntime:
                 action_ids=sorted(best),
             )
             best = {}
-        for p in sorted(best.values(), key=lambda q: (q.priority, q.urgency), reverse=True):
+        # Selection order, not priority order: when two chosen actions share
+        # a resource, the one the strategy chose first gets it (ADR 0009 —
+        # the strategy decides). For Greedy the two orders are the same.
+        for p in best.values():
             outcome = self._action_master.launch(p, origin="decision")
             if outcome.status is LaunchStatus.BLOCKED:
                 if p.instinct_id in interrupting:

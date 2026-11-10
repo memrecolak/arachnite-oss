@@ -30,6 +30,7 @@ package "Distributed" <<Rectangle>> {
     + stop(): None
     + emergency_stop(): None
     + health: HealthMonitor
+    - _on_remote_signal(signal): None
     + {static} from_manifest(m, agent_id, transport, sinks): AgentNode
   }
 
@@ -48,9 +49,13 @@ package "Distributed" <<Rectangle>> {
 
   class AgentNodeConfig
   class NodeAssignment {
-    + node_class: str
+    + node_class: type<BaseNode>
     + agent_node_id: str
-    + config: NodeConfig
+    + node_section: str
+    + config: dict
+    + is_reflex: bool
+    + reflex_action_id: str | None
+    + node_id: str  (class node_id)
   }
 
   class PermissionWhitelist {
@@ -90,7 +95,7 @@ package "Transport" <<Rectangle>> {
   }
   class NATSTransport {
     + servers: list<str>
-    + subject_pfx: str
+    + subject_prefix: str
   }
   class RedisTransport {
     + url: str
@@ -120,6 +125,7 @@ package "Codec" <<Rectangle>> {
     + register(kind: str, codec: SignalCodec): None
     + encode(kind: str, value: Any): bytes
     + decode(kind: str, data: bytes): Any
+    + decode_network(kind: str, data: bytes): Any
     + check_network_safety(transport_name: str): None
   }
 }
@@ -157,12 +163,16 @@ CodecRegistry "1" o-- "*" SignalCodec          : per-kind + '*' fallback
 
 note bottom of BaseTransport
   Wire format: msgpack envelope
-    { version, origin_agent_node_id,
-      kind, codec_value: bytes }
+    { v, src: origin agent_node_id,
+      sig: { source, kind, value: codec bytes,
+             confidence, timestamp, metadata,
+             type?, ext? } }
   Local → in-process callbacks (no encode)
   MQTT → topic = "{prefix}{kind}"
   NATS → subject = "{prefix}.{kind}"
   Redis → channel = "{prefix}:{kind}"
+  '*' → MQTT "{prefix}#", NATS "{prefix}.>",
+        Redis PSUBSCRIBE "{prefix}:*"
 end note
 
 note right of DeploymentManifest

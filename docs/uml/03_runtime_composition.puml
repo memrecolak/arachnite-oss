@@ -47,7 +47,9 @@ class ArachniteRuntime {
   + resume(): None
   + tick(): None
   + wait_idle(timeout): bool
+  + wait(): None
   + monitor_state(): MonitorState
+  + inject_remote_signal(signal): None
   - _on_reflex_signal(signal): None
   + register_sense_live(node): None
   + register_instinct_live(node): None
@@ -65,6 +67,8 @@ class SignalBus {
   + publish(signal: Signal): None
   + publish_many(signals): None
   + subscriber_count(kind): int
+  + start_transport(): None
+  + add_remote_listener(listener): None
 }
 
 class ContextNode {
@@ -92,17 +96,19 @@ class ActionMasterNode {
   - _running_nodes: dict<str, BaseActionNode>
   - _origins: dict<str, str>
   - _owners: dict<str, str>
-  - _claims: dict<str, str>
   - _armed: dict<str, Proposal>
+  - _closed: bool
   - _tasks: dict<str, Task>
-  - _completed: list<Result>
+  - _completed: deque<Result>
   --
   + launch(p, origin): LaunchOutcome
   + launch_reflex(p, preemption): LaunchOutcome
   + drain_completed(): list<Result>
   + wait_idle(timeout): bool
   + conflicting_owners(p): set<str>
+  + cancel(action_id, timeout): None
   + cancel_all(timeout): None
+  + close(): None
   + dispatch(p, origin): Result
 }
 
@@ -114,14 +120,14 @@ class LaunchOutcome <<dataclass>> {
 
 class "Action task" as ActionTask <<asyncio.Task>> {
   execute() with timeout and retries
-  on cancel: on_preempted() safe-stop
+  on cancel or timeout: on_preempted() safe-stop
 }
 
 note right of ActionMasterNode
   _owners: resource -> owning action_id
   (at most one running owner per resource).
-  _claims: resource -> armed reflex; blocks
-  deliberative launches until it starts.
+  _armed: every armed reflex claims its resources;
+  the claims block deliberative launches until it starts.
   _origins: 'reflex' | 'decision' | 'direct'.
 end note
 
@@ -129,7 +135,7 @@ end note
 class NodeSupervisor {
   + restart_policy: RestartPolicy
   + max_restarts: int
-  + restart_delay: float
+  + restart_delay_s: float
   - _states: dict<str, NodeState>
   - _restart_counts: dict<str, int>
   - _nodes: dict<str, BaseNode>
@@ -252,11 +258,11 @@ note bottom of ArachniteRuntime
   Per tick (see 04_tick_sequence.puml):
     1. SENSE     – SenseMasterNode.read_all()
     2. CONTEXT   – ContextNode.update()
-    3. REFLEX    – InstinctMasterNode.evaluate_reflexes()
+    3. REFLEX    – InstinctMasterNode.evaluate_reflex_pairs()
                    + ActionMasterNode.launch_reflex()
     4. INSTINCT  – InstinctMasterNode.evaluate_all()
     5. DECIDE    – DecisionMasterNode.on_new_proposals_many()
-    6. ACT       – ActionMasterNode.launch() (park() if BLOCKED)
+    6. ACT       – ActionMasterNode.launch() (park()/defer() if BLOCKED)
   Actions run as tasks across ticks; their Results are
   drained into the next tick's ctx.last_results.
 end note

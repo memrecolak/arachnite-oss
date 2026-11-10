@@ -36,12 +36,14 @@ transport is just a shared bus.
 `AgentNode` is the wrapper around a single runtime, plus a transport:
 
 ```python
-from arachnite import ArachniteRuntime
+from arachnite import ArachniteRuntime, SignalBus
 from arachnite.distributed.agent_node import AgentNode
 from arachnite.transport.local import LocalTransport
 
-runtime = ArachniteRuntime(...)  # built as you've been doing all along
 transport = LocalTransport(agent_node_id="agent-1")
+# The bus must carry the transport, or nothing crosses the wire
+bus = SignalBus(transport=transport, agent_node_id="agent-1")
+runtime = ArachniteRuntime(..., bus=bus)  # otherwise built as you've been doing all along
 
 agent = AgentNode(
     node_id="agent-1",
@@ -56,8 +58,9 @@ await agent.start()
 await agent.stop()
 ```
 
-The transport is what makes it distributed. Pick the right one for your
-deployment.
+The transport is what makes it distributed. Signals from other agents reach
+this agent's `ctx.signals` on its next tick. Pick the right transport for
+your deployment.
 
 ## Transports
 
@@ -140,14 +143,20 @@ You then load this manifest and start everything in one go:
 from arachnite.distributed.manifest import DeploymentManifest
 from arachnite.distributed.mesh import MeshRuntime
 
+# Loading already validates (env vars, imports, sections, transport_config
+# keys, co-location) and raises ManifestValidationError on a bad manifest
 manifest = DeploymentManifest.from_yaml("deployment.yaml")
-manifest.validate()  # checks env vars, imports, co-location
 
 mesh = MeshRuntime(manifest=manifest)
 await mesh.start()
 # ... agents run until ...
 await mesh.stop()
 ```
+
+`from_yaml()` needs PyYAML: `pip install "arachnite[yaml]"`
+(`DeploymentManifest.from_dict()` takes an already-parsed dict). Unknown
+keys in a node entry (for example `priority`, which belongs on the class)
+are rejected, not ignored.
 
 `MeshRuntime` is a launch coordinator. It builds every `AgentNode` in the
 manifest, starts them concurrently, and shuts them all down cleanly. It's
@@ -209,9 +218,17 @@ There's one rule you have to know about distributed agents:
 
 The whole point of a reflex is to react instantly. If the reflex has to send
 its proposal across a network to reach its action, the latency defeats the
-purpose. The framework enforces this with a **co-location validator** —
-`manifest.validate()` will fail if you put a reflex on `edge-1` and its
-target action on `cloud-brain`.
+purpose. The framework enforces this with a **co-location validator** — a
+manifest that puts a reflex on `edge-1` and its target action on
+`cloud-brain` fails to load. Every reflex entry in a manifest must name its
+target with an `action_id:` key, which is matched against the action
+classes' `node_id`:
+
+```yaml
+      instinct:
+        - kind: "myapp.reflexes.OverheatReflex"
+          action_id: "EmergencyShutdown"   # must be on this same agent
+```
 
 The validator checks reflex → action only. Put the **sensor that feeds the
 reflex** on the same `AgentNode` as well, so the danger signal never has to

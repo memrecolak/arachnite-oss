@@ -498,11 +498,15 @@ class NodeAssignment:
 
     agent\_node\_id: str
 
-    config: dict              \# passed to node constructor as kwargs
+    node\_section: str         \# 'sense' | 'instinct' | 'decision' | 'action'
+
+    config: dict              \# wrapped in NodeConfig and passed as config=
 
     is\_reflex: bool = False
 
     reflex\_action\_id: str | None = None  \# manifest action\_id of a reflex node
+
+    allowed\_permissions: set\[Permission\] | None = None  \# None = skip check
 
     @property
 

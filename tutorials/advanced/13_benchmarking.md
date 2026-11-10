@@ -115,7 +115,11 @@ async def bench():
         action_master=am, bus=bus,
         tick_rate_hz=10_000.0,  # as fast as possible
     )
-    await rt.start()
+    # Don't call rt.start(): its background tick loop would run alongside the
+    # manual tick() calls below and skew the samples. Set the masters up
+    # yourself, as benchmarks/tick_latency.py does.
+    for m in (sm, im, dm, am):
+        await m.setup()
 
     # 2. Warm up (discard first N ticks)
     for _ in range(1_000):
@@ -128,7 +132,9 @@ async def bench():
         await rt.tick()
         samples.append((time.perf_counter() - t0) * 1_000)  # ms
 
-    await rt.stop()
+    await rt.wait_idle(timeout=5.0)  # actions launched by the ticks finish
+    for m in (am, dm, im, sm):
+        await m.teardown()
 
     # 4. Report
     s = sorted(samples)

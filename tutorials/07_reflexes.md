@@ -316,18 +316,21 @@ same way?"
 
 The answer: **the priority number alone doesn't make something a reflex**.
 What makes a reflex is the *base class* you inherit from
-(`BaseReflexInstinctNode`). The priority range is a *convention* to keep your
-numbers organized. The runtime checks the class type, not the priority, to
-decide whether to fast-path through the decision layer.
+(`BaseReflexInstinctNode`). For normal instincts the priority range is a
+*convention* to keep your numbers organized: nothing stops a normal instinct
+from using 250, it still goes through the decision layer. The runtime checks
+the class type, not the priority, to decide whether to fast-path through the
+decision layer.
 
-So always inherit from `BaseReflexInstinctNode` for reflex behaviour, and
-use priority >= 200 to make your intent clear to anyone reading the code.
+So always inherit from `BaseReflexInstinctNode` for reflex behaviour. The
+other direction *is* checked: registering a reflex with a priority below 200
+raises an error, so every reflex shows its intent in its number.
 
 ## What's next?
 
 You've now seen every major piece of Arachnite: senses, instincts, reflexes,
 decisions, actions. In the next (and final) lesson, we'll combine everything
 into a small project: a **smart lamp** that uses multiple sensors, two
-instincts, a reflex, and two actions.
+instincts, a reflex, and three actions.
 
 [← Previous: Priorities and Decisions](06_priorities_and_decisions.md) | [Next: Lesson 8 — Smart Lamp Project →](08_smart_lamp_project.md)

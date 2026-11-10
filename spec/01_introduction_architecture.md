@@ -254,7 +254,7 @@ class Context:
 
     signals: list\[Signal\]           \# all signals from this tick
 
-    history: deque\[list\[Signal\]\]    \# past N ticks \(default N=10\)
+    history: deque\[list\[Signal\]\]    \# last N ticks, current tick included \(default N=10\)
 
     state: dict\[str, Any\]           \# mutable key\-value store
 

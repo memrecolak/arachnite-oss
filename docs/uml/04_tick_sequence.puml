@@ -50,11 +50,11 @@ deactivate CTX
 RT -> RT : notify context_observers(ctx)
 
 == 3 · REFLEX  (bypasses the decision layer) ==
-RT -> IM : evaluate_reflexes(ctx, nodes)\n(event mode: only reflexes\n without trigger_on_signals)
+RT -> IM : evaluate_reflex_pairs(ctx, nodes)\n(event mode: only reflexes\n without trigger_on_signals)
 activate IM
 IM -> RI : evaluate(ctx)  (concurrent)
 RI --> IM : Proposal | None
-IM --> RT : list<Proposal>  (priority desc)
+IM --> RT : list<(reflex node, Proposal)>  (priority desc)
 deactivate IM
 
 alt reflex proposals present
@@ -74,10 +74,10 @@ alt reflex proposals present
         A running reflex is never preempted.
       end note
     end
-    AM --> RT : LaunchOutcome\n(LAUNCHED / ARMED / DEDUPED / NOT_FOUND)
+    AM --> RT : LaunchOutcome\n(LAUNCHED / ARMED / DEDUPED / NOT_FOUND / CLOSED)
     deactivate AM
   end
-  RT -> RT : await asyncio.sleep(0)\n(reflex execute() is entered now)
+  RT -> RT : a few await asyncio.sleep(0) turns\n(reflex execute() and a preempted\n owner's safe-stop are entered now)
 end
 
 == 4 · INSTINCT ==
@@ -115,9 +115,13 @@ loop for each selected proposal (best per action_id)
   alt LAUNCHED
     AM ->> AT : create_task(execute)
     AM --> RT : LaunchOutcome(LAUNCHED)
-  else BLOCKED (owner still unwinding)
+  else BLOCKED
     AM --> RT : LaunchOutcome(BLOCKED)
-    RT -> DM : park(proposal)  (hand-off)
+    alt proposal issued an interrupt (owner unwinding)
+      RT -> DM : park(proposal)  (hand-off)
+    else lost a same-tick conflict to a sibling
+      RT -> DM : defer(proposal)  (pending rules)
+    end
   end
   deactivate AM
 end

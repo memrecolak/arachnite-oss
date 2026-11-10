@@ -459,6 +459,18 @@ The rollback walk always tries **every** rollback, even if one of them
 fails. If any fail, the `Result.error` is a `RollbackError` whose `failures`
 list names each failed step, and `rolled_back` is `False`.
 
+A step that returns `success=False` *without* `abort_sequence=True` does not
+abort anything: the failure is logged and the next step runs.
+
+The action's own `timeout_s` bounds the whole run, not one step. When it
+runs out, the run is cut at its current `await`, even inside a mandatory
+block, and wound down like this: `on_preempted()` runs first (its
+`preempted_by` is a stand-in proposal with `instinct_id="timeout"`), then
+`on_aborted()` for the step that was cut, then `on_timeout()` supplies the
+`Result`. That `Result` has `cancelled=True` and keeps `step_results` and
+`stopped_at_step`. With `max_retries > 0`, a run the timeout cut inside a
+mandatory block is not retried.
+
 ## Stopping the agent: `stop()` vs `emergency_stop()`
 
 - **`await rt.stop()`** is the graceful path. A running mandatory block is
@@ -474,9 +486,10 @@ list names each failed step, and `rolled_back` is `False`.
 ## Tips and gotchas
 
 1. **`execute_step()` must always return a `StepResult`.** Catch exceptions
-   inside and return `StepResult(success=False, error=...)` instead. If a
-   step does raise, the framework treats it as an abort: the sequence stops
-   and goes through `on_aborted()` (see above).
+   inside and return `StepResult(success=False, error=...)` instead (add
+   `abort_sequence=True` if the sequence must stop there). If a step does
+   raise, the framework treats it as an abort: the sequence stops and goes
+   through `on_aborted()` (see above).
 
 2. **Use `completed` to branch later steps.** For example, "if step 2 found
    no changes, skip step 3":
